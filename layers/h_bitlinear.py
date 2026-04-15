@@ -52,14 +52,20 @@ def ternary_quantize_ste(weight: torch.Tensor) -> torch.Tensor:
     return weight + (quantized - weight).detach()
 
 
-def quantize_activations_4bit(x: torch.Tensor) -> torch.Tensor:
-    """Apply symmetric 4-bit activation quantization with STE.
+def quantize_activations(x: torch.Tensor, bits: int = 4) -> torch.Tensor:
+    """Apply symmetric activation quantization with STE.
 
-    Scaling is computed per token vector over the last dimension, which is more
-    stable than a single scale for the entire batch.
+    Scaling is computed per token vector over the last dimension. ``bits`` can
+    be increased during warmup to keep training slightly softer before the model
+    transitions into full 4-bit activation quantization.
     """
-    scale = x.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / 7.0
-    quantized = (x / scale).round().clamp(-8, 7) * scale
+    if bits < 2:
+        return x
+
+    positive_levels = (2 ** (bits - 1)) - 1
+    negative_levels = 2 ** (bits - 1)
+    scale = x.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / max(positive_levels, 1)
+    quantized = (x / scale).round().clamp(-negative_levels, positive_levels) * scale
     return x + (quantized - x).detach()
 
 
@@ -82,6 +88,11 @@ class HBitLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.config = config or _DefaultBitLinearConfig()
+        self.weight_quantization_mix = 1.0
+        self.activation_quantization_mix = 1.0
+        self.activation_bits = 4
+        self.enable_weight_quantization = True
+        self.enable_activation_quantization = True
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
@@ -110,12 +121,47 @@ class HBitLinear(nn.Module):
         if self.hadamard is not None:
             x = x @ self.hadamard.to(dtype=x.dtype)
 
-        if bool(getattr(self.config, "use_4bit_activations", True)):
-            x = quantize_activations_4bit(x)
+        if bool(getattr(self.config, "use_4bit_activations", True)) and self.enable_activation_quantization:
+            quantized_x = quantize_activations(x, bits=self.activation_bits)
+            if self.activation_quantization_mix >= 1.0:
+                x = quantized_x
+            elif self.activation_quantization_mix > 0.0:
+                x = torch.lerp(x, quantized_x, self.activation_quantization_mix)
 
-        quantized_weight = ternary_quantize_ste(self.weight).to(dtype=x.dtype)
+        if self.enable_weight_quantization:
+            quantized_weight = ternary_quantize_ste(self.weight).to(dtype=x.dtype)
+            if self.weight_quantization_mix >= 1.0:
+                weight = quantized_weight
+            elif self.weight_quantization_mix > 0.0:
+                weight = torch.lerp(self.weight.to(dtype=x.dtype), quantized_weight, self.weight_quantization_mix)
+            else:
+                weight = self.weight.to(dtype=x.dtype)
+        else:
+            weight = self.weight.to(dtype=x.dtype)
+
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
-        return F.linear(x, quantized_weight, bias)
+        return F.linear(x, weight, bias)
+
+    def set_quantization_state(
+        self,
+        *,
+        weight_mix: float | None = None,
+        activation_mix: float | None = None,
+        activation_bits: int | None = None,
+        enable_weight_quantization: bool | None = None,
+        enable_activation_quantization: bool | None = None,
+    ) -> None:
+        """Update runtime quantization settings for staged training."""
+        if weight_mix is not None:
+            self.weight_quantization_mix = float(min(max(weight_mix, 0.0), 1.0))
+        if activation_mix is not None:
+            self.activation_quantization_mix = float(min(max(activation_mix, 0.0), 1.0))
+        if activation_bits is not None:
+            self.activation_bits = max(int(activation_bits), 2)
+        if enable_weight_quantization is not None:
+            self.enable_weight_quantization = bool(enable_weight_quantization)
+        if enable_activation_quantization is not None:
+            self.enable_activation_quantization = bool(enable_activation_quantization)
 
     def extra_repr(self) -> str:
         return (

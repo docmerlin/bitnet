@@ -63,10 +63,10 @@ class BitNetDeep(nn.Module):
             config=self.config
         )
 
-        # Tie weights so the output projection uses the same master weights.
-        self.lm_head.weight = self.embed_tokens.weight
-
         self.apply(self._init_weights)
+
+        # Tie weights after initialization so the shared tensor is not overwritten.
+        self.lm_head.weight = self.embed_tokens.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Embedding):
