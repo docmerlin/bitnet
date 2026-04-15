@@ -2,6 +2,8 @@
 
 Experimental PyTorch implementation of a deep ternary BitNet-style language model optimized for weak hardware.
 
+WARNING: THIS IS VERY EARLY STAGE ALPHA SOFTWARE.
+
 ## Current architecture
 
 - Hidden size: `1024`
