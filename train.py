@@ -40,16 +40,27 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.checkpoint import checkpoint
 
 from config import TernaryConfig, config as default_config
-from layers.block_attnres import BlockAttentionResidual
+from layers.hybrid_block import HybridTransformerBlock
 from layers.h_bitlinear import HBitLinear
+from layers.infini_attention import InfiniAttention
 from model import BitNetDeep
-from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
+
+try:
+    from datasets import load_dataset
+except ImportError:  # pragma: no cover - optional dependency for training only.
+    load_dataset = None
+
+try:
+    from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
+    _TOKENIZER_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - optional dependency for training only.
+    HierarchicalTokenizer = Any
+    _TOKENIZER_IMPORT_ERROR = exc
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -243,22 +254,71 @@ class TrainingWrapper(nn.Module):
         self.model = model
         self.gradient_checkpointing = gradient_checkpointing
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    @staticmethod
+    def _checkpoint_context(layer: nn.Module, memory_state: Optional[Dict[str, torch.Tensor]] = None):
+        infini_attn = getattr(layer, "infini_attn", None)
+        if isinstance(infini_attn, InfiniAttention) and memory_state is not None:
+            return contextlib.nullcontext(), infini_attn.use_memory_state(memory_state, update_memory_buffers=False)
+        return contextlib.nullcontext(), contextlib.nullcontext()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        reset_memory: bool = True,
+    ) -> torch.Tensor:
+        if reset_memory:
+            reset_infini_memory(self.model)
+
         x = self.model.embed_tokens(input_ids)
         x = self.model.subln(x)
 
         for layer in self.model.layers:
             if self.gradient_checkpointing and self.training:
+                layer_memory_state = None
+                infini_attn = getattr(layer, "infini_attn", None)
+                if isinstance(infini_attn, InfiniAttention):
+                    layer_memory_state = infini_attn.get_memory_state()
                 x = checkpoint(
-                    lambda hidden_states: layer(hidden_states, attention_mask),
+                    lambda hidden_states, layer=layer, attention_mask=attention_mask: layer(hidden_states, attention_mask),
                     x,
                     use_reentrant=False,
+                    context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: self._checkpoint_context(
+                        layer,
+                        layer_memory_state,
+                    ),
                 )
             else:
                 x = layer(x, attention_mask)
 
         x = self.model.norm(x)
         return self.model.lm_head(x)
+
+
+def iter_infini_attention_modules(module: nn.Module) -> Iterator[InfiniAttention]:
+    for submodule in module.modules():
+        if isinstance(submodule, InfiniAttention):
+            yield submodule
+
+
+def capture_infini_memory_state(module: nn.Module) -> List[Dict[str, torch.Tensor]]:
+    return [submodule.get_memory_state() for submodule in iter_infini_attention_modules(module)]
+
+
+def restore_infini_memory_state(
+    module: nn.Module,
+    state: Sequence[Dict[str, torch.Tensor]],
+) -> None:
+    infini_modules = list(iter_infini_attention_modules(module))
+    if len(infini_modules) != len(state):
+        raise ValueError("InfiniAttention state does not match the current model layout")
+    for submodule, memory_state in zip(infini_modules, state):
+        submodule.load_memory_state(memory_state)
+
+
+def reset_infini_memory(module: nn.Module) -> None:
+    for submodule in iter_infini_attention_modules(module):
+        submodule.reset_memory()
 
 
 class JsonlLogger:
@@ -335,6 +395,12 @@ class TextDatasetStream:
         self.iterator = self._build_iterator()
 
     def _build_iterator(self) -> Iterator[Dict[str, Any]]:
+        if load_dataset is None:
+            raise ImportError(
+                "train.py requires the `datasets` package. Install it with "
+                "`python3 -m pip install -r requirements.txt`."
+            )
+
         dataset = load_dataset(
             self.source.path,
             name=self.source.config_name,
@@ -635,7 +701,6 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
         },
         max_position_embeddings=args.sequence_length,
         initializer_range=default_config.initializer_range,
-        num_block_attnres_layers=args.num_layers,
         block_size=args.final_blocks,
         infini_memory_dim=default_config.infini_memory_dim,
         use_hadamard=not args.disable_hadamard,
@@ -726,7 +791,7 @@ def update_block_growth(model: nn.Module, token_progress: float, args: argparse.
 
     blocks = max(1, min(blocks, args.sequence_length))
     for module in model.modules():
-        if isinstance(module, BlockAttentionResidual):
+        if isinstance(module, HybridTransformerBlock):
             module.num_blocks = blocks
     return blocks
 
@@ -768,6 +833,7 @@ def load_checkpoint(
 ) -> TrainerState:
     payload = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(payload["model"])
+    reset_infini_memory(model)
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
     if scaler is not None and payload.get("scaler") is not None:
@@ -788,6 +854,9 @@ def evaluate(
     if args.validation_batches <= 0:
         return {}
 
+    was_training = runner.training
+    memory_state = capture_infini_memory_state(runner)
+    reset_infini_memory(runner)
     runner.eval()
     eval_stream = build_batch_stream(
         mixture,
@@ -802,22 +871,25 @@ def evaluate(
         micro_batch_size=args.micro_batch_size,
     )
 
-    losses: List[float] = []
-    for _ in range(args.validation_batches):
-        batch = next(eval_stream)
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+    try:
+        losses: List[float] = []
+        for _ in range(args.validation_batches):
+            batch = next(eval_stream)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
 
-        with autocast_context(device, amp_enabled, amp_dtype):
-            logits = runner(input_ids, attention_mask)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-        losses.append(float(loss.item()))
+            with autocast_context(device, amp_enabled, amp_dtype):
+                logits = runner(input_ids, attention_mask)
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+            losses.append(float(loss.item()))
 
-    mean_loss = sum(losses) / len(losses)
-    perplexity = math.exp(min(mean_loss, 20.0))
-    runner.train()
-    return {"val_loss": mean_loss, "val_perplexity": perplexity}
+        mean_loss = sum(losses) / len(losses)
+        perplexity = math.exp(min(mean_loss, 20.0))
+        return {"val_loss": mean_loss, "val_perplexity": perplexity}
+    finally:
+        restore_infini_memory_state(runner, memory_state)
+        runner.train(was_training)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -942,6 +1014,12 @@ def main() -> None:
 
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
+
+    if _TOKENIZER_IMPORT_ERROR is not None:
+        raise ImportError(
+            "train.py requires the tokenizer dependencies. Install them with "
+            "`python3 -m pip install -r requirements.txt`."
+        ) from _TOKENIZER_IMPORT_ERROR
 
     tokenizer = HierarchicalTokenizer(
         max_patch_size=args.tokenizer_max_patch_size,

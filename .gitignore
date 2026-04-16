@@ -2,4 +2,11 @@ __pycache__/
 *.py[cod]
 *.swp
 .DS_Store
-.venv/
+
+# Local virtualenv artifacts when the repo lives inside a venv.
+/.venv/
+/bin/
+/include/
+/lib/
+/share/
+/pyvenv.cfg

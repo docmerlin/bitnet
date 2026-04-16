@@ -17,6 +17,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+_HADAMARD_BASE_CACHE: dict[int, torch.Tensor] = {}
+_HADAMARD_DEVICE_CACHE: dict[tuple[int, str, int | None, torch.dtype], torch.Tensor] = {}
+
+
 class _DefaultBitLinearConfig:
     use_hadamard = True
     use_4bit_activations = True
@@ -33,6 +37,24 @@ def hadamard_matrix(size: int) -> torch.Tensor:
     top = torch.cat((half, half), dim=1)
     bottom = torch.cat((half, -half), dim=1)
     return torch.cat((top, bottom), dim=0) / math.sqrt(2.0)
+
+
+def get_hadamard_tensor(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return a shared Hadamard tensor for the requested size/device/dtype."""
+    device = torch.device(device)
+    cache_key = (size, device.type, device.index, dtype)
+    cached = _HADAMARD_DEVICE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    base = _HADAMARD_BASE_CACHE.get(size)
+    if base is None:
+        base = hadamard_matrix(size)
+        _HADAMARD_BASE_CACHE[size] = base
+
+    cached = base.to(device=device, dtype=dtype)
+    _HADAMARD_DEVICE_CACHE[cache_key] = cached
+    return cached
 
 
 def ternary_quantize_ste(weight: torch.Tensor) -> torch.Tensor:
@@ -102,9 +124,9 @@ class HBitLinear(nn.Module):
 
         use_hadamard = bool(getattr(self.config, "use_hadamard", True))
         if use_hadamard and in_features & (in_features - 1) == 0:
-            self.register_buffer("hadamard", hadamard_matrix(in_features), persistent=False)
+            self.hadamard_size = in_features
         else:
-            self.register_buffer("hadamard", None, persistent=False)
+            self.hadamard_size = None
 
         self.reset_parameters()
 
@@ -117,9 +139,13 @@ class HBitLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply optional Hadamard, 4-bit activations, and ternary matmul."""
-        if self.hadamard is not None:
-            x = x @ self.hadamard.to(dtype=x.dtype)
+        """Apply Hadamard (on input), activation quantization, and ternary weight matmul.
+
+        Following BitNet b1.58 best practices, Hadamard is applied to the input
+        before the ternary weight multiplication for improved quantization stability.
+        """
+        if self.hadamard_size is not None:
+            x = x @ get_hadamard_tensor(self.hadamard_size, x.device, x.dtype)
 
         if bool(getattr(self.config, "use_4bit_activations", True)) and self.enable_activation_quantization:
             quantized_x = quantize_activations(x, bits=self.activation_bits)
@@ -166,7 +192,7 @@ class HBitLinear(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"ternary=True, hadamard={self.hadamard is not None}"
+            f"ternary=True, hadamard={self.hadamard_size is not None}"
         )
 
 

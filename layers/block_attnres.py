@@ -1,10 +1,8 @@
-"""Block Attention Residuals for the deep ternary transformer.
+"""Block Attention Residuals (STTNRes) for deep ternary models.
 
-The sequence is split into a configurable number of local blocks. Each block
-performs causal self-attention only within its own span, which keeps compute
-bounded and stabilizes very deep stacks. A standard feed-forward sublayer is
-included so one ``BlockAttentionResidual`` instance acts as a full transformer
-block.
+Splits the sequence into local blocks and computes attention only within each
+block. This improves gradient flow in very deep (64+) networks. Supports
+runtime change of `num_blocks` for progressive block growth during training.
 """
 
 from __future__ import annotations
@@ -37,6 +35,8 @@ class BlockAttentionResidual(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head dimension must be even for rotary embeddings")
         self.num_blocks = max(1, block_size)
         self.config = config
 
@@ -47,88 +47,37 @@ class BlockAttentionResidual(nn.Module):
         self.ffn_norm = nn.RMSNorm(hidden_size, eps=norm_eps)
         self.qkv = HBitLinear(hidden_size, hidden_size * 3, bias=False, config=config)
         self.o_proj = HBitLinear(hidden_size, hidden_size, bias=False, config=config)
-        self.ffn_up = nn.Linear(hidden_size, intermediate_size * 2, bias=False)
+        self.ffn_up = HBitLinear(hidden_size, intermediate_size * 2, bias=False, config=config)
         self.ffn_down = HBitLinear(intermediate_size, hidden_size, bias=False, config=config)
 
     def _rope_scaling_factor(self, seq_len: int) -> float:
+        """Simple YaRN-style scaling factor."""
         rope_scaling = getattr(self.config, "rope_scaling", None)
         if not rope_scaling:
             return 1.0
-
         original = rope_scaling.get("original_max_position_embeddings", seq_len)
         factor = rope_scaling.get("factor", 1.0)
         return float(factor if seq_len > original else 1.0)
 
-    def _pad_sequence_dimension(self, tensor: torch.Tensor, padded_seq_len: int) -> torch.Tensor:
-        pad_len = padded_seq_len - tensor.size(2)
-        if pad_len <= 0:
-            return tensor
-        return F.pad(tensor, (0, 0, 0, pad_len))
-
-    def _build_valid_mask(
-        self,
-        batch_size: int,
-        seq_len: int,
-        padded_seq_len: int,
-        block_tokens: int,
-        device: torch.device,
-        attention_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        valid = torch.arange(padded_seq_len, device=device).unsqueeze(0) < seq_len
-        valid = valid.expand(batch_size, -1).clone()
-
-        if attention_mask is not None and attention_mask.ndim == 2:
-            valid[:, :seq_len] &= attention_mask[:, :seq_len].to(torch.bool)
-
-        return valid.view(batch_size, self.num_blocks, block_tokens)
-
-    def _build_local_additive_mask(
-        self,
-        attention_mask: Optional[torch.Tensor],
-        block_tokens: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        padded_seq_len: int,
-    ) -> Optional[torch.Tensor]:
-        if attention_mask is None or attention_mask.ndim != 4:
-            return None
-
-        if attention_mask.size(-1) < padded_seq_len:
-            pad = padded_seq_len - attention_mask.size(-1)
-            attention_mask = F.pad(attention_mask, (0, pad, 0, pad))
-
-        local_blocks = []
-        for block_index in range(self.num_blocks):
-            start = block_index * block_tokens
-            end = start + block_tokens
-            local_blocks.append(attention_mask[:, :, start:end, start:end])
-
-        return torch.stack(local_blocks, dim=1).to(device=device, dtype=dtype)
-
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        attn_residual = x
+        """Block-wise causal attention + FFN with progressive block support."""
+        residual = x
         x = self.attn_norm(x)
 
         batch_size, seq_len, _ = x.shape
-        block_tokens = math.ceil(seq_len / self.num_blocks)
-        padded_seq_len = self.num_blocks * block_tokens
 
         qkv = self.qkv(x)
         qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        q = self._pad_sequence_dimension(q, padded_seq_len)
-        k = self._pad_sequence_dimension(k, padded_seq_len)
-        v = self._pad_sequence_dimension(v, padded_seq_len)
-
+        # Apply RoPE
         rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
-        rope_scale = self._rope_scaling_factor(padded_seq_len)
+        rope_scale = self._rope_scaling_factor(seq_len)
         cos, sin = build_rope_cache(
-            seq_len=padded_seq_len,
+            seq_len=seq_len,
             dim=self.head_dim,
             theta=rope_theta,
             scaling_factor=rope_scale,
@@ -137,59 +86,66 @@ class BlockAttentionResidual(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        q = q.view(batch_size, self.num_heads, self.num_blocks, block_tokens, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, self.num_heads, self.num_blocks, block_tokens, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, self.num_heads, self.num_blocks, block_tokens, self.head_dim).transpose(1, 2)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        scale = self.head_dim ** -0.5
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-
+        # Causal mask for local blocks
+        num_blocks = max(1, min(self.num_blocks, seq_len))
+        block_size = math.ceil(seq_len / num_blocks)
+        positions = torch.arange(seq_len, device=x.device)
+        block_ids = positions.div(block_size, rounding_mode="floor")
+        block_mask = block_ids[:, None] != block_ids[None, :]
         causal_mask = torch.triu(
-            torch.ones(block_tokens, block_tokens, device=x.device, dtype=torch.bool),
+            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
             diagonal=1,
         )
-        scores = scores.masked_fill(causal_mask.view(1, 1, 1, block_tokens, block_tokens), torch.finfo(scores.dtype).min)
+        invalid_attn = causal_mask | block_mask
 
-        valid_mask = self._build_valid_mask(
-            batch_size=batch_size,
-            seq_len=seq_len,
-            padded_seq_len=padded_seq_len,
-            block_tokens=block_tokens,
-            device=x.device,
-            attention_mask=attention_mask,
+        attn = attn.masked_fill(
+            invalid_attn.view(1, 1, seq_len, seq_len),
+            torch.finfo(attn.dtype).min,
         )
-        query_valid = valid_mask[:, :, None, :, None]
-        key_valid = valid_mask[:, :, None, None, :]
-        scores = scores.masked_fill(~key_valid, torch.finfo(scores.dtype).min)
 
-        local_additive_mask = self._build_local_additive_mask(
-            attention_mask=attention_mask,
-            block_tokens=block_tokens,
-            dtype=scores.dtype,
-            device=x.device,
-            padded_seq_len=padded_seq_len,
-        )
-        if local_additive_mask is not None:
-            scores = scores + local_additive_mask
+        mask_floor = torch.finfo(attn.dtype).min
+        query_valid = None
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                query_valid = attention_mask[:, None, :seq_len, None].to(torch.bool)
+                key_valid = attention_mask[:, None, None, :seq_len].to(torch.bool)
+                attn = attn.masked_fill(~key_valid, mask_floor)
+            elif attention_mask.ndim == 3:
+                additive_mask = attention_mask[:, None, :seq_len, :seq_len].to(dtype=attn.dtype)
+                attn = attn + additive_mask
+                query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
+            elif attention_mask.ndim == 4:
+                additive_mask = attention_mask[:, :, :seq_len, :seq_len].to(dtype=attn.dtype)
+                attn = attn + additive_mask
+                query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
+            else:
+                raise ValueError("attention_mask must be 2D, 3D, or 4D")
 
-        # Avoid NaNs for padded query rows by zeroing them before softmax and again after.
-        scores = scores.masked_fill(~query_valid, 0.0)
+        if query_valid is not None:
+            # Rows that are fully masked need explicit zeroing so softmax does not
+            # turn them into a uniform distribution.
+            attn = attn.masked_fill(~query_valid, 0.0)
 
-        attn = torch.softmax(scores, dim=-1)
-        attn = attn.masked_fill(~query_valid, 0.0)
+        attn = F.softmax(attn, dim=-1)
+        if query_valid is not None:
+            attn = attn.masked_fill(~query_valid, 0.0)
+
         context = torch.matmul(attn, v)
-        context = context.masked_fill(~query_valid, 0.0)
+        if query_valid is not None:
+            context = context.masked_fill(~query_valid, 0.0)
 
-        context = context.transpose(1, 2).contiguous().view(batch_size, self.num_heads, padded_seq_len, self.head_dim)
-        context = context[:, :, :seq_len, :].transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        x = residual + self.o_proj(context)
 
-        x = attn_residual + self.o_proj(context)
-
-        ffn_residual = x
-        ffn_input = self.ffn_norm(x)
-        gate, value = self.ffn_up(ffn_input).chunk(2, dim=-1)
-        ffn_output = self.ffn_down(F.silu(gate) * value)
-        return ffn_residual + ffn_output
+        # FFN (using HBitLinear for down projection)
+        residual = x
+        x = self.ffn_norm(x)
+        gate, value = self.ffn_up(x).chunk(2, dim=-1)
+        x = self.ffn_down(F.silu(gate) * value)
+        return residual + x
 
 
 if __name__ == "__main__":

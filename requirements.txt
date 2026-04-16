@@ -1,5 +1,7 @@
-tiktoken
-datasets
 torch
-# Run with: python3 -m pip install -r requirements.txt --break-system-packages
-# Or create a venv for best results on macOS.
+datasets
+tiktoken
+
+# Optional trainer logging integrations.
+tensorboard
+wandb

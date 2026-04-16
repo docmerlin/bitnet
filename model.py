@@ -1,8 +1,10 @@
 """Main BitNetDeep model.
 
-The current architecture uses Block Attention Residuals in all 64 layers,
-matching the updated requirement to keep STTNRes-style block attention as the
-main residual mechanism throughout the network.
+Every Transformer layer now contains BOTH:
+- Infini-Attention (local masked attention + compressive memory with per-head gating)
+- Attention Residuals (AttnRes) around both the attention and MLP sublayers
+
+This matches the exact requirement: no layer splitting — full combination in every block from layer 0 to the final layer.
 """
 import torch
 import torch.nn as nn
@@ -10,7 +12,7 @@ from typing import Optional
 
 from config import TernaryConfig, config as default_config
 from layers.h_bitlinear import HBitLinear
-from layers.block_attnres import BlockAttentionResidual
+from layers.hybrid_block import HybridTransformerBlock
 
 
 class RMSNorm(nn.Module):
@@ -47,12 +49,16 @@ class BitNetDeep(nn.Module):
 
         self.layers = nn.ModuleList()
 
+        # Every single layer now contains BOTH Infini-Attention and Attention Residuals (AttnRes)
+        # as explicitly requested. No layer splitting.
         for _ in range(self.config.num_hidden_layers):
-            layer = BlockAttentionResidual(
+            layer = HybridTransformerBlock(
                 hidden_size=self.config.hidden_size,
                 num_heads=self.config.num_attention_heads,
-                block_size=self.config.block_size,
-                config=self.config
+                intermediate_size=self.config.intermediate_size,
+                memory_dim=self.config.infini_memory_dim,
+                init_scale=self.config.attn_res_init_scale,
+                config=self.config,
             )
             self.layers.append(layer)
 
@@ -72,7 +78,16 @@ class BitNetDeep(nn.Module):
         if isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        reset_memory: bool = True,
+    ) -> torch.Tensor:
+        if reset_memory:
+            for layer in self.layers:
+                layer.infini_attn.reset_memory()
+
         x = self.embed_tokens(input_ids)
         x = self.subln(x)  # Extra stability for deep ternary net
 

@@ -12,7 +12,7 @@ class TernaryConfig:
     - 64 layers (scalable to 128-192)
     - RMSNorm + SubLN (extra sub-layer norm for ternary weight stability)
     - RoPE with YaRN/NTK scaling for long context
-    - All 64 layers use Block Attention Residuals (STTNRes-style local blocks)
+    - EVERY layer uses BOTH Infini-Attention and Attention Residuals (AttnRes)
     - Hierarchical tokenizer targets a 128k-token byte-and-merge vocabulary
     """
     vocab_size: int = 131072  # ~128k target (first-stage ~100k + hierarchical merges)
@@ -27,12 +27,10 @@ class TernaryConfig:
     max_position_embeddings: int = 8192
     initializer_range: float = 0.02
 
-    # Block Attention Residual controls
-    num_block_attnres_layers: int = 64
-    block_size: int = 4  # Number of local attention blocks per layer
-
-    # Infini-Attention (kept for future experiments)
-    infini_memory_dim: int = 64  # Compressive memory dimension per head
+    # Hybrid block parameters (every layer now uses both Infini-Attention + AttnRes)
+    block_size: int = 8          # Number of local blocks for attention residual (supports progressive growth)
+    infini_memory_dim: int = 64  # Compressive memory dimension per head for Infini-Attention
+    attn_res_init_scale: float = 0.1  # Initial scale for Attention Residual connections
 
     # Ternary training / inference
     use_hadamard: bool = True
@@ -48,5 +46,7 @@ class TernaryConfig:
             }
         if self.head_dim * self.num_attention_heads != self.hidden_size:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for rotary embeddings")
 
 config = TernaryConfig()
