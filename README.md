@@ -4,21 +4,25 @@ Experimental PyTorch implementation of a deep ternary BitNet-style language mode
 
 WARNING: THIS IS VERY EARLY STAGE ALPHA SOFTWARE.
 
-## Current architecture
+## Current architecture (after latest improvements)
 
 - Hidden size: `1024`
 - Layers: `64`
-- Attention heads: `32`
-- Residual stack: `64` layers of block attention residuals
-- Linear layers: `HBitLinear` with ternary weight quantization, optional Hadamard preprocessing, and 4-bit activation quantization
-- Tokenizer: two-stage hierarchical byte-and-merge tokenizer inspired by dynamic grouping with hierarchical BPE
-- Positional encoding: rotary embeddings with simple YaRN-style scaling support
+- Heads: `32` (head dim = 32)
+- These are the default full-training settings used by `run_train.sh`; `run_local_train.sh` uses a smaller local profile for weaker hardware.
+- **Unified hybrid block in every layer**: Every Transformer block contains BOTH Infini-Attention (local + compressive memory with per-head gating) AND Attention Residuals (AttnRes) around both attention and MLP sublayers. No layer splitting.
+- All linear projections use `H-BitLinear` (Hadamard transform on input + ternary weights + 4-bit activations with STE)
+- Tokenizer: two-stage hierarchical tokenizer with end-of-patch markers and learned second-stage merges over first-stage token bytes
+- RMSNorm + extra SubLN for ternary stability
+- RoPE with YaRN scaling
+- Two-stage quantization schedule and progressive block growth during training
 
 ## Repository layout
 
 - `config.py`: model and training configuration
 - `model.py`: main `BitNetDeep` model
-- `layers/`: ternary linear, block attention residual, and Infini-Attention modules
+- `layers/hybrid_block.py`: main transformer block combining Infini-Attention and AttnRes in every layer
+- `layers/`: ternary linear, block attention residual, Infini-Attention, and supporting modules
 - `tokenizer/`: hierarchical tokenizer implementation
 - `train.py`: streaming training pipeline using Hugging Face datasets
 - `utils.py`: rotary and ternary helper functions
@@ -33,16 +37,27 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Dependency notes:
+
+- `test_forward.py` requires `tiktoken`
+- `train.py` requires both `tiktoken` and `datasets`
+
 Run a quick model smoke test:
 
 ```bash
-python3 model.py
+python3 test_forward.py
 ```
+
+This exercises the hybrid model stack, hierarchical tokenizer, and H-BitLinear path.
 
 Run the training entrypoint:
 
 ```bash
-python3 train.py
+# Local test (smaller model, fast on Mac Mini)
+./run_local_train.sh
+
+# Full model (64 layers, requires GPU with good VRAM)
+./run_train.sh
 ```
 
 ## Programming data presets
