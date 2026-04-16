@@ -2,6 +2,8 @@
 
 Features:
 - streaming Hugging Face mixtures (FineWeb-Edu + DCLM by default)
+- built-in programming dataset presets via CodeSearchNet language shards and an all-language alias
+- built-in math dataset presets via FineMath and OpenWebMath
 - hierarchical tokenization with sequence packing
 - two-stage quantization schedule for ternary warmup -> full QAT
 - progressive Block Attention Residual growth
@@ -13,8 +15,10 @@ Features:
 Example:
     python3 train.py \
         --output-dir runs/bitnet \
-        --train-mixture fineweb_edu=0.7,dclm=0.3 \
-        --val-mixture fineweb_edu=0.5,dclm=0.5 \
+        --early-train-mixture fineweb_edu=0.60,dclm=0.25,code_search_net_all=0.10,finemath_3plus=0.05 \
+        --late-train-mixture fineweb_edu=0.35,dclm=0.15,code_search_net_all=0.20,finemath_3plus=0.30 \
+        --mixture-switch-ratio 0.70 \
+        --val-mixture fineweb_edu=0.40,code_search_net_all=0.20,finemath_3plus=0.40 \
         --sequence-length 1024 \
         --micro-batch-size 1 \
         --grad-accumulation-steps 16 \
@@ -91,6 +95,76 @@ DATASET_PRESETS: Dict[str, DatasetSource] = {
         config_name="en",
         split="train",
         text_field="text",
+    ),
+    "finemath_3plus": DatasetSource(
+        alias="finemath_3plus",
+        path="HuggingFaceTB/finemath",
+        config_name="finemath-3plus",
+        split="train",
+        text_field="text",
+    ),
+    "open_web_math": DatasetSource(
+        alias="open_web_math",
+        path="open-web-math/open-web-math",
+        config_name=None,
+        split="train",
+        text_field="text",
+    ),
+    "code_search_net_python": DatasetSource(
+        alias="code_search_net_python",
+        path="code-search-net/code_search_net",
+        config_name="python",
+        split="train",
+        text_field="whole_func_string",
+    ),
+    "code_search_net_go": DatasetSource(
+        alias="code_search_net_go",
+        path="code-search-net/code_search_net",
+        config_name="go",
+        split="train",
+        text_field="whole_func_string",
+    ),
+    "code_search_net_javascript": DatasetSource(
+        alias="code_search_net_javascript",
+        path="code-search-net/code_search_net",
+        config_name="javascript",
+        split="train",
+        text_field="whole_func_string",
+    ),
+    "code_search_net_java": DatasetSource(
+        alias="code_search_net_java",
+        path="code-search-net/code_search_net",
+        config_name="java",
+        split="train",
+        text_field="whole_func_string",
+    ),
+    "code_search_net_php": DatasetSource(
+        alias="code_search_net_php",
+        path="code-search-net/code_search_net",
+        config_name="php",
+        split="train",
+        text_field="whole_func_string",
+    ),
+    "code_search_net_ruby": DatasetSource(
+        alias="code_search_net_ruby",
+        path="code-search-net/code_search_net",
+        config_name="ruby",
+        split="train",
+        text_field="whole_func_string",
+    ),
+}
+
+
+MIXTURE_GROUP_PRESETS: Dict[str, Tuple[Tuple[str, float], ...]] = {
+    # Weighted toward the most broadly useful languages while still covering
+    # every CodeSearchNet shard the trainer can stream without gated access.
+    "code_search_net_all": (
+        ("code_search_net_python", 0.30),
+        ("code_search_net_javascript", 0.22),
+        ("code_search_net_java", 0.18),
+        ("code_search_net_go", 0.15),
+        ("code_search_net_php", 0.08),
+        ("code_search_net_ruby", 0.07),
     ),
 }
 
@@ -427,7 +501,7 @@ def autocast_context(device: torch.device, amp_enabled: bool, amp_dtype: Optiona
     return torch.autocast(device_type=device.type, dtype=amp_dtype)
 
 
-def parse_mixture_entry(entry: str) -> Tuple[DatasetSource, float]:
+def parse_mixture_entry(entry: str) -> List[Tuple[DatasetSource, float]]:
     entry = entry.strip()
     if not entry:
         raise ValueError("Mixture entries must not be empty")
@@ -441,7 +515,13 @@ def parse_mixture_entry(entry: str) -> Tuple[DatasetSource, float]:
 
     source_name = source_name.strip()
     if source_name in DATASET_PRESETS:
-        return DATASET_PRESETS[source_name], weight
+        return [(DATASET_PRESETS[source_name], weight)]
+
+    if source_name in MIXTURE_GROUP_PRESETS:
+        return [
+            (DATASET_PRESETS[member_name], weight * member_weight)
+            for member_name, member_weight in MIXTURE_GROUP_PRESETS[source_name]
+        ]
 
     parts = source_name.split("|")
     if len(parts) != 4:
@@ -450,17 +530,24 @@ def parse_mixture_entry(entry: str) -> Tuple[DatasetSource, float]:
         )
 
     path, config_name, split, text_field = parts
-    return DatasetSource(
-        alias=path,
-        path=path,
-        config_name=config_name or None,
-        split=split,
-        text_field=text_field,
-    ), weight
+    return [(
+        DatasetSource(
+            alias=path,
+            path=path,
+            config_name=config_name or None,
+            split=split,
+            text_field=text_field,
+        ),
+        weight,
+    )]
 
 
 def parse_mixture(spec: str) -> List[Tuple[DatasetSource, float]]:
-    return [parse_mixture_entry(entry) for entry in spec.split(",") if entry.strip()]
+    expanded: List[Tuple[DatasetSource, float]] = []
+    for entry in spec.split(","):
+        if entry.strip():
+            expanded.extend(parse_mixture_entry(entry))
+    return expanded
 
 
 def build_text_stream(
@@ -515,6 +602,20 @@ def build_batch_stream(
         max_document_tokens=max_document_tokens,
     )
     return BatchStream(packed_stream, micro_batch_size=micro_batch_size)
+
+
+def choose_stage_mixture(
+    progress_ratio: float,
+    *,
+    early_mixture: List[Tuple[DatasetSource, float]],
+    late_mixture: Optional[List[Tuple[DatasetSource, float]]],
+    switch_ratio: float,
+) -> Tuple[str, List[Tuple[DatasetSource, float]]]:
+    """Return the active curriculum stage and mixture for the current progress."""
+    progress_ratio = min(max(progress_ratio, 0.0), 1.0)
+    if late_mixture is not None and progress_ratio >= switch_ratio:
+        return "late", late_mixture
+    return "early", early_mixture
 
 
 def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenizer) -> TernaryConfig:
@@ -732,8 +833,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-from", type=str, default="")
 
     # Data
-    parser.add_argument("--train-mixture", type=str, default="fineweb_edu=0.7,dclm=0.3")
-    parser.add_argument("--val-mixture", type=str, default="fineweb_edu=0.5,dclm=0.5")
+    parser.add_argument(
+        "--train-mixture",
+        type=str,
+        default="fineweb_edu=0.55,dclm=0.20,code_search_net_all=0.10,finemath_3plus=0.15",
+    )
+    parser.add_argument(
+        "--early-train-mixture",
+        type=str,
+        default="",
+        help="Optional early-stage training mixture. Falls back to --train-mixture when unset.",
+    )
+    parser.add_argument(
+        "--late-train-mixture",
+        type=str,
+        default="",
+        help="Optional late-stage training mixture. Falls back to --train-mixture when unset.",
+    )
+    parser.add_argument(
+        "--mixture-switch-ratio",
+        type=float,
+        default=0.7,
+        help="Fraction of total tokens after which the trainer switches from the early to late mixture.",
+    )
+    parser.add_argument(
+        "--val-mixture",
+        type=str,
+        default="fineweb_edu=0.45,code_search_net_all=0.20,finemath_3plus=0.35",
+    )
     parser.add_argument("--shuffle-buffer-size", type=int, default=10_000)
     parser.add_argument("--validation-offset-examples", type=int, default=25_000)
     parser.add_argument("--max-document-tokens", type=int, default=32_768)
@@ -799,6 +926,8 @@ def main() -> None:
         parser.error("--hidden-size must be divisible by --num-heads")
     if args.final_blocks < args.initial_blocks:
         parser.error("--final-blocks must be greater than or equal to --initial-blocks")
+    if not 0.0 <= args.mixture_switch_ratio <= 1.0:
+        parser.error("--mixture-switch-ratio must be between 0.0 and 1.0")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -806,7 +935,9 @@ def main() -> None:
     seed_everything(args.seed)
     device = choose_device(args.device)
     amp_enabled, amp_dtype = configure_mixed_precision(device, args.precision)
-    train_mixture = parse_mixture(args.train_mixture)
+    base_train_mixture = parse_mixture(args.train_mixture)
+    early_train_mixture = parse_mixture(args.early_train_mixture) if args.early_train_mixture else base_train_mixture
+    late_train_mixture = parse_mixture(args.late_train_mixture) if args.late_train_mixture else None
     val_mixture = parse_mixture(args.val_mixture)
 
     if hasattr(torch, "set_float32_matmul_precision"):
@@ -830,7 +961,12 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Model parameters: {parameter_count / 1e6:.2f}M")
     print(f"Tokenizer vocab size: {len(tokenizer)}")
-    print(f"Training mixture: {args.train_mixture}")
+    if late_train_mixture is None:
+        print(f"Training mixture: {args.train_mixture}")
+    else:
+        print(f"Early training mixture: {args.early_train_mixture or args.train_mixture}")
+        print(f"Late training mixture: {args.late_train_mixture}")
+        print(f"Mixture switch ratio: {args.mixture_switch_ratio:.2f}")
     print(f"Validation mixture: {args.val_mixture}")
 
     tokens_per_optimization_step = (
@@ -857,8 +993,8 @@ def main() -> None:
         scaler = torch.cuda.amp.GradScaler()
 
     logger = JsonlLogger(args)
-    train_batch_stream = build_batch_stream(
-        train_mixture,
+    early_train_batch_stream = build_batch_stream(
+        early_train_mixture,
         tokenizer,
         seed=args.seed,
         shuffle=True,
@@ -869,6 +1005,20 @@ def main() -> None:
         max_document_tokens=args.max_document_tokens,
         micro_batch_size=args.micro_batch_size,
     )
+    late_train_batch_stream = None
+    if late_train_mixture is not None:
+        late_train_batch_stream = build_batch_stream(
+            late_train_mixture,
+            tokenizer,
+            seed=args.seed + 17,
+            shuffle=True,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            skip_examples=0,
+            restart_on_eof=True,
+            sequence_length=args.sequence_length,
+            max_document_tokens=args.max_document_tokens,
+            micro_batch_size=args.micro_batch_size,
+        )
 
     state = TrainerState()
     if args.resume_from:
@@ -882,6 +1032,15 @@ def main() -> None:
             train_progress = state.tokens_processed / max(args.total_tokens, 1)
             quant_metrics = update_quantization_schedule(base_model, train_progress, args)
             active_blocks = update_block_growth(base_model, train_progress, args)
+            mixture_stage, _ = choose_stage_mixture(
+                train_progress,
+                early_mixture=early_train_mixture,
+                late_mixture=late_train_mixture,
+                switch_ratio=args.mixture_switch_ratio,
+            )
+            active_train_batch_stream = early_train_batch_stream if mixture_stage == "early" else late_train_batch_stream
+            if active_train_batch_stream is None:
+                active_train_batch_stream = early_train_batch_stream
 
             runner.train()
             optimizer.zero_grad(set_to_none=True)
@@ -891,7 +1050,7 @@ def main() -> None:
             step_start = time.time()
 
             for _ in range(args.grad_accumulation_steps):
-                batch = next(train_batch_stream)
+                batch = next(active_train_batch_stream)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
@@ -942,6 +1101,8 @@ def main() -> None:
                         "tokens_processed": float(state.tokens_processed),
                         "tokens_per_second": tokens_per_second,
                         "active_blocks": float(active_blocks),
+                        "mixture_stage_id": 0.0 if mixture_stage == "early" else 1.0,
+                        "mixture_switch_ratio": args.mixture_switch_ratio,
                         **quant_metrics,
                     },
                 )
