@@ -1,69 +1,219 @@
 # bitnet
 
-Experimental PyTorch implementation of a deep ternary BitNet-style language model optimized for weak hardware.
+Experimental PyTorch repo for two related research tracks:
 
-WARNING: THIS IS VERY EARLY STAGE ALPHA SOFTWARE.
+- a deep ternary BitNet-style language model built around a hybrid transformer block
+- a separate ternary Byte Latent Transformer (`blt/`) stack for BLT distillation work
 
-## Current architecture (after latest improvements)
+This is still early-stage research code. Interfaces, defaults, and training behavior are evolving quickly.
 
-- Hidden size: `1024`
-- Layers: `64`
-- Heads: `32` (head dim = 32)
-- These are the default full-training settings used by `run_train.sh`; `run_local_train.sh` uses a smaller local profile for weaker hardware.
-- **Unified hybrid block in every layer**: Every Transformer block contains BOTH Infini-Attention (local + compressive memory with per-head gating) AND Attention Residuals (AttnRes) around both attention and MLP sublayers. No layer splitting.
-- All linear projections use `H-BitLinear` (Hadamard transform on input + ternary weights + 4-bit activations with STE)
-- Tokenizer: two-stage hierarchical tokenizer with end-of-patch markers and learned second-stage merges over first-stage token bytes
-- RMSNorm + extra SubLN for ternary stability
-- RoPE with YaRN scaling
-- Two-stage quantization schedule and progressive block growth during training
+## What Is In This Repo
 
-## Repository layout
+There are now two distinct model/training paths in this repository.
 
-- `config.py`: model and training configuration
+### 1. BitNet-style Hybrid LM
+
+This is the original repo path built around:
+
+- `model.py`
+- `train.py`
+- `run_train.sh`
+- `run_local_train.sh`
+
+Key properties:
+
+- ternary linear layers via `HBitLinear`
+- a unified hybrid block in every layer (`layers/hybrid_block.py`)
+- each block combines:
+  - Infini-Attention style local + memory attention
+  - Attention Residuals (AttnRes)
+- hierarchical tokenizer path under `tokenizer/`
+- streaming Hugging Face dataset training path in `train.py`
+
+### 2. Separate Ternary BLT Stack
+
+This is the newer, isolated BLT research path under `blt/`.
+
+Key properties:
+
+- raw-byte input path instead of the hierarchical tokenizer path
+- separate local encoder, global latent transformer, and local decoder
+- optional teacher-guided distillation from Meta BLT
+- student patcher training and rollout support
+- separate CLI entrypoint via `python3 -m blt`
+- separate runner scripts in `blt/`
+
+The BLT code is intentionally isolated from the older `train.py` path so BLT experiments do not entangle the original BitNet trainer.
+
+## Repository Layout
+
+### Top-level BitNet path
+
+- `config.py`: BitNet model and trainer configuration
 - `model.py`: main `BitNetDeep` model
-- `layers/hybrid_block.py`: main transformer block combining Infini-Attention and AttnRes in every layer
-- `layers/`: ternary linear, block attention residual, Infini-Attention, and supporting modules
+- `train.py`: streaming training pipeline for the BitNet path
+- `layers/hybrid_block.py`: main hybrid transformer block
+- `layers/block_attnres.py`: attention residual implementation
+- `layers/infini_attention.py`: Infini-Attention-style module with memory handling
+- `layers/h_bitlinear.py`: ternary / Hadamard linear layer implementation
 - `tokenizer/`: hierarchical tokenizer implementation
-- `train.py`: streaming training pipeline using Hugging Face datasets
-- `utils.py`: rotary and ternary helper functions
+- `utils.py`: rotary embedding and ternary helper functions
+- `test_forward.py`: quick forward-pass smoke test for the BitNet path
+- `run_train.sh`: full BitNet training launcher
+- `run_local_train.sh`: smaller local BitNet training launcher
 
-## Quick start
+### BLT path
 
-Create a virtual environment and install dependencies:
+- `blt/config.py`: `TernaryBLTConfig`
+- `blt/model.py`: full ternary BLT student model
+- `blt/data.py`: raw-byte dataset and batch stream utilities
+- `blt/losses.py`: BLT distillation losses
+- `blt/train_distill.py`: BLT CLI, trainer, checkpointing, eval, and resume flow
+- `blt/teacher/facebook_blt.py`: optional adapter for Meta BLT teacher inference
+- `blt/patching/teacher_patcher.py`: patch-length helpers and teacher-forced patch utilities
+- `blt/patching/student_entropy.py`: student boundary model for learned patching
+- `blt/layers/`: BLT local encoder / global transformer / local decoder / cross-attention modules
+- `blt/run_blt_distill.sh`: real BLT distillation runner
+- `blt/run_blt_local.sh`: quick local BLT smoke runner
+- `blt/README.md`: BLT-specific notes
+
+### Tests
+
+The repo currently uses simple script-style regression tests rather than a full pytest suite.
+
+BitNet path examples:
+
+- `tests/test_block_attnres.py`
+- `tests/test_hybrid_block.py`
+- `tests/test_infini_attention_memory.py`
+- `tests/test_h_bitlinear.py`
+- `tests/test_config_validation.py`
+
+BLT path examples:
+
+- `tests/test_blt_shapes.py`
+- `tests/test_blt_distill_smoke.py`
+- `tests/test_blt_patching.py`
+- `tests/test_blt_masking.py`
+- `tests/test_blt_teacher_adapter.py`
+- `tests/test_blt_train_cli.py`
+- `tests/test_blt_resume_eval_patcher.py`
+
+## Dependencies
+
+Install the repo dependencies with:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
+
+`requirements.txt` currently includes:
+
+- `torch`
+- `datasets`
+- `tiktoken`
+- optional logging integrations: `tensorboard`, `wandb`
 
 Dependency notes:
 
-- `test_forward.py` requires `tiktoken`
-- `train.py` requires both `tiktoken` and `datasets`
+- `test_forward.py` needs `tiktoken`
+- `train.py` needs `datasets` and `tiktoken`
+- `python3 -m blt --hf-dataset ...` needs `datasets`
+- real Meta BLT distillation also needs:
+  - gated access to `facebook/blt-1b`
+  - gated access to `facebook/blt-entropy`
+  - a local checkout of `facebookresearch/blt`
+  - the upstream BLT runtime dependencies used by that project
 
-Run a quick model smoke test:
+## Quick Start
+
+### BitNet forward smoke test
 
 ```bash
 python3 test_forward.py
 ```
 
-This exercises the hybrid model stack, hierarchical tokenizer, and H-BitLinear path.
+This exercises:
 
-Run the training entrypoint:
+- the hybrid BitNet model stack
+- the hierarchical tokenizer path
+- `HBitLinear`
+
+### BitNet training launchers
+
+Local smoke profile:
 
 ```bash
-# Local test (smaller model, fast on Mac Mini)
 ./run_local_train.sh
+```
 
-# Full model (64 layers, requires GPU with good VRAM)
+Fuller GPU profile:
+
+```bash
 ./run_train.sh
 ```
 
-## Programming data presets
+These launchers drive `train.py`, not the BLT stack.
 
-`train.py` now includes built-in streaming presets for programming data via
-CodeSearchNet language shards:
+### BLT local smoke run
+
+```bash
+./blt/run_blt_local.sh
+```
+
+This is the easiest end-to-end BLT check. It:
+
+- stays on CPU by default
+- uses inline text
+- runs without a teacher
+- exercises the BLT trainer, eval loop, checkpoint save path, and CLI entrypoint
+
+### BLT teacher-guided distillation run
+
+```bash
+BLT_UPSTREAM_REPO=/path/to/facebookresearch/blt ./blt/run_blt_distill.sh
+```
+
+That launcher:
+
+- runs `python3 -m blt`
+- uses `facebook/blt-1b` as the default teacher model
+- uses `facebook/blt-entropy` as the default entropy model
+- defaults to a student patcher rollout mode of `teacher_then_student`
+
+## BitNet Training Path
+
+The original BitNet path uses `train.py` and supports:
+
+- streaming Hugging Face datasets
+- train/validation mixtures
+- curriculum switching between early and late mixtures
+- progressive block growth
+- gradient checkpointing
+- optional `torch.compile`
+
+### Current BitNet launcher defaults
+
+`run_train.sh` uses a larger research profile:
+
+- hidden size `1024`
+- `64` layers
+- `32` heads
+- sequence length `1024`
+- broader early web mixture and later code/math-heavier curriculum
+
+`run_local_train.sh` uses a smaller local profile:
+
+- hidden size `512`
+- `12` layers
+- `16` heads
+- sequence length `512`
+
+### Programming data presets
+
+`train.py` includes built-in streaming programming presets based on CodeSearchNet shards:
 
 - `code_search_net_all`
 - `code_search_net_python`
@@ -73,18 +223,11 @@ CodeSearchNet language shards:
 - `code_search_net_php`
 - `code_search_net_ruby`
 
-Recommended default for broad coding ability: `code_search_net_all`.
+Recommended default for broader coding coverage:
 
-It expands to all available CodeSearchNet languages with a weighted split:
+- `code_search_net_all`
 
-- Python: 30%
-- JavaScript: 22%
-- Java: 18%
-- Go: 15%
-- PHP: 8%
-- Ruby: 7%
-
-Example code-heavy mixture:
+Example:
 
 ```bash
 python3 train.py \
@@ -92,33 +235,29 @@ python3 train.py \
   --val-mixture fineweb_edu=0.5,code_search_net_all=0.5
 ```
 
-If you want to use a gated programming corpus such as StarCoderData, `train.py`
-also supports custom entries in the form:
+Custom Hugging Face dataset entries are also supported in the form:
 
-```bash
+```text
 path|config|split|text_field=weight
 ```
 
-For example:
+Example:
 
 ```bash
-bigcode/starcoderdata|python|train|content=0.2
+python3 train.py \
+  --train-mixture fineweb_edu=0.8,bigcode/starcoderdata|python|train|content=0.2
 ```
 
-That requires an authenticated Hugging Face token in your environment.
+That requires the appropriate authenticated Hugging Face access.
 
-## Math data presets
+### Math data presets
 
-`train.py` now includes built-in streaming presets for math-heavy pretraining
-data:
+Built-in math-oriented presets currently include:
 
 - `finemath_3plus`
 - `open_web_math`
 
-Recommended default: `finemath_3plus` for cleaner math-focused web text, with
-`open_web_math` available when you want broader math coverage.
-
-Example math-heavy mixture:
+Example:
 
 ```bash
 python3 train.py \
@@ -126,25 +265,15 @@ python3 train.py \
   --val-mixture fineweb_edu=0.30,code_search_net_python=0.20,finemath_3plus=0.50
 ```
 
-The default full-hardware launcher `run_train.sh` now includes modest Python
-code and math ratios:
+### Early / late data curriculum
 
-```bash
-./run_train.sh
-```
-
-## Early/Late data curriculum
-
-`train.py` can now switch training mixtures partway through a run. Use:
+`train.py` supports switching mixtures during training with:
 
 - `--early-train-mixture`
 - `--late-train-mixture`
 - `--mixture-switch-ratio`
 
-If these are omitted, the trainer falls back to the single `--train-mixture`
-for the whole run.
-
-Example curriculum:
+Example:
 
 ```bash
 python3 train.py \
@@ -154,6 +283,153 @@ python3 train.py \
   --val-mixture fineweb_edu=0.35,dclm=0.15,code_search_net_all=0.20,finemath_3plus=0.30
 ```
 
+## BLT Path
+
+The BLT stack is a separate research implementation aimed at distilling Meta BLT behavior into a ternary student.
+
+### BLT architecture in this repo
+
+The BLT student path includes:
+
+- local byte encoder
+- latent/global transformer over patches
+- local byte decoder
+- teacher-forced patch utilities
+- optional student patcher training
+- online teacher-guided distillation
+- resume/eval/checkpoint support
+
+The implementation is under:
+
+- `blt/model.py`
+- `blt/layers/`
+- `blt/train_distill.py`
+
+### BLT CLI entrypoint
+
+Everything runs through:
+
+```bash
+python3 -m blt --help
+```
+
+The CLI supports:
+
+- inline text: `--text`
+- text files: `--text-file`
+- streaming Hugging Face datasets: `--hf-dataset`
+- eval sources via `--eval-text`, `--eval-text-file`, `--eval-hf-dataset`
+- checkpoint save / resume
+- student patcher training and rollout
+- teacher disable path via `--no-teacher`
+- teacher entropy patch disable path via `--disable-teacher-patcher`
+
+### BLT teacher adapter requirements
+
+The real teacher adapter in `blt/teacher/facebook_blt.py` is optional and not needed for local smoke runs.
+
+It expects:
+
+- a local `facebookresearch/blt` checkout
+- gated model access to:
+  - `facebook/blt-1b`
+  - `facebook/blt-entropy`
+- the upstream BLT runtime dependencies installed in the active environment
+
+### BLT current behavior / contracts
+
+The BLT path currently assumes:
+
+- suffix-padded masks only
+- patch lengths correspond to the valid prefix, not the full padded width
+- padded rows are zeroed in encoder and decoder outputs
+- when the student patcher takes over, the teacher is rerun on the selected patch layout so patch-level distillation targets stay aligned
+
+### BLT local example
+
+Quick local smoke run:
+
+```bash
+./blt/run_blt_local.sh
+```
+
+Equivalent direct CLI shape:
+
+```bash
+python3 -m blt \
+  --text "Byte latent transformers can be distilled into a ternary student." \
+  --text "This local runner is only a quick smoke test for the BLT package." \
+  --eval-text "Short held out text for a local BLT smoke evaluation." \
+  --no-teacher \
+  --device cpu \
+  --steps 2 \
+  --batch-size 2 \
+  --sequence-length 32 \
+  --save-path checkpoints/blt_local.pt
+```
+
+### BLT distillation example
+
+The recommended entrypoint is the runner script:
+
+```bash
+BLT_UPSTREAM_REPO=/path/to/facebookresearch/blt ./blt/run_blt_distill.sh
+```
+
+Equivalent direct CLI shape:
+
+```bash
+python3 -m blt \
+  --hf-dataset HuggingFaceFW/fineweb-edu \
+  --hf-split train \
+  --hf-text-field text \
+  --eval-text "A short held-out eval sample for BLT distillation." \
+  --teacher-upstream-repo /path/to/facebookresearch/blt \
+  --teacher-model-id facebook/blt-1b \
+  --teacher-entropy-model-id facebook/blt-entropy \
+  --device cuda \
+  --teacher-device cuda \
+  --steps 100 \
+  --batch-size 2 \
+  --sequence-length 256 \
+  --save-path checkpoints/blt_distill.pt \
+  --save-every 20 \
+  --student-patcher-mode teacher_then_student \
+  --student-patcher-warmup-steps 50
+```
+
+## Testing
+
+This repo currently relies on script-style tests that can be run directly with `python3`.
+
+Examples:
+
+```bash
+python3 test_forward.py
+python3 tests/test_hybrid_block.py
+python3 tests/test_infini_attention_memory.py
+python3 tests/test_blt_shapes.py
+python3 tests/test_blt_distill_smoke.py
+python3 tests/test_blt_train_cli.py
+python3 tests/test_blt_resume_eval_patcher.py
+```
+
+Syntax-only verification for edited files can also be done with:
+
+```bash
+python3 -m py_compile path/to/file.py
+```
+
+## Current Caveats
+
+- This is research code, not a production training framework.
+- The real Meta BLT teacher path was designed and regression-tested through local stubs and interface checks in this repo, but the actual upstream Meta runtime still depends on external gated assets and upstream packages.
+- The BLT path explicitly supports suffix-padded masks; non-suffix masks are rejected.
+- The BLT local smoke runner is a functionality check, not a quality benchmark.
+- The BitNet and BLT paths are intentionally separate; features added to one are not automatically mirrored in the other.
+
 ## Notes
 
-- The model is designed to be hackable and CPU-friendly first, with room for more optimized kernels later.
+- Use `run_train.sh` / `run_local_train.sh` for the older BitNet path.
+- Use `blt/run_blt_distill.sh` / `blt/run_blt_local.sh` or `python3 -m blt` for the BLT path.
+- See `blt/README.md` for BLT-specific notes scoped to that directory.
