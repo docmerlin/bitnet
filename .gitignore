@@ -10,3 +10,7 @@ __pycache__/
 /lib/
 /share/
 /pyvenv.cfg
+
+# Local training artifacts and session notes.
+/checkpoints/
+/session*.md
