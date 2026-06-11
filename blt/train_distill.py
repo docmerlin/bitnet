@@ -26,6 +26,7 @@ from blt.losses import DistillationLossWeights, compute_blt_distillation_loss
 from blt.model import TernaryBLTModel, TernaryBLTOutput
 from blt.patching.student_entropy import StudentEntropyModel
 from blt.patching.teacher_patcher import UniformPatcher, normalize_patch_lengths_to_targets, patch_start_mask_from_lengths
+from optim import build_cmud
 from utils import load_checkpoint_payload, seed_everything
 
 
@@ -355,6 +356,7 @@ def resolve_amp_dtype(device: torch.device, precision: str) -> torch.dtype | Non
 
 
 RESUME_STICKY_ARG_NAMES = (
+    "optimizer",
     "disable_teacher_patcher",
     "student_patcher_mode",
     "student_patcher_dim",
@@ -619,7 +621,15 @@ def run_distillation(
 
     config = build_config_from_args(args, checkpoint_config=None if checkpoint is None else checkpoint.get("config"))
     student = TernaryBLTModel(config)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    if args.optimizer == "cmud":
+        optimizer = build_cmud(
+            student,
+            lr=args.mud_learning_rate,
+            fallback_lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     student_patcher, patcher_optimizer = build_student_patcher(args, config)
     start_step = 0
@@ -776,8 +786,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=2, help="Eval micro-batch size.")
     parser.add_argument("--sequence-length", type=int, default=128, help="Packed byte sequence length for autoregressive training.")
     parser.add_argument("--max-document-bytes", type=int, default=2048, help="Maximum encoded byte length per document before packing.")
-    parser.add_argument("--learning-rate", type=float, default=3e-4, help="AdamW learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay.")
+    parser.add_argument("--optimizer", choices=("cmud", "adamw"), default="cmud",
+                        help="Student optimizer: C-MUD (default) or legacy AdamW.")
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
+                        help="LR for AdamW and for the C-Lion fallback group of C-MUD.")
+    parser.add_argument("--mud-learning-rate", type=float, default=1e-3,
+                        help="LR for the C-MUD matrix (MUD) group.")
+    parser.add_argument("--weight-decay", type=float, default=0.01, help="Optimizer weight decay.")
     parser.add_argument("--log-every", type=int, default=1, help="Print metrics every N steps.")
     parser.add_argument("--eval-every", type=int, default=0, help="Run eval every N train steps. Set to 0 to disable.")
     parser.add_argument("--eval-steps", type=int, default=1, help="Number of eval batches per evaluation run.")
