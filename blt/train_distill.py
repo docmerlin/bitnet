@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -89,6 +90,7 @@ class BLTDistillationTrainer:
         patcher_warmup_steps: int = 0,
         patch_length_provider: Any | None = None,
         start_step: int = 0,
+        amp_dtype: torch.dtype | None = None,
     ) -> None:
         self.student = student
         self.optimizer = optimizer
@@ -97,6 +99,7 @@ class BLTDistillationTrainer:
         self.weights = weights or DistillationLossWeights()
         self.device = device or next(student.parameters()).device
         self.student.to(self.device)
+        self.amp_dtype = amp_dtype
 
         self.student_patcher = student_patcher
         self.patcher_optimizer = patcher_optimizer
@@ -113,6 +116,11 @@ class BLTDistillationTrainer:
             raise ValueError("patcher_mode requires a student_patcher")
         if self.student_patcher is not None and self.patcher_optimizer is None:
             raise ValueError("student_patcher requires a patcher_optimizer")
+
+    def _autocast(self) -> contextlib.AbstractContextManager[Any]:
+        if self.amp_dtype is None or self.device.type not in {"cuda", "cpu"}:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
 
     def _provided_patch_lengths(
         self,
@@ -205,53 +213,54 @@ class BLTDistillationTrainer:
         teacher_outputs = None
         provided_patch_lengths = self._provided_patch_lengths(batch)
 
-        if self.teacher is not None:
-            with torch.no_grad():
-                teacher_outputs = self.teacher.forward(
-                    batch.input_ids,
-                    attention_mask=batch.attention_mask,
-                    patch_lengths=provided_patch_lengths,
-                )
+        with self._autocast():
+            if self.teacher is not None:
+                with torch.no_grad():
+                    teacher_outputs = self.teacher.forward(
+                        batch.input_ids,
+                        attention_mask=batch.attention_mask,
+                        patch_lengths=provided_patch_lengths,
+                    )
 
-        current_step = self.global_step + 1
-        teacher_patch_lengths = self._teacher_patch_lengths(provided_patch_lengths, teacher_outputs)
-        patcher_loss, predicted_patch_lengths, patcher_metrics = self._compute_patcher_loss(batch, teacher_patch_lengths)
-        patch_lengths, using_student_patcher = self._select_patch_lengths(
-            provided_patch_lengths,
-            teacher_patch_lengths,
-            predicted_patch_lengths,
-            step=current_step,
-        )
-        teacher_outputs = self._maybe_rerun_teacher_for_selected_patch_lengths(
-            batch,
-            teacher_outputs=teacher_outputs,
-            teacher_patch_lengths=teacher_patch_lengths,
-            selected_patch_lengths=patch_lengths,
-            using_student_patcher=using_student_patcher,
-        )
+            current_step = self.global_step + 1
+            teacher_patch_lengths = self._teacher_patch_lengths(provided_patch_lengths, teacher_outputs)
+            patcher_loss, predicted_patch_lengths, patcher_metrics = self._compute_patcher_loss(batch, teacher_patch_lengths)
+            patch_lengths, using_student_patcher = self._select_patch_lengths(
+                provided_patch_lengths,
+                teacher_patch_lengths,
+                predicted_patch_lengths,
+                step=current_step,
+            )
+            teacher_outputs = self._maybe_rerun_teacher_for_selected_patch_lengths(
+                batch,
+                teacher_outputs=teacher_outputs,
+                teacher_patch_lengths=teacher_patch_lengths,
+                selected_patch_lengths=patch_lengths,
+                using_student_patcher=using_student_patcher,
+            )
 
-        student_outputs = self.student(
-            batch.input_ids,
-            attention_mask=batch.attention_mask,
-            patch_lengths=patch_lengths,
-        )
+            student_outputs = self.student(
+                batch.input_ids,
+                attention_mask=batch.attention_mask,
+                patch_lengths=patch_lengths,
+            )
 
-        model_loss, metrics = compute_blt_distillation_loss(
-            student_outputs,
-            teacher_outputs,
-            labels=batch.labels,
-            attention_mask=batch.attention_mask,
-            weights=self.weights,
-            temperature=self.config.distill_temperature,
-        )
+            model_loss, metrics = compute_blt_distillation_loss(
+                student_outputs,
+                teacher_outputs,
+                labels=batch.labels,
+                attention_mask=batch.attention_mask,
+                weights=self.weights,
+                temperature=self.config.distill_temperature,
+            )
 
-        total_loss = model_loss
-        metrics["model_loss"] = float(model_loss.detach().item())
-        metrics.update(patcher_metrics)
-        if patcher_loss is not None:
-            total_loss = total_loss + self.patcher_loss_weight * patcher_loss
-        metrics["student_patcher_active"] = 1.0 if using_student_patcher else 0.0
-        metrics["loss"] = float(total_loss.detach().item())
+            total_loss = model_loss
+            metrics["model_loss"] = float(model_loss.detach().item())
+            metrics.update(patcher_metrics)
+            if patcher_loss is not None:
+                total_loss = total_loss + self.patcher_loss_weight * patcher_loss
+            metrics["student_patcher_active"] = 1.0 if using_student_patcher else 0.0
+            metrics["loss"] = float(total_loss.detach().item())
 
         self.optimizer.zero_grad(set_to_none=True)
         if self.patcher_optimizer is not None:
@@ -272,50 +281,51 @@ class BLTDistillationTrainer:
         teacher_outputs = None
         provided_patch_lengths = self._provided_patch_lengths(batch)
 
-        if self.teacher is not None:
-            teacher_outputs = self.teacher.forward(
-                batch.input_ids,
-                attention_mask=batch.attention_mask,
-                patch_lengths=provided_patch_lengths,
+        with self._autocast():
+            if self.teacher is not None:
+                teacher_outputs = self.teacher.forward(
+                    batch.input_ids,
+                    attention_mask=batch.attention_mask,
+                    patch_lengths=provided_patch_lengths,
+                )
+
+            teacher_patch_lengths = self._teacher_patch_lengths(provided_patch_lengths, teacher_outputs)
+            patcher_loss, predicted_patch_lengths, patcher_metrics = self._compute_patcher_loss(batch, teacher_patch_lengths)
+            patch_lengths, using_student_patcher = self._select_patch_lengths(
+                provided_patch_lengths,
+                teacher_patch_lengths,
+                predicted_patch_lengths,
+                step=self.global_step,
+            )
+            teacher_outputs = self._maybe_rerun_teacher_for_selected_patch_lengths(
+                batch,
+                teacher_outputs=teacher_outputs,
+                teacher_patch_lengths=teacher_patch_lengths,
+                selected_patch_lengths=patch_lengths,
+                using_student_patcher=using_student_patcher,
             )
 
-        teacher_patch_lengths = self._teacher_patch_lengths(provided_patch_lengths, teacher_outputs)
-        patcher_loss, predicted_patch_lengths, patcher_metrics = self._compute_patcher_loss(batch, teacher_patch_lengths)
-        patch_lengths, using_student_patcher = self._select_patch_lengths(
-            provided_patch_lengths,
-            teacher_patch_lengths,
-            predicted_patch_lengths,
-            step=self.global_step,
-        )
-        teacher_outputs = self._maybe_rerun_teacher_for_selected_patch_lengths(
-            batch,
-            teacher_outputs=teacher_outputs,
-            teacher_patch_lengths=teacher_patch_lengths,
-            selected_patch_lengths=patch_lengths,
-            using_student_patcher=using_student_patcher,
-        )
+            student_outputs = self.student(
+                batch.input_ids,
+                attention_mask=batch.attention_mask,
+                patch_lengths=patch_lengths,
+            )
+            model_loss, metrics = compute_blt_distillation_loss(
+                student_outputs,
+                teacher_outputs,
+                labels=batch.labels,
+                attention_mask=batch.attention_mask,
+                weights=self.weights,
+                temperature=self.config.distill_temperature,
+            )
 
-        student_outputs = self.student(
-            batch.input_ids,
-            attention_mask=batch.attention_mask,
-            patch_lengths=patch_lengths,
-        )
-        model_loss, metrics = compute_blt_distillation_loss(
-            student_outputs,
-            teacher_outputs,
-            labels=batch.labels,
-            attention_mask=batch.attention_mask,
-            weights=self.weights,
-            temperature=self.config.distill_temperature,
-        )
-
-        total_loss = model_loss
-        metrics["model_loss"] = float(model_loss.detach().item())
-        metrics.update(patcher_metrics)
-        if patcher_loss is not None:
-            total_loss = total_loss + self.patcher_loss_weight * patcher_loss
-        metrics["student_patcher_active"] = 1.0 if using_student_patcher else 0.0
-        metrics["loss"] = float(total_loss.detach().item())
+            total_loss = model_loss
+            metrics["model_loss"] = float(model_loss.detach().item())
+            metrics.update(patcher_metrics)
+            if patcher_loss is not None:
+                total_loss = total_loss + self.patcher_loss_weight * patcher_loss
+            metrics["student_patcher_active"] = 1.0 if using_student_patcher else 0.0
+            metrics["loss"] = float(total_loss.detach().item())
         return student_outputs, teacher_outputs, metrics
 
 
@@ -327,6 +337,21 @@ def choose_device(device_arg: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def resolve_amp_dtype(device: torch.device, precision: str) -> torch.dtype | None:
+    """Resolve the autocast dtype for student/teacher forwards (None = full precision).
+
+    Only bf16 is offered for training: it needs no gradient scaler. autocast is
+    enabled on CUDA/CPU; MPS keeps full precision.
+    """
+    if precision == "fp32" or device.type not in {"cuda", "cpu"}:
+        return None
+    if precision == "bf16":
+        return torch.bfloat16
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return None
 
 
 RESUME_STICKY_ARG_NAMES = (
@@ -581,6 +606,9 @@ def run_distillation(
     device = choose_device(args.device)
     teacher_device = choose_device(args.teacher_device)
     args.teacher_device = str(teacher_device)
+    amp_dtype = resolve_amp_dtype(device, args.precision)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
     checkpoint = None
     if args.resume_from is not None:
@@ -639,6 +667,7 @@ def run_distillation(
         patcher_warmup_steps=args.student_patcher_warmup_steps,
         patch_length_provider=patch_length_provider,
         start_step=start_step,
+        amp_dtype=amp_dtype,
     )
 
     move_optimizer_to_device(trainer.optimizer, trainer.device)
@@ -751,6 +780,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
 
     parser.add_argument("--device", default="auto", help="Student training device.")
+    parser.add_argument("--precision", choices=("auto", "fp32", "bf16"), default="auto",
+                        help="Mixed-precision mode for student/teacher forwards (bf16 autocast; default auto).")
     parser.add_argument("--teacher-device", default="auto", help="Teacher execution device.")
     parser.add_argument("--no-teacher", action="store_true", help="Disable distillation and run hard-CE-only training.")
     parser.add_argument("--teacher-model-id", default="facebook/blt-1b", help="Teacher BLT model ID.")
