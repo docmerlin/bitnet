@@ -48,6 +48,13 @@ class InfiniAttention(nn.Module):
         self.gate = nn.Parameter(torch.zeros(num_heads))
         self.update_memory_buffers = True
 
+        # Per-head QK normalization stabilizes attention logits in deep ternary nets.
+        self.use_qk_norm = bool(getattr(config, "use_qk_norm", True))
+        if self.use_qk_norm:
+            eps = float(getattr(config, "rms_norm_eps", 1e-5))
+            self.q_norm = nn.RMSNorm(self.head_dim, eps=eps)
+            self.k_norm = nn.RMSNorm(self.head_dim, eps=eps)
+
         # This is transient recurrence state, not learned model state.
         self.register_buffer("memory_k", torch.zeros(num_heads, memory_dim, self.head_dim), persistent=False)
         self.register_buffer("memory_v", torch.zeros(num_heads, memory_dim, self.head_dim), persistent=False)
@@ -145,6 +152,10 @@ class InfiniAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
         rope_scale = self._rope_scaling_factor(seq_len)

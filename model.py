@@ -62,21 +62,31 @@ class BitNetDeep(nn.Module):
             )
             self.layers.append(layer)
 
-        self.lm_head = HBitLinear(
-            self.config.hidden_size,
-            self.config.vocab_size,
-            bias=False,
-            config=self.config
-        )
+        # The output projection defaults to full precision (better quality than a
+        # ternary head); set quantize_lm_head=True to keep it ternary.
+        if getattr(self.config, "quantize_lm_head", False):
+            self.lm_head = HBitLinear(
+                self.config.hidden_size,
+                self.config.vocab_size,
+                bias=False,
+                config=self.config,
+            )
+        else:
+            self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
 
         # Tie weights after initialization so the shared tensor is not overwritten.
-        self.lm_head.weight = self.embed_tokens.weight
+        if getattr(self.config, "tie_word_embeddings", True):
+            self.lm_head.weight = self.embed_tokens.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        elif isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
 
     def forward(
         self,

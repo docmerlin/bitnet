@@ -37,6 +37,11 @@ class TernaryConfig:
     use_4bit_activations: bool = True
     ternary_weight_bits: int = 2  # 1.58-bit effective (-1,0,1)
 
+    # Stability / quality
+    use_qk_norm: bool = True       # per-head RMSNorm on q/k before RoPE (deep ternary stability)
+    tie_word_embeddings: bool = True
+    quantize_lm_head: bool = False  # keep the output projection in full precision for quality
+
     def __post_init__(self):
         if self.rope_scaling is None:
             self.rope_scaling = {
