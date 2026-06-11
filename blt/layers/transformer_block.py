@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,44 +45,40 @@ class TernarySelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        mask_floor = torch.finfo(scores.dtype).min
-
+        mask_floor = torch.finfo(q.dtype).min
+        attn_bias = None
         if self.causal:
             q_positions = torch.arange(seq_len, device=x.device).view(seq_len, 1)
             k_positions = torch.arange(seq_len, device=x.device).view(1, seq_len)
             invalid = k_positions > q_positions
             if self.local_window is not None:
                 invalid |= (q_positions - k_positions) >= self.local_window
-            scores = scores.masked_fill(invalid.view(1, 1, seq_len, seq_len), mask_floor)
+            attn_bias = torch.zeros(seq_len, seq_len, dtype=q.dtype, device=x.device)
+            attn_bias = attn_bias.masked_fill(invalid, mask_floor).view(1, 1, seq_len, seq_len)
 
         query_valid = None
         if attention_mask is not None:
             if attention_mask.ndim == 2:
-                query_valid = attention_mask[:, None, :seq_len, None].to(torch.bool)
                 key_valid = attention_mask[:, None, None, :seq_len].to(torch.bool)
-                scores = scores.masked_fill(~key_valid, mask_floor)
+                if attn_bias is None:
+                    attn_bias = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=q.dtype, device=x.device)
+                else:
+                    attn_bias = attn_bias.expand(batch_size, 1, seq_len, seq_len).clone()
+                attn_bias.masked_fill_(~key_valid, mask_floor)
+                query_valid = attention_mask[:, None, :seq_len, None].to(torch.bool)
             elif attention_mask.ndim == 3:
-                additive_mask = attention_mask[:, None, :seq_len, :seq_len].to(dtype=scores.dtype)
-                scores = scores + additive_mask
+                additive_mask = attention_mask[:, None, :seq_len, :seq_len].to(dtype=q.dtype)
+                attn_bias = additive_mask if attn_bias is None else attn_bias + additive_mask
                 query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
             elif attention_mask.ndim == 4:
-                additive_mask = attention_mask[:, :, :seq_len, :seq_len].to(dtype=scores.dtype)
-                scores = scores + additive_mask
+                additive_mask = attention_mask[:, :, :seq_len, :seq_len].to(dtype=q.dtype)
+                attn_bias = additive_mask if attn_bias is None else attn_bias + additive_mask
                 query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
             else:
                 raise ValueError("attention_mask must be 2D, 3D, or 4D")
 
-        if query_valid is not None:
-            scores = scores.masked_fill(~query_valid, 0.0)
-
-        probs = F.softmax(scores, dim=-1)
-        if self.dropout > 0.0:
-            probs = F.dropout(probs, p=self.dropout, training=self.training)
-        if query_valid is not None:
-            probs = probs.masked_fill(~query_valid, 0.0)
-
-        context = torch.matmul(probs, v)
+        dropout_p = self.dropout if self.training else 0.0
+        context = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, dropout_p=dropout_p)
         if query_valid is not None:
             context = context.masked_fill(~query_valid, 0.0)
 

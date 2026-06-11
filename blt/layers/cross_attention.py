@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,36 +59,29 @@ class TernaryCrossAttention(nn.Module):
         k = self.k_proj(self.kv_norm(key_value)).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(self.kv_norm(key_value)).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        mask_floor = torch.finfo(scores.dtype).min
+        mask_floor = torch.finfo(q.dtype).min
+        attn_bias = None
         query_valid = None
 
         if mask is not None:
             if mask.dtype == torch.bool:
                 bool_mask = mask[:, None, :, :]
                 query_valid = bool_mask.any(dim=-1, keepdim=True)
-                scores = scores.masked_fill(~bool_mask, mask_floor)
+                attn_bias = torch.zeros(batch_size, 1, query_len, kv_len, dtype=q.dtype, device=query.device)
+                attn_bias = attn_bias.masked_fill(~bool_mask, mask_floor)
             elif mask.ndim == 3:
-                additive_mask = mask[:, None, :, :].to(dtype=scores.dtype)
-                scores = scores + additive_mask
+                additive_mask = mask[:, None, :, :].to(dtype=q.dtype)
+                attn_bias = additive_mask
                 query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
             elif mask.ndim == 4:
-                additive_mask = mask[:, :, :, :].to(dtype=scores.dtype)
-                scores = scores + additive_mask
+                additive_mask = mask[:, :, :, :].to(dtype=q.dtype)
+                attn_bias = additive_mask
                 query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
             else:
                 raise ValueError("cross-attention mask must be bool, 3D additive, or 4D additive")
 
-        if query_valid is not None:
-            scores = scores.masked_fill(~query_valid, 0.0)
-
-        probs = F.softmax(scores, dim=-1)
-        if self.dropout > 0.0:
-            probs = F.dropout(probs, p=self.dropout, training=self.training)
-        if query_valid is not None:
-            probs = probs.masked_fill(~query_valid, 0.0)
-
-        context = torch.matmul(probs, v)
+        dropout_p = self.dropout if self.training else 0.0
+        context = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, dropout_p=dropout_p)
         if query_valid is not None:
             context = context.masked_fill(~query_valid, 0.0)
 
