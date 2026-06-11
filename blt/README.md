@@ -35,3 +35,6 @@ Notes:
 - Run these from the repo root, or let the scripts relocate to the repo root automatically.
 - The BLT package lives under `blt/`, but it is executed as a Python module from the repository root with `python3 -m blt`.
 - The existing `run_train.sh` and `run_local_train.sh` scripts remain for the older BitNet training stack and are not BLT entrypoints.
+- If you omit `--eval-text`, `--eval-text-file`, and `--eval-hf-dataset`, evaluation reuses the training stream and prints a warning.
+- `--student-patcher-mode distill_only` trains the student patcher on teacher boundaries but keeps teacher patches for the forward pass.
+- Resume restores optimizer and student-patcher state only. Data streams restart from the beginning and RNG state is not checkpointed.

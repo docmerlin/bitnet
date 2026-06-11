@@ -31,7 +31,7 @@ class BitNetDeep(nn.Module):
     """Deep Ternary LLM based on BitNet b1.58 with modern techniques.
 
     The model uses:
-    - 64 Block Attention Residual layers
+    - hybrid transformer layers that combine Infini-Attention and AttnRes in every block
     - ternary H-BitLinear projections
     - RMSNorm plus an extra SubLN before the stack
     - tied embeddings / output projection weights

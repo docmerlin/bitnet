@@ -53,7 +53,7 @@ The BLT code is intentionally isolated from the older `train.py` path so BLT exp
 - `model.py`: main `BitNetDeep` model
 - `train.py`: streaming training pipeline for the BitNet path
 - `layers/hybrid_block.py`: main hybrid transformer block
-- `layers/block_attnres.py`: attention residual implementation
+- `layers/block_attnres.py`: standalone block-local attention module (legacy/alternate block; production model uses AttnRes wrappers inside `hybrid_block.py`)
 - `layers/infini_attention.py`: Infini-Attention-style module with memory handling
 - `layers/h_bitlinear.py`: ternary / Hadamard linear layer implementation
 - `tokenizer/`: hierarchical tokenizer implementation
@@ -318,9 +318,9 @@ The CLI supports:
 - inline text: `--text`
 - text files: `--text-file`
 - streaming Hugging Face datasets: `--hf-dataset`
-- eval sources via `--eval-text`, `--eval-text-file`, `--eval-hf-dataset`
+- eval sources via `--eval-text`, `--eval-text-file`, `--eval-hf-dataset` (if omitted, the trainer reuses the training stream and prints a warning)
 - checkpoint save / resume
-- student patcher training and rollout
+- student patcher training and rollout (`distill_only`, `teacher_then_student`, `student`)
 - teacher disable path via `--no-teacher`
 - teacher entropy patch disable path via `--disable-teacher-patcher`
 
@@ -408,10 +408,22 @@ Examples:
 python3 test_forward.py
 python3 tests/test_hybrid_block.py
 python3 tests/test_infini_attention_memory.py
+python3 tests/test_utils.py
+python3 tests/test_tokenizer_roundtrip.py
+python3 tests/test_train_smoke.py
 python3 tests/test_blt_shapes.py
+python3 tests/test_blt_masking.py
+python3 tests/test_blt_patching.py
 python3 tests/test_blt_distill_smoke.py
+python3 tests/test_blt_teacher_adapter.py
 python3 tests/test_blt_train_cli.py
 python3 tests/test_blt_resume_eval_patcher.py
+
+Or run the full script-style suite with pytest from the repo root:
+
+```bash
+python3 -m pytest
+```
 ```
 
 Syntax-only verification for edited files can also be done with:
@@ -423,6 +435,7 @@ python3 -m py_compile path/to/file.py
 ## Current Caveats
 
 - This is research code, not a production training framework.
+- Resume restores optimizer/scheduler (and BLT student-patcher) state only. Training streams restart from the beginning of each dataset and RNG state is not checkpointed.
 - The real Meta BLT teacher path was designed and regression-tested through local stubs and interface checks in this repo, but the actual upstream Meta runtime still depends on external gated assets and upstream packages.
 - The BLT path explicitly supports suffix-padded masks; non-suffix masks are rejected.
 - The BLT local smoke runner is a functionality check, not a quality benchmark.

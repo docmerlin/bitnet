@@ -13,6 +13,7 @@ from blt.layers.local_decoder import LocalDecoder
 from blt.layers.local_encoder import LocalEncoder
 from blt.patching.teacher_patcher import UniformPatcher, normalize_patch_lengths_to_targets, patch_presence_mask
 from layers.h_bitlinear import HBitLinear
+from utils import validate_suffix_padded_mask
 
 
 @dataclass(slots=True)
@@ -55,10 +56,7 @@ class TernaryBLTModel(nn.Module):
             raise ValueError("attention_mask must have the same shape as input_ids")
 
         attention_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
-        if attention_mask.numel() > 0:
-            shifted = attention_mask[:, 1:] > attention_mask[:, :-1]
-            if torch.any(shifted):
-                raise ValueError("TernaryBLTModel only supports suffix-padded attention masks")
+        validate_suffix_padded_mask(attention_mask)
 
         valid_lengths = attention_mask.sum(dim=1)
 

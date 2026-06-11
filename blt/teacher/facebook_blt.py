@@ -12,6 +12,7 @@ import torch
 
 from blt.model import TernaryBLTOutput
 from blt.patching.teacher_patcher import normalize_patch_lengths
+from utils import validate_suffix_padded_mask
 
 
 def import_upstream_blt(upstream_repo_path: str | Path | None = None) -> Dict[str, Any]:
@@ -233,14 +234,89 @@ class FacebookBLTTeacher:
         )
 
     @staticmethod
-    def _is_suffix_padded(mask: torch.Tensor) -> bool:
-        first_zero_seen = False
-        for value in mask.to(dtype=torch.bool).tolist():
-            if not value:
-                first_zero_seen = True
-            elif first_zero_seen:
-                return False
-        return True
+    def _slice_output(output: TernaryBLTOutput, batch_index: int) -> TernaryBLTOutput:
+        return TernaryBLTOutput(
+            logits=output.logits[batch_index : batch_index + 1],
+            patch_lengths=output.patch_lengths[batch_index : batch_index + 1],
+            patch_ids=output.patch_ids[batch_index : batch_index + 1],
+            encoder_hidden=output.encoder_hidden[batch_index : batch_index + 1],
+            encoder_patches=output.encoder_patches[batch_index : batch_index + 1],
+            global_hidden=output.global_hidden[batch_index : batch_index + 1],
+            decoder_hidden=output.decoder_hidden[batch_index : batch_index + 1],
+        )
+
+    def _forward_suffix_padded_batch(
+        self,
+        tokens: torch.Tensor,
+        attention_mask: torch.Tensor,
+        batch_patch_lengths: torch.Tensor | None,
+    ) -> TernaryBLTOutput:
+        validate_suffix_padded_mask(attention_mask)
+        batch_size, seq_len = tokens.shape
+        valid_lengths = attention_mask.sum(dim=1)
+        if torch.any(valid_lengths <= 0):
+            raise ValueError("attention_mask must contain at least one valid token per sequence")
+
+        outputs_by_index: dict[int, tuple[int, TernaryBLTOutput]] = {}
+        max_num_patches = 0
+        for valid_length in valid_lengths.unique(sorted=True).tolist():
+            valid_length = int(valid_length)
+            batch_indices = torch.nonzero(valid_lengths == valid_length, as_tuple=False).flatten()
+            group_tokens = tokens[batch_indices, :valid_length]
+            group_patch_lengths = None
+            if batch_patch_lengths is not None:
+                group_patch_lengths = batch_patch_lengths[batch_indices]
+            resolved_patch_lengths = self._resolve_patch_lengths(group_tokens, group_patch_lengths)
+            group_output = self._forward_trimmed(group_tokens, resolved_patch_lengths)
+            for local_index, batch_index in enumerate(batch_indices.tolist()):
+                row_output = self._slice_output(group_output, local_index)
+                outputs_by_index[batch_index] = (valid_length, row_output)
+                max_num_patches = max(max_num_patches, row_output.patch_lengths.size(1))
+
+        first_output = outputs_by_index[min(outputs_by_index)][1]
+        hidden_dim = first_output.encoder_hidden.size(-1)
+        patch_dim = first_output.encoder_patches.size(-1)
+        decoder_dim = first_output.decoder_hidden.size(-1)
+        vocab_size = first_output.logits.size(-1)
+        batch_logits = tokens.new_zeros((batch_size, seq_len, vocab_size), dtype=first_output.logits.dtype)
+        batch_patch_lengths_out = tokens.new_zeros((batch_size, max_num_patches), dtype=torch.long)
+        batch_patch_ids = tokens.new_zeros((batch_size, seq_len), dtype=torch.long)
+        batch_encoder_hidden = tokens.new_zeros(
+            (batch_size, seq_len, hidden_dim),
+            dtype=first_output.encoder_hidden.dtype,
+        )
+        batch_encoder_patches = tokens.new_zeros(
+            (batch_size, max_num_patches, patch_dim),
+            dtype=first_output.encoder_patches.dtype,
+        )
+        batch_global_hidden = tokens.new_zeros(
+            (batch_size, max_num_patches, patch_dim),
+            dtype=first_output.global_hidden.dtype,
+        )
+        batch_decoder_hidden = tokens.new_zeros(
+            (batch_size, seq_len, decoder_dim),
+            dtype=first_output.decoder_hidden.dtype,
+        )
+
+        for batch_index, (valid_length, output) in outputs_by_index.items():
+            num_patches = output.patch_lengths.size(1)
+            batch_logits[batch_index, :valid_length] = output.logits[0]
+            batch_patch_lengths_out[batch_index, :num_patches] = output.patch_lengths[0]
+            batch_patch_ids[batch_index, :valid_length] = output.patch_ids[0]
+            batch_encoder_hidden[batch_index, :valid_length] = output.encoder_hidden[0]
+            batch_encoder_patches[batch_index, :num_patches] = output.encoder_patches[0]
+            batch_global_hidden[batch_index, :num_patches] = output.global_hidden[0]
+            batch_decoder_hidden[batch_index, :valid_length] = output.decoder_hidden[0]
+
+        return TernaryBLTOutput(
+            logits=batch_logits,
+            patch_lengths=batch_patch_lengths_out,
+            patch_ids=batch_patch_ids,
+            encoder_hidden=batch_encoder_hidden,
+            encoder_patches=batch_encoder_patches,
+            global_hidden=batch_global_hidden,
+            decoder_hidden=batch_decoder_hidden,
+        )
 
     @torch.no_grad()
     def forward(
@@ -264,55 +340,4 @@ class FacebookBLTTeacher:
             resolved_patch_lengths = self._resolve_patch_lengths(tokens, batch_patch_lengths)
             return self._forward_trimmed(tokens, resolved_patch_lengths)
 
-        batch_size, seq_len = tokens.shape
-        outputs: list[TernaryBLTOutput] = []
-        valid_lengths: list[int] = []
-        max_num_patches = 0
-
-        for batch_index in range(batch_size):
-            row_mask = attention_mask[batch_index]
-            if not self._is_suffix_padded(row_mask):
-                raise ValueError("FacebookBLTTeacher only supports suffix-padded attention masks")
-            valid_length = int(row_mask.sum().item())
-            if valid_length <= 0:
-                raise ValueError("attention_mask must contain at least one valid token per sequence")
-
-            valid_lengths.append(valid_length)
-            row_tokens = tokens[batch_index : batch_index + 1, :valid_length]
-            row_patch_lengths = None if batch_patch_lengths is None else batch_patch_lengths[batch_index : batch_index + 1]
-            resolved_patch_lengths = self._resolve_patch_lengths(row_tokens, row_patch_lengths)
-            output = self._forward_trimmed(row_tokens, resolved_patch_lengths)
-            outputs.append(output)
-            max_num_patches = max(max_num_patches, output.patch_lengths.size(1))
-
-        hidden_dim = outputs[0].encoder_hidden.size(-1)
-        patch_dim = outputs[0].encoder_patches.size(-1)
-        decoder_dim = outputs[0].decoder_hidden.size(-1)
-        vocab_size = outputs[0].logits.size(-1)
-        batch_logits = tokens.new_zeros((batch_size, seq_len, vocab_size), dtype=outputs[0].logits.dtype)
-        batch_patch_lengths_out = tokens.new_zeros((batch_size, max_num_patches), dtype=torch.long)
-        batch_patch_ids = tokens.new_zeros((batch_size, seq_len), dtype=torch.long)
-        batch_encoder_hidden = tokens.new_zeros((batch_size, seq_len, hidden_dim), dtype=outputs[0].encoder_hidden.dtype)
-        batch_encoder_patches = tokens.new_zeros((batch_size, max_num_patches, patch_dim), dtype=outputs[0].encoder_patches.dtype)
-        batch_global_hidden = tokens.new_zeros((batch_size, max_num_patches, patch_dim), dtype=outputs[0].global_hidden.dtype)
-        batch_decoder_hidden = tokens.new_zeros((batch_size, seq_len, decoder_dim), dtype=outputs[0].decoder_hidden.dtype)
-
-        for batch_index, (valid_length, output) in enumerate(zip(valid_lengths, outputs)):
-            num_patches = output.patch_lengths.size(1)
-            batch_logits[batch_index, :valid_length] = output.logits[0]
-            batch_patch_lengths_out[batch_index, :num_patches] = output.patch_lengths[0]
-            batch_patch_ids[batch_index, :valid_length] = output.patch_ids[0]
-            batch_encoder_hidden[batch_index, :valid_length] = output.encoder_hidden[0]
-            batch_encoder_patches[batch_index, :num_patches] = output.encoder_patches[0]
-            batch_global_hidden[batch_index, :num_patches] = output.global_hidden[0]
-            batch_decoder_hidden[batch_index, :valid_length] = output.decoder_hidden[0]
-
-        return TernaryBLTOutput(
-            logits=batch_logits,
-            patch_lengths=batch_patch_lengths_out,
-            patch_ids=batch_patch_ids,
-            encoder_hidden=batch_encoder_hidden,
-            encoder_patches=batch_encoder_patches,
-            global_hidden=batch_global_hidden,
-            decoder_hidden=batch_decoder_hidden,
-        )
+        return self._forward_suffix_padded_batch(tokens, attention_mask, batch_patch_lengths)

@@ -149,7 +149,9 @@ def test_blt_resume_eval_and_student_patcher() -> bool:
         step_checkpoint = checkpoint_path.with_name("blt-resume-step1.pt")
         assert step_checkpoint.exists(), f"Expected periodic checkpoint at {step_checkpoint}"
 
-        saved_payload = torch.load(checkpoint_path, map_location="cpu")
+        from utils import load_checkpoint_payload
+
+        saved_payload = load_checkpoint_payload(checkpoint_path, map_location="cpu")
         assert saved_payload["student_patcher"] is not None, "Expected student patcher state in checkpoint"
         assert saved_payload["step"] == 1
 
@@ -231,7 +233,7 @@ def test_blt_resume_eval_and_student_patcher() -> bool:
         assert second_result["student_patcher_enabled"] is True
         assert second_result["metrics"]["student_patcher_active"] == 0.0
 
-        resumed_payload = torch.load(checkpoint_path, map_location="cpu")
+        resumed_payload = load_checkpoint_payload(checkpoint_path, map_location="cpu")
         resumed_args = resumed_payload["training_args"]
         assert resumed_args["student_patcher_mode"] == "teacher_then_student"
         assert resumed_args["student_patcher_dim"] == 96

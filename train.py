@@ -49,6 +49,7 @@ from layers.hybrid_block import HybridTransformerBlock
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
 from model import BitNetDeep
+from utils import load_checkpoint_payload, seed_everything
 
 try:
     from datasets import load_dataset
@@ -527,13 +528,6 @@ class BatchStream:
         }
 
 
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def choose_device(device_arg: str) -> torch.device:
     if device_arg != "auto":
         return torch.device(device_arg)
@@ -831,7 +825,7 @@ def load_checkpoint(
     scheduler: LambdaLR,
     scaler: Optional[Any],
 ) -> TrainerState:
-    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload = load_checkpoint_payload(checkpoint_path, map_location="cpu")
     model.load_state_dict(payload["model"])
     reset_infini_memory(model)
     optimizer.load_state_dict(payload["optimizer"])
@@ -1102,6 +1096,11 @@ def main() -> None:
     if args.resume_from:
         state = load_checkpoint(Path(args.resume_from), base_model, optimizer, scheduler, scaler)
         print(f"Resumed from {args.resume_from} at step {state.step}")
+        print(
+            "Resume restores optimizer/scheduler state only. Training streams restart from the "
+            "beginning of each dataset and RNG state is not checkpointed.",
+            flush=True,
+        )
 
     start_time = time.time()
 

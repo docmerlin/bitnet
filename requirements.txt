@@ -5,3 +5,6 @@ tiktoken
 # Optional trainer logging integrations.
 tensorboard
 wandb
+
+# Optional test runner.
+pytest

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -25,7 +24,8 @@ from blt.data import (
 from blt.losses import DistillationLossWeights, compute_blt_distillation_loss
 from blt.model import TernaryBLTModel, TernaryBLTOutput
 from blt.patching.student_entropy import StudentEntropyModel
-from blt.patching.teacher_patcher import UniformPatcher, normalize_patch_lengths, normalize_patch_lengths_to_targets, patch_start_mask_from_lengths
+from blt.patching.teacher_patcher import UniformPatcher, normalize_patch_lengths_to_targets, patch_start_mask_from_lengths
+from utils import load_checkpoint_payload, seed_everything
 
 
 class TeacherModel(Protocol):
@@ -329,13 +329,6 @@ def choose_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 RESUME_STICKY_ARG_NAMES = (
     "disable_teacher_patcher",
     "student_patcher_mode",
@@ -410,6 +403,14 @@ def _source_value(args: argparse.Namespace, name: str, *, eval_mode: bool) -> An
     return getattr(args, name)
 
 
+def _has_explicit_eval_source(args: argparse.Namespace) -> bool:
+    return (
+        args.eval_text is not None
+        or args.eval_text_file is not None
+        or args.eval_hf_dataset is not None
+    )
+
+
 def build_text_stream(args: argparse.Namespace, *, eval_mode: bool = False):
     text = _source_value(args, "text", eval_mode=eval_mode)
     text_file = _source_value(args, "text_file", eval_mode=eval_mode)
@@ -437,6 +438,11 @@ def build_batch_stream(
     *,
     eval_mode: bool = False,
 ) -> BatchByteStream:
+    if eval_mode and not _has_explicit_eval_source(args):
+        print(
+            "No explicit eval source provided; reusing the training text/HF stream for evaluation.",
+            flush=True,
+        )
     vocabulary = ByteVocabulary(config)
     text_stream = build_text_stream(args, eval_mode=eval_mode)
     sequence_stream = PackedByteSequenceStream(
@@ -543,7 +549,7 @@ def load_checkpoint(checkpoint_path: str | Path, *, device: torch.device) -> dic
     path = Path(checkpoint_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"checkpoint not found: {path}")
-    return torch.load(path, map_location=device)
+    return load_checkpoint_payload(path, map_location=device)
 
 
 def evaluate(
@@ -594,6 +600,11 @@ def run_distillation(
         student.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = int(checkpoint.get("step", 0))
+        print(
+            "Resume restores optimizer and student-patcher state only. Data streams restart from "
+            "the beginning and RNG state is not checkpointed.",
+            flush=True,
+        )
 
         saved_patcher_state = checkpoint.get("student_patcher")
         saved_patcher_optimizer_state = checkpoint.get("student_patcher_optimizer")
@@ -747,7 +758,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--teacher-upstream-repo", default=None, help="Path to a local facebookresearch/blt checkout.")
     parser.add_argument("--disable-teacher-patcher", action="store_true", help="Disable teacher entropy patching and fall back to static patch lengths unless the batch already provides them.")
 
-    parser.add_argument("--student-patcher-mode", choices=["off", "distill_only", "teacher_then_student", "student"], default="off")
+    parser.add_argument(
+        "--student-patcher-mode",
+        choices=["off", "distill_only", "teacher_then_student", "student"],
+        default="off",
+        help=(
+            "Student patcher rollout mode. "
+            "off=disabled; "
+            "distill_only=train the patcher on teacher boundaries but keep teacher patches for forward; "
+            "teacher_then_student=use teacher patches until warmup, then student patches; "
+            "student=always use student patches."
+        ),
+    )
     parser.add_argument("--student-patcher-dim", type=int, default=128)
     parser.add_argument("--student-patcher-layers", type=int, default=2)
     parser.add_argument("--student-patcher-heads", type=int, default=4)
