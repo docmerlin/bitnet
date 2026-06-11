@@ -553,11 +553,13 @@ def save_checkpoint(
 ) -> Path:
     checkpoint_path = checkpoint_path_for_step(save_path, step, final=final)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    # Unwrap torch.compile so checkpoint keys stay free of the _orig_mod prefix.
+    model_to_save = getattr(student, "_orig_mod", student)
     torch.save(
         {
             "step": step,
             "config": asdict(config),
-            "model": student.state_dict(),
+            "model": model_to_save.state_dict(),
             "optimizer": optimizer.state_dict(),
             "metrics": metrics,
             "eval_metrics": eval_metrics,
@@ -674,6 +676,11 @@ def run_distillation(
     if trainer.patcher_optimizer is not None:
         move_optimizer_to_device(trainer.patcher_optimizer, trainer.device)
 
+    # Compile after the optimizer is built (params are shared) and after any resume
+    # load (which targets the uncompiled module). CUDA only.
+    if args.compile and hasattr(torch, "compile") and device.type == "cuda":
+        trainer.student = torch.compile(trainer.student)
+
     batch_stream = build_batch_stream(args, config)
     eval_stream = build_batch_stream(args, config, eval_mode=True) if args.eval_every > 0 else None
     end_step = start_step + args.steps
@@ -782,6 +789,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="Student training device.")
     parser.add_argument("--precision", choices=("auto", "fp32", "bf16"), default="auto",
                         help="Mixed-precision mode for student/teacher forwards (bf16 autocast; default auto).")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                        help="Compile the student with torch.compile on CUDA (default: on; --no-compile to disable).")
     parser.add_argument("--teacher-device", default="auto", help="Teacher execution device.")
     parser.add_argument("--no-teacher", action="store_true", help="Disable distillation and run hard-CE-only training.")
     parser.add_argument("--teacher-model-id", default="facebook/blt-1b", help="Teacher BLT model ID.")
