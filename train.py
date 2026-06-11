@@ -1003,7 +1003,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Runtime controls
     parser.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     parser.add_argument("--gradient-checkpointing", action="store_true")
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                        help="Compile the model with torch.compile on CUDA (default: on; --no-compile to disable)")
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
 
     # Logging / eval / saving
@@ -1057,7 +1058,11 @@ def main() -> None:
     base_model.to(device)
 
     runner = TrainingWrapper(base_model, gradient_checkpointing=args.gradient_checkpointing).to(device)
-    if args.compile and hasattr(torch, "compile") and not args.gradient_checkpointing:
+    should_compile = args.compile and hasattr(torch, "compile") and not args.gradient_checkpointing
+    if should_compile and device.type != "cuda":
+        print("Skipping torch.compile: only enabled on CUDA.", flush=True)
+        should_compile = False
+    if should_compile:
         runner = torch.compile(runner, mode=args.compile_mode)
     elif args.compile and args.gradient_checkpointing:
         print("Skipping torch.compile because gradient checkpointing is enabled.", flush=True)
