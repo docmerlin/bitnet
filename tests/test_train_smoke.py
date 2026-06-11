@@ -38,9 +38,15 @@ def _tiny_config() -> TernaryConfig:
     )
 
 
-def _tiny_args() -> argparse.Namespace:
+def _tiny_args(optimizer: str = "cmud") -> argparse.Namespace:
     return argparse.Namespace(
+        optimizer=optimizer,
         learning_rate=1e-4,
+        mud_learning_rate=1e-3,
+        mud_momentum=0.95,
+        mud_passes=1,
+        no_cautious=False,
+        no_optimizer_8bit=False,
         weight_decay=0.0,
         lion_beta1=0.9,
         lion_beta2=0.99,

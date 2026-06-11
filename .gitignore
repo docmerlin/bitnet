@@ -6,6 +6,7 @@ __pycache__/
 # Local virtualenv artifacts when the repo lives inside a venv.
 /.venv/
 /bin/
+/etc/
 /include/
 /lib/
 /share/

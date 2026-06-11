@@ -88,7 +88,10 @@ class HybridTransformerBlock(nn.Module):
         self.ffn_up = HBitLinear(hidden_size, intermediate_size * 2, bias=False, config=config)
         self.ffn_down = HBitLinear(intermediate_size, hidden_size, bias=False, config=config)
 
-        # Learned gate to balance Infini-Attention with residual path
+        # Learned gate to balance Infini-Attention with residual path.
+        # Initialized to 0 so sigmoid(gate)=0.5 at init: the attention path starts
+        # damped to ~half scale (and AttnRes scales it again by attn_res_init_scale).
+        # If early training is sluggish, a positive init here opens the attention path.
         self.gate = nn.Parameter(torch.zeros(1))  # learned scalar gate
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:

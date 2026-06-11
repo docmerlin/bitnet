@@ -7,7 +7,8 @@ Features:
 - hierarchical tokenization with sequence packing
 - two-stage quantization schedule for ternary warmup -> full QAT
 - progressive Block Attention Residual growth
-- Lion optimizer with decoupled weight decay
+- C-MUD optimizer (cautious MomentUm Decorrelation + 8-bit C-Lion fallback),
+  with the legacy Lion optimizer available via --optimizer lion
 - cosine LR schedule with warmup and cooldown
 - optional gradient checkpointing, mixed precision, torch.compile, validation,
   checkpointing, TensorBoard, and WandB logging
@@ -49,6 +50,7 @@ from layers.hybrid_block import HybridTransformerBlock
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
 from model import BitNetDeep
+from optim import CMUD, build_cmud
 from utils import load_checkpoint_payload, seed_everything
 
 try:
@@ -276,6 +278,10 @@ class TrainingWrapper(nn.Module):
 
         for layer in self.model.layers:
             if self.gradient_checkpointing and self.training:
+                # Compressive memory is intentionally frozen for the duration of a
+                # checkpointed layer: the captured state is replayed with
+                # update_memory_buffers=False so the forward and the backward
+                # recomputation see identical memory and do not double-update it.
                 layer_memory_state = None
                 infini_attn = getattr(layer, "infini_attn", None)
                 if isinstance(infini_attn, InfiniAttention):
@@ -703,7 +709,20 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
     )
 
 
-def create_optimizer(model: nn.Module, args: argparse.Namespace) -> Lion:
+def create_optimizer(model: nn.Module, args: argparse.Namespace) -> Optimizer:
+    if args.optimizer == "cmud":
+        return build_cmud(
+            model,
+            lr=args.mud_learning_rate,
+            fallback_lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            momentum=args.mud_momentum,
+            passes=args.mud_passes,
+            betas=(args.lion_beta1, args.lion_beta2),
+            cautious=not args.no_cautious,
+            eight_bit=not args.no_optimizer_8bit,
+        )
+
     decay_params: List[nn.Parameter] = []
     no_decay_params: List[nn.Parameter] = []
 
@@ -946,11 +965,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--grad-accumulation-steps", type=int, default=16)
     parser.add_argument("--total-tokens", type=int, default=50_000_000)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
+                        help="LR for the Lion path and the C-Lion fallback group of C-MUD")
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
+
+    # Optimizer selection: C-MUD (cautious MomentUm Decorrelation) for 2D weights
+    # with an 8-bit C-Lion fallback, or the legacy full-precision Lion.
+    parser.add_argument("--optimizer", choices=("cmud", "lion"), default="cmud")
+    parser.add_argument("--mud-learning-rate", type=float, default=1e-3,
+                        help="LR for the MUD (matrix) group (MUD paper default)")
+    parser.add_argument("--mud-momentum", type=float, default=0.95)
+    parser.add_argument("--mud-passes", type=int, default=1,
+                        help="MUD triangular-whitening passes (p); 1 = MUD1 (default)")
+    parser.add_argument("--no-cautious", action="store_true",
+                        help="Disable the cautious sign-agreement mask (use plain MUD + Lion)")
+    parser.add_argument("--no-optimizer-8bit", action="store_true",
+                        help="Keep the C-Lion fallback momentum in full precision")
     parser.add_argument("--warmup-ratio", type=float, default=0.08)
     parser.add_argument("--cooldown-ratio", type=float, default=0.05)
     parser.add_argument("--warmup-steps", type=int, default=0)

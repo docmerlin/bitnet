@@ -194,6 +194,57 @@ The original BitNet path uses `train.py` and supports:
 - gradient checkpointing
 - optional `torch.compile`
 
+### Optimizer: C-MUD (+ 8-bit C-Lion fallback)
+
+The default optimizer for the BitNet path is **C-MUD**: a cautious variant of
+**MUD** (MomentUm Decorrelation, from *Beyond Muon: MUD (MomentUm Decorrelation)
+for Faster Transformer Training*, Southworth & Thomas 2026). MUD decorrelates the
+matrix-valued momentum update, like Muon, but replaces Muon's polar /
+Newton-Schulz iteration with a cheaper **triangular whitening** surrogate: per
+pass it row-normalizes the momentum, forms the row Gram `G = Q Qᵀ`, takes its
+lower triangle `T = tril(G)` as a Cholesky-like factor, applies a forward
+triangular solve `Q ← T⁻¹ Q`, and re-normalizes. A single pass (MUD1, the default)
+costs one `k×k` triangular solve where `k = min(rows, cols)` — roughly 12× fewer
+FLOPs than Muon — and the map converges quadratically toward a row-orthonormal
+`Q Qᵀ ≈ I_k` as passes increase. The matrix update is scaled by
+`0.2·√(max(rows, cols))`.
+
+The **C-** prefix is the cautious-optimizer modification from *Cautious
+Optimizers: Improving Training with One Line of Code*, which zeroes any
+per-coordinate update whose sign disagrees with the current gradient (and
+rescales the survivors to preserve the mean step size). The same cautious mask is
+applied to the fallback optimizer below.
+
+Usage:
+
+- **C-MUD for 2D matrix weights** — the bulk of the model (`HBitLinear`
+  projections, attention and FFN weights). This is where the triangular momentum
+  decorrelation is defined.
+- **8-bit C-Lion as the fallback** for parameters MUD does not target: embeddings,
+  RMSNorm/SubLN gains, biases, and the scalar/vector gates and AttnRes scales. This
+  is the cautious variant of Lion (not plain Lion), with 8-bit optimizer state to
+  keep memory low for these tensors.
+
+Implementation: `optim.py` provides `CMUD` (one `torch.optim.Optimizer` that
+dispatches per parameter group) plus `build_cmud` / `split_parameters_for_cmud`
+for routing. `train.py` builds it by default; the legacy full-precision `Lion`
+optimizer is still available via `--optimizer lion`.
+
+Relevant flags:
+
+- `--optimizer {cmud,lion}` (default `cmud`)
+- `--learning-rate` — LR for the C-Lion fallback group (and the legacy Lion path)
+- `--mud-learning-rate` — LR for the MUD matrix group (MUD paper default `1e-3`)
+- `--mud-momentum` — MUD heavy-ball momentum (Nesterov lookahead)
+- `--mud-passes` — triangular-whitening passes `p` (default `1` = MUD1; `2` for
+  harder landscapes)
+- `--no-cautious` — drop the cautious mask (plain MUD + Lion)
+- `--no-optimizer-8bit` — keep the C-Lion fallback momentum in full precision
+
+8-bit state is applied to fallback parameters at or above the 2048-element block
+size, so the main beneficiary is the large embedding / tied output table; small
+tensors (norms, biases, scalar gates) keep full-precision momentum.
+
 ### Current BitNet launcher defaults
 
 `run_train.sh` uses a larger research profile:
