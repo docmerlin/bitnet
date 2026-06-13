@@ -18,6 +18,7 @@ from blt.data import (
     ByteBatch,
     ByteVocabulary,
     PackedByteSequenceStream,
+    PrefetchStream,
     iter_hf_dataset,
     iter_text_file,
     iter_texts,
@@ -692,6 +693,8 @@ def run_distillation(
         trainer.student = torch.compile(trainer.student)
 
     batch_stream = build_batch_stream(args, config)
+    if args.prefetch_batches > 0:
+        batch_stream = PrefetchStream(batch_stream, buffer_size=args.prefetch_batches)
     eval_stream = build_batch_stream(args, config, eval_mode=True) if args.eval_every > 0 else None
     end_step = start_step + args.steps
 
@@ -806,6 +809,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="Mixed-precision mode for student/teacher forwards (bf16 autocast; default auto).")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
                         help="Compile the student with torch.compile on CUDA (default: on; --no-compile to disable).")
+    parser.add_argument("--prefetch-batches", type=int, default=2,
+                        help="Background-thread batch prefetch depth to overlap tokenization with compute (0 disables).")
     parser.add_argument("--teacher-device", default="auto", help="Teacher execution device.")
     parser.add_argument("--no-teacher", action="store_true", help="Disable distillation and run hard-CE-only training.")
     parser.add_argument("--teacher-model-id", default="facebook/blt-1b", help="Teacher BLT model ID.")
@@ -881,6 +886,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--eval-steps must be positive")
     if args.save_every < 0:
         parser.error("--save-every must be non-negative")
+    if args.prefetch_batches < 0:
+        parser.error("--prefetch-batches must be non-negative")
     if args.student_patcher_warmup_steps < 0:
         parser.error("--student-patcher-warmup-steps must be non-negative")
     if args.teacher_upstream_repo is None and not args.no_teacher:

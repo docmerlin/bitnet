@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, List, Sequence
+from typing import Any, Iterable, Iterator, List, Sequence
 
 import torch
 
@@ -121,6 +123,48 @@ def collate_byte_batch(samples: Sequence[dict[str, torch.Tensor]]) -> ByteBatch:
         labels=torch.stack([sample["labels"] for sample in samples], dim=0),
         attention_mask=torch.stack([sample["attention_mask"] for sample in samples], dim=0),
     )
+
+
+class PrefetchStream:
+    """Pull batches on a background thread so byte tokenization overlaps compute.
+
+    Wraps any iterator and fills a bounded queue from a daemon worker. Exceptions
+    from the source are re-raised on the consuming thread. Suitable for the infinite
+    training stream consumed via ``next(...)``.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, stream: Iterator[Any], *, buffer_size: int = 2) -> None:
+        if buffer_size < 1:
+            raise ValueError("buffer_size must be >= 1")
+        self.stream = stream
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=buffer_size)
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._started = False
+
+    def _worker(self) -> None:
+        try:
+            for item in self.stream:
+                self._queue.put(item)
+        except BaseException as exc:  # propagate to the consumer
+            self._queue.put(exc)
+        else:
+            self._queue.put(self._SENTINEL)
+
+    def __iter__(self) -> "PrefetchStream":
+        return self
+
+    def __next__(self) -> Any:
+        if not self._started:
+            self._thread.start()
+            self._started = True
+        item = self._queue.get()
+        if item is self._SENTINEL:
+            raise StopIteration
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 def iter_texts(texts: Iterable[str], *, restart_on_eof: bool = True) -> Iterator[str]:
