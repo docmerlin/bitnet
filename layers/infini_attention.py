@@ -9,7 +9,6 @@ memory attention.
 from __future__ import annotations
 
 import contextlib
-import math
 from typing import Optional
 
 import torch
@@ -17,7 +16,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from layers.h_bitlinear import HBitLinear
-from utils import apply_rotary_emb, build_rope_cache
+from utils import (
+    apply_rotary_emb,
+    build_rope_cache,
+    causal_block_attention_bias,
+    combine_attention_bias,
+)
 
 
 class InfiniAttention(nn.Module):
@@ -171,45 +175,22 @@ class InfiniAttention(nn.Module):
 
         scale = self.head_dim ** -0.5
 
-        num_blocks = max(1, min(self.num_blocks, seq_len))
-        block_size = math.ceil(seq_len / num_blocks)
-        positions = torch.arange(seq_len, device=x.device)
-        block_ids = positions.div(block_size, rounding_mode="floor")
-        block_mask = block_ids[:, None] != block_ids[None, :]
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
-            diagonal=1,
+        # Block-causal structure (cached) plus any caller mask -> one fused SDPA call.
+        base_bias = causal_block_attention_bias(
+            seq_len, self.num_blocks, dtype=q.dtype, device=x.device
         )
-        invalid_local = causal_mask | block_mask
-
-        # Build a single additive bias so block-causal masking, padding, and any
-        # caller-supplied mask are all expressed through one fused SDPA call.
-        mask_floor = torch.finfo(q.dtype).min
-        attn_bias = torch.zeros(seq_len, seq_len, dtype=q.dtype, device=x.device)
-        attn_bias = attn_bias.masked_fill(invalid_local, mask_floor).view(1, 1, seq_len, seq_len)
-
-        query_valid = None
-        if attention_mask is not None:
-            if attention_mask.ndim == 2:
-                key_valid = attention_mask[:, None, None, :seq_len].to(torch.bool)
-                attn_bias = attn_bias.expand(batch_size, 1, seq_len, seq_len).clone()
-                attn_bias.masked_fill_(~key_valid, mask_floor)
-                query_valid = attention_mask[:, None, :seq_len, None].to(torch.bool)
-            elif attention_mask.ndim == 3:
-                additive_mask = attention_mask[:, None, :seq_len, :seq_len].to(dtype=q.dtype)
-                attn_bias = attn_bias + additive_mask
-                query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
-            elif attention_mask.ndim == 4:
-                additive_mask = attention_mask[:, :, :seq_len, :seq_len].to(dtype=q.dtype)
-                attn_bias = attn_bias + additive_mask
-                query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
-            else:
-                raise ValueError("attention_mask must be 2D, 3D, or 4D")
+        attn_bias, query_valid = combine_attention_bias(
+            attention_mask,
+            base_bias=base_bias,
+            batch_size=batch_size,
+            q_len=seq_len,
+            k_len=seq_len,
+            dtype=q.dtype,
+            device=x.device,
+        )
 
         local_context = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         if query_valid is not None:
-            # Padded query rows softmax to a synthetic distribution (or NaN if fully
-            # masked); force them to zero to match the rest of the masking contract.
             local_context = local_context.masked_fill(~query_valid, 0.0)
 
         mem_k = self.memory_k.unsqueeze(0).expand(batch_size, -1, -1, -1).to(dtype=q.dtype)

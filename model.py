@@ -64,7 +64,7 @@ class BitNetDeep(nn.Module):
 
         # The output projection defaults to full precision (better quality than a
         # ternary head); set quantize_lm_head=True to keep it ternary.
-        if getattr(self.config, "quantize_lm_head", False):
+        if self.config.quantize_lm_head:
             self.lm_head = HBitLinear(
                 self.config.hidden_size,
                 self.config.vocab_size,
@@ -77,7 +77,7 @@ class BitNetDeep(nn.Module):
         self.apply(self._init_weights)
 
         # Tie weights after initialization so the shared tensor is not overwritten.
-        if getattr(self.config, "tie_word_embeddings", True):
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
     def _init_weights(self, module):

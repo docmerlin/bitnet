@@ -36,8 +36,10 @@ def _build_rope_cache_cached(
 
 
 def clear_rope_cache() -> None:
-    """Clear cached RoPE tables. Useful in tests that vary device or shape often."""
+    """Clear cached RoPE and attention-bias tables. Useful in tests that vary device or shape often."""
     _build_rope_cache_cached.cache_clear()
+    _causal_block_bias_cached.cache_clear()
+    _causal_window_bias_cached.cache_clear()
 
 
 def build_rope_cache(
@@ -54,6 +56,100 @@ def build_rope_cache(
     """
     device_key = "cpu" if device is None else str(device)
     return _build_rope_cache_cached(seq_len, dim, theta, scaling_factor, device_key)
+
+
+@lru_cache(maxsize=128)
+def _causal_block_bias_cached(
+    seq_len: int, num_blocks: int, dtype: torch.dtype, device_key: str
+) -> torch.Tensor:
+    device = torch.device(device_key)
+    positions = torch.arange(seq_len, device=device)
+    causal = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1)
+    if num_blocks > 1:
+        block_size = (seq_len + num_blocks - 1) // num_blocks
+        block_ids = positions.div(block_size, rounding_mode="floor")
+        causal = causal | (block_ids[:, None] != block_ids[None, :])
+    bias = torch.zeros(seq_len, seq_len, dtype=dtype, device=device).masked_fill(causal, torch.finfo(dtype).min)
+    return bias.view(1, 1, seq_len, seq_len)
+
+
+@lru_cache(maxsize=128)
+def _causal_window_bias_cached(
+    seq_len: int, window: int, dtype: torch.dtype, device_key: str
+) -> torch.Tensor:
+    device = torch.device(device_key)
+    q_pos = torch.arange(seq_len, device=device).view(seq_len, 1)
+    k_pos = torch.arange(seq_len, device=device).view(1, seq_len)
+    invalid = k_pos > q_pos
+    if window >= 0:
+        invalid = invalid | ((q_pos - k_pos) >= window)
+    bias = torch.zeros(seq_len, seq_len, dtype=dtype, device=device).masked_fill(invalid, torch.finfo(dtype).min)
+    return bias.view(1, 1, seq_len, seq_len)
+
+
+def causal_block_attention_bias(
+    seq_len: int, num_blocks: int, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Cached additive bias for block-local causal attention ([1, 1, S, S])."""
+    num_blocks = max(1, min(num_blocks, seq_len))
+    return _causal_block_bias_cached(seq_len, num_blocks, dtype, str(device))
+
+
+def causal_window_attention_bias(
+    seq_len: int, window: int | None, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Cached additive bias for (optionally sliding-window) causal attention."""
+    return _causal_window_bias_cached(seq_len, window if window is not None else -1, dtype, str(device))
+
+
+def combine_attention_bias(
+    attention_mask: torch.Tensor | None,
+    *,
+    base_bias: torch.Tensor | None,
+    batch_size: int,
+    q_len: int,
+    k_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Fold a caller mask into a structural ``base_bias`` for one SDPA call.
+
+    Returns ``(attn_bias, query_valid)``. ``query_valid`` is ``None`` when no mask
+    is supplied; otherwise it marks rows the caller must zero after attention (fully
+    masked query rows otherwise softmax into a synthetic distribution). Accepts a
+    boolean keep-mask ``[B, q, k]``, a 2D suffix-padding mask ``[B, k]``, or a 3D/4D
+    additive mask. ``base_bias`` is never mutated, so cached biases can be passed in.
+    """
+    if attention_mask is None:
+        return base_bias, None
+
+    mask_floor = torch.finfo(dtype).min
+    if attention_mask.ndim == 2:
+        # 2D key-padding mask [B, k] (bool or int), suffix-padding contract.
+        key_valid = attention_mask[:, None, None, :k_len].to(torch.bool)
+        if base_bias is None:
+            attn_bias = torch.zeros(batch_size, 1, q_len, k_len, dtype=dtype, device=device)
+        else:
+            attn_bias = base_bias.expand(batch_size, 1, q_len, k_len).clone()
+        attn_bias.masked_fill_(~key_valid, mask_floor)
+        query_valid = attention_mask[:, None, :q_len, None].to(torch.bool)
+    elif attention_mask.dtype == torch.bool:
+        # Boolean keep-mask [B, q, k] (cross-attention).
+        keep = attention_mask[:, None, :q_len, :k_len]
+        query_valid = keep.any(dim=-1, keepdim=True)
+        bias = torch.zeros(batch_size, 1, q_len, k_len, dtype=dtype, device=device).masked_fill(~keep, mask_floor)
+        attn_bias = bias if base_bias is None else base_bias + bias
+    elif attention_mask.ndim == 3:
+        additive = attention_mask[:, None, :q_len, :k_len].to(dtype=dtype)
+        attn_bias = additive if base_bias is None else base_bias + additive
+        query_valid = additive.amax(dim=-1, keepdim=True) >= 0
+    elif attention_mask.ndim == 4:
+        additive = attention_mask[:, :, :q_len, :k_len].to(dtype=dtype)
+        attn_bias = additive if base_bias is None else base_bias + additive
+        query_valid = additive.amax(dim=-1, keepdim=True) >= 0
+    else:
+        raise ValueError("attention_mask must be a bool, 2D, 3D, or 4D tensor")
+    return attn_bias, query_valid
 
 
 def seed_everything(seed: int, *, deterministic: bool = True) -> None:

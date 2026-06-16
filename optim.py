@@ -108,10 +108,7 @@ def _dequantize_blockwise(
     shape: torch.Size,
 ) -> torch.Tensor:
     blocks = quantized.to(torch.float32) * scale.unsqueeze(1)
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    return blocks.reshape(-1)[:numel].view(shape)
+    return blocks.reshape(-1)[: shape.numel()].view(shape)
 
 
 def split_parameters_for_cmud(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:

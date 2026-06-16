@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from blt.config import TernaryBLTConfig
 from layers.h_bitlinear import HBitLinear
+from utils import combine_attention_bias
 
 
 class TernaryCrossAttention(nn.Module):
@@ -59,26 +60,15 @@ class TernaryCrossAttention(nn.Module):
         k = self.k_proj(self.kv_norm(key_value)).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(self.kv_norm(key_value)).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        mask_floor = torch.finfo(q.dtype).min
-        attn_bias = None
-        query_valid = None
-
-        if mask is not None:
-            if mask.dtype == torch.bool:
-                bool_mask = mask[:, None, :, :]
-                query_valid = bool_mask.any(dim=-1, keepdim=True)
-                attn_bias = torch.zeros(batch_size, 1, query_len, kv_len, dtype=q.dtype, device=query.device)
-                attn_bias = attn_bias.masked_fill(~bool_mask, mask_floor)
-            elif mask.ndim == 3:
-                additive_mask = mask[:, None, :, :].to(dtype=q.dtype)
-                attn_bias = additive_mask
-                query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
-            elif mask.ndim == 4:
-                additive_mask = mask[:, :, :, :].to(dtype=q.dtype)
-                attn_bias = additive_mask
-                query_valid = additive_mask.amax(dim=-1, keepdim=True) >= 0
-            else:
-                raise ValueError("cross-attention mask must be bool, 3D additive, or 4D additive")
+        attn_bias, query_valid = combine_attention_bias(
+            mask,
+            base_bias=None,
+            batch_size=batch_size,
+            q_len=query_len,
+            k_len=kv_len,
+            dtype=q.dtype,
+            device=query.device,
+        )
 
         dropout_p = self.dropout if self.training else 0.0
         context = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, dropout_p=dropout_p)
