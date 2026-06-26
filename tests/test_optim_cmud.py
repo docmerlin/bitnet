@@ -158,11 +158,51 @@ def test_cmud_8bit_state_serializes_and_resumes() -> bool:
     return True
 
 
+def test_mud_decorrelate_handles_zero_rows() -> bool:
+    # A zero-norm momentum row (e.g. a weight row with no gradient) used to leave a
+    # zero on the Gram diagonal and NaN the triangular solve.
+    torch.manual_seed(0)
+    m = torch.randn(8, 4)
+    m[2] = 0.0
+    out = mud_decorrelate(m, passes=2)
+    assert torch.isfinite(out).all(), out
+    assert torch.allclose(out[2], torch.zeros(4)), out[2]
+    print("MUD zero-row guard tests passed")
+    return True
+
+
+def test_cmud_resume_across_8bit_toggle_preserves_momentum() -> bool:
+    # Switching the 8-bit setting (or crossing the block-size threshold) on resume
+    # must convert the stored momentum, not silently reset it to zeros.
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Embedding(4096, 4), nn.Linear(4, 4, bias=False))
+    eight_bit = build_cmud(model, lr=0.05, fallback_lr=0.02, weight_decay=0.0, eight_bit=True)
+    ids = torch.randint(0, 4096, (8,))
+    for _ in range(3):
+        eight_bit.zero_grad()
+        model[1](model[0](ids)).pow(2).mean().backward()
+        eight_bit.step()
+
+    emb = model[0].weight
+    stored_q = eight_bit.state[emb]["exp_avg_q"]
+    expected = _dequantize_blockwise(stored_q, eight_bit.state[emb]["exp_avg_scale"], emb.shape)
+
+    fp32 = build_cmud(model, lr=0.05, fallback_lr=0.02, weight_decay=0.0, eight_bit=False)
+    fp32.load_state_dict(eight_bit.state_dict())
+    loaded = fp32._load_exp_avg(fp32.state[emb], torch.zeros_like(emb), use_8bit=False)
+    assert loaded.abs().sum() > 0, "momentum was silently reset on resume"
+    assert torch.allclose(loaded, expected, atol=1e-5)
+    print("C-MUD 8-bit/fp32 resume tests passed")
+    return True
+
+
 if __name__ == "__main__":
     test_mud_decorrelate_row_orthonormalizes()
+    test_mud_decorrelate_handles_zero_rows()
     test_cautious_mask_zeroes_disagreeing_coords()
     test_blockwise_quant_roundtrip_is_close()
     test_split_routes_embeddings_to_fallback()
     test_split_dedupes_tied_weights()
     test_cmud_step_reduces_loss()
     test_cmud_8bit_state_serializes_and_resumes()
+    test_cmud_resume_across_8bit_toggle_preserves_momentum()

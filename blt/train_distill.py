@@ -376,6 +376,11 @@ def apply_checkpoint_training_args(args: argparse.Namespace, checkpoint: dict[st
     for name in RESUME_STICKY_ARG_NAMES:
         if name in training_args:
             setattr(args, name, training_args[name])
+    # Checkpoints written before C-MUD became the default store no "optimizer"
+    # key; they were trained with AdamW, so resume with AdamW rather than loading
+    # an AdamW state dict into a C-MUD optimizer.
+    if "optimizer" not in training_args:
+        args.optimizer = "adamw"
 
 
 def move_optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:

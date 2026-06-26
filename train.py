@@ -34,7 +34,7 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -845,7 +845,16 @@ def load_checkpoint(
     scaler: Optional[Any],
 ) -> TrainerState:
     payload = load_checkpoint_payload(checkpoint_path, map_location="cpu")
-    model.load_state_dict(payload["model"])
+    # Tolerate architecture evolution (e.g. qk-norm params added after a checkpoint
+    # was written): load non-strict and surface any mismatch instead of crashing.
+    incompatible = model.load_state_dict(payload["model"], strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"Warning: resumed checkpoint did not match the model exactly. "
+            f"Missing keys: {incompatible.missing_keys}; "
+            f"unexpected keys: {incompatible.unexpected_keys}",
+            flush=True,
+        )
     reset_infini_memory(model)
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
@@ -1054,6 +1063,14 @@ def main() -> None:
         vocab_size_target=args.vocab_size,
     )
     model_config = build_model_config(args, tokenizer)
+    if args.resume_from:
+        # Rebuild the model from the checkpoint's own config so the architecture
+        # (e.g. qk-norm, head type) matches what was saved rather than current
+        # CLI/defaults. Fields absent from older checkpoints fall back to defaults.
+        saved_config = load_checkpoint_payload(Path(args.resume_from), map_location="cpu").get("model_config")
+        if saved_config:
+            valid_fields = {f.name for f in fields(TernaryConfig)}
+            model_config = TernaryConfig(**{k: v for k, v in saved_config.items() if k in valid_fields})
     base_model = BitNetDeep(model_config)
     base_model.to(device)
 

@@ -242,7 +242,26 @@ def test_run_distillation_is_seeded_directly() -> bool:
     return True
 
 
+def test_resume_defaults_optimizer_to_adamw_for_legacy_checkpoints() -> bool:
+    # Checkpoints written before C-MUD became the default have no "optimizer" key;
+    # resume must fall back to AdamW rather than loading AdamW state into C-MUD.
+    import argparse
+
+    from blt.train_distill import apply_checkpoint_training_args
+
+    args = argparse.Namespace(optimizer="cmud")
+    apply_checkpoint_training_args(args, {"training_args": {"seed": 0}})  # no "optimizer" key
+    assert args.optimizer == "adamw", args.optimizer
+
+    args = argparse.Namespace(optimizer="cmud")
+    apply_checkpoint_training_args(args, {"training_args": {"optimizer": "cmud"}})
+    assert args.optimizer == "cmud", args.optimizer
+    print("BLT legacy-checkpoint optimizer default tests passed")
+    return True
+
+
 if __name__ == "__main__":
     test_blt_cli_runtime_smoke()
     test_disable_teacher_patcher_uses_static_patch_lengths()
     test_run_distillation_is_seeded_directly()
+    test_resume_defaults_optimizer_to_adamw_for_legacy_checkpoints()

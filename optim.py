@@ -68,6 +68,11 @@ def mud_decorrelate(update: torch.Tensor, passes: int = 1, eps: float = 1e-8) ->
         q = q / (row_norm + eps)
         gram = q @ q.t()
         tri = torch.tril(gram)
+        # Guard the triangular solve: an all-zero momentum row normalizes to zero,
+        # leaving a zero on the Gram diagonal that would make the solve divide by
+        # zero and emit NaNs. A small ridge keeps T invertible (rows are unit-norm
+        # so the diagonal is otherwise ~1, making this negligible).
+        tri.diagonal(dim1=-2, dim2=-1).add_(eps)
         q = torch.linalg.solve_triangular(tri, q, upper=False)
         row_norm = q.norm(dim=1, keepdim=True)
         q = q / (row_norm + eps)
@@ -266,15 +271,21 @@ class CMUD(Optimizer):
 
     @staticmethod
     def _load_exp_avg(state: dict, grad: torch.Tensor, use_8bit: bool) -> torch.Tensor:
-        if use_8bit:
-            if "exp_avg_q" not in state:
-                return torch.zeros_like(grad)
-            return _dequantize_blockwise(state["exp_avg_q"], state["exp_avg_scale"], grad.shape).to(
+        # Read whichever format the resumed state holds, converting if the current
+        # 8-bit setting differs, so toggling 8-bit (or crossing the block-size
+        # threshold) never silently discards momentum.
+        if "exp_avg_q" in state:
+            stored = _dequantize_blockwise(state["exp_avg_q"], state["exp_avg_scale"], grad.shape).to(
                 device=grad.device, dtype=grad.dtype
             )
-        if "exp_avg" not in state:
-            state["exp_avg"] = torch.zeros_like(grad)
-        return state["exp_avg"]
+        elif "exp_avg" in state:
+            stored = state["exp_avg"]
+        else:
+            stored = torch.zeros_like(grad)
+        if not use_8bit and "exp_avg_q" not in state:
+            # Keep the canonical fp32 buffer in state for in-place EMA updates.
+            state["exp_avg"] = stored
+        return stored
 
     @staticmethod
     def _store_exp_avg(state: dict, exp_avg: torch.Tensor, use_8bit: bool) -> None:
@@ -282,8 +293,11 @@ class CMUD(Optimizer):
             quantized, scale = _quantize_blockwise(exp_avg)
             state["exp_avg_q"] = quantized
             state["exp_avg_scale"] = scale
+            state.pop("exp_avg", None)
         else:
             state["exp_avg"] = exp_avg
+            state.pop("exp_avg_q", None)
+            state.pop("exp_avg_scale", None)
 
 
 def build_cmud(
