@@ -124,21 +124,21 @@ def combine_attention_bias(
         return base_bias, None
 
     mask_floor = torch.finfo(dtype).min
-    if attention_mask.ndim == 2:
-        # 2D key-padding mask [B, k] (bool or int), suffix-padding contract.
-        key_valid = attention_mask[:, None, None, :k_len].to(torch.bool)
+    if attention_mask.ndim == 2 or attention_mask.dtype == torch.bool:
+        # Keep-mask paths: a 2D key-padding mask [B, k] (suffix-padding contract)
+        # or a boolean keep-mask [B, q, k] (cross-attention). Both fold into the
+        # structural bias by floor-filling the dropped key positions in place.
+        if attention_mask.ndim == 2:
+            keep = attention_mask[:, None, None, :k_len].to(torch.bool)
+            query_valid = attention_mask[:, None, :q_len, None].to(torch.bool)
+        else:
+            keep = attention_mask[:, None, :q_len, :k_len]
+            query_valid = keep.any(dim=-1, keepdim=True)
         if base_bias is None:
             attn_bias = torch.zeros(batch_size, 1, q_len, k_len, dtype=dtype, device=device)
         else:
             attn_bias = base_bias.expand(batch_size, 1, q_len, k_len).clone()
-        attn_bias.masked_fill_(~key_valid, mask_floor)
-        query_valid = attention_mask[:, None, :q_len, None].to(torch.bool)
-    elif attention_mask.dtype == torch.bool:
-        # Boolean keep-mask [B, q, k] (cross-attention).
-        keep = attention_mask[:, None, :q_len, :k_len]
-        query_valid = keep.any(dim=-1, keepdim=True)
-        bias = torch.zeros(batch_size, 1, q_len, k_len, dtype=dtype, device=device).masked_fill(~keep, mask_floor)
-        attn_bias = bias if base_bias is None else base_bias + bias
+        attn_bias.masked_fill_(~keep, mask_floor)
     elif attention_mask.ndim == 3:
         additive = attention_mask[:, None, :q_len, :k_len].to(dtype=dtype)
         attn_bias = additive if base_bias is None else base_bias + additive

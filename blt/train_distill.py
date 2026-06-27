@@ -207,13 +207,18 @@ class BLTDistillationTrainer:
                 patch_lengths=selected_patch_lengths,
             )
 
-    def train_step(self, batch: BLTDistillationBatch) -> tuple[TernaryBLTOutput, TernaryBLTOutput | None, dict[str, float]]:
-        self.student.train()
-        if self.student_patcher is not None:
-            self.student_patcher.train()
+    def _run_forward(
+        self, batch: BLTDistillationBatch, *, step: int
+    ) -> tuple[TernaryBLTOutput, TernaryBLTOutput | None, torch.Tensor, dict[str, float]]:
+        """Run the teacher/student forward shared by training and evaluation.
+
+        Returns ``(student_outputs, teacher_outputs, total_loss, metrics)``. The
+        teacher always runs under ``no_grad``; ``eval_step`` additionally wraps the
+        whole call so the student forward is gradient-free.
+        """
         batch = batch.to(self.device)
-        teacher_outputs = None
         provided_patch_lengths = self._provided_patch_lengths(batch)
+        teacher_outputs = None
 
         with self._autocast():
             if self.teacher is not None:
@@ -224,14 +229,13 @@ class BLTDistillationTrainer:
                         patch_lengths=provided_patch_lengths,
                     )
 
-            current_step = self.global_step + 1
             teacher_patch_lengths = self._teacher_patch_lengths(provided_patch_lengths, teacher_outputs)
             patcher_loss, predicted_patch_lengths, patcher_metrics = self._compute_patcher_loss(batch, teacher_patch_lengths)
             patch_lengths, using_student_patcher = self._select_patch_lengths(
                 provided_patch_lengths,
                 teacher_patch_lengths,
                 predicted_patch_lengths,
-                step=current_step,
+                step=step,
             )
             teacher_outputs = self._maybe_rerun_teacher_for_selected_patch_lengths(
                 batch,
@@ -263,6 +267,16 @@ class BLTDistillationTrainer:
                 total_loss = total_loss + self.patcher_loss_weight * patcher_loss
             metrics["student_patcher_active"] = 1.0 if using_student_patcher else 0.0
             metrics["loss"] = float(total_loss.detach().item())
+
+        return student_outputs, teacher_outputs, total_loss, metrics
+
+    def train_step(self, batch: BLTDistillationBatch) -> tuple[TernaryBLTOutput, TernaryBLTOutput | None, dict[str, float]]:
+        self.student.train()
+        if self.student_patcher is not None:
+            self.student_patcher.train()
+
+        current_step = self.global_step + 1
+        student_outputs, teacher_outputs, total_loss, metrics = self._run_forward(batch, step=current_step)
 
         self.optimizer.zero_grad(set_to_none=True)
         if self.patcher_optimizer is not None:
@@ -279,55 +293,8 @@ class BLTDistillationTrainer:
         self.student.eval()
         if self.student_patcher is not None:
             self.student_patcher.eval()
-        batch = batch.to(self.device)
-        teacher_outputs = None
-        provided_patch_lengths = self._provided_patch_lengths(batch)
 
-        with self._autocast():
-            if self.teacher is not None:
-                teacher_outputs = self.teacher.forward(
-                    batch.input_ids,
-                    attention_mask=batch.attention_mask,
-                    patch_lengths=provided_patch_lengths,
-                )
-
-            teacher_patch_lengths = self._teacher_patch_lengths(provided_patch_lengths, teacher_outputs)
-            patcher_loss, predicted_patch_lengths, patcher_metrics = self._compute_patcher_loss(batch, teacher_patch_lengths)
-            patch_lengths, using_student_patcher = self._select_patch_lengths(
-                provided_patch_lengths,
-                teacher_patch_lengths,
-                predicted_patch_lengths,
-                step=self.global_step,
-            )
-            teacher_outputs = self._maybe_rerun_teacher_for_selected_patch_lengths(
-                batch,
-                teacher_outputs=teacher_outputs,
-                teacher_patch_lengths=teacher_patch_lengths,
-                selected_patch_lengths=patch_lengths,
-                using_student_patcher=using_student_patcher,
-            )
-
-            student_outputs = self.student(
-                batch.input_ids,
-                attention_mask=batch.attention_mask,
-                patch_lengths=patch_lengths,
-            )
-            model_loss, metrics = compute_blt_distillation_loss(
-                student_outputs,
-                teacher_outputs,
-                labels=batch.labels,
-                attention_mask=batch.attention_mask,
-                weights=self.weights,
-                temperature=self.config.distill_temperature,
-            )
-
-            total_loss = model_loss
-            metrics["model_loss"] = float(model_loss.detach().item())
-            metrics.update(patcher_metrics)
-            if patcher_loss is not None:
-                total_loss = total_loss + self.patcher_loss_weight * patcher_loss
-            metrics["student_patcher_active"] = 1.0 if using_student_patcher else 0.0
-            metrics["loss"] = float(total_loss.detach().item())
+        student_outputs, teacher_outputs, _, metrics = self._run_forward(batch, step=self.global_step)
         return student_outputs, teacher_outputs, metrics
 
 
