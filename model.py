@@ -13,6 +13,7 @@ from typing import Optional
 from config import TernaryConfig, config as default_config
 from layers.h_bitlinear import HBitLinear
 from layers.hybrid_block import HybridTransformerBlock
+from utils import document_attention_keep_mask
 
 
 class RMSNorm(nn.Module):
@@ -93,10 +94,14 @@ class BitNetDeep(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         reset_memory: bool = True,
+        segment_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if reset_memory:
             for layer in self.layers:
                 layer.infini_attn.reset_memory()
+
+        if segment_ids is not None:
+            attention_mask = document_attention_keep_mask(segment_ids)
 
         x = self.embed_tokens(input_ids)
         x = self.subln(x)  # Extra stability for deep ternary net

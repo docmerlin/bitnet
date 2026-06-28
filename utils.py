@@ -152,6 +152,18 @@ def combine_attention_bias(
     return attn_bias, query_valid
 
 
+def document_attention_keep_mask(segment_ids: torch.Tensor) -> torch.Tensor:
+    """Boolean keep-mask ``[B, q, k]`` that blocks attention across packed documents.
+
+    ``segment_ids`` is ``[B, S]`` with a distinct id per packed document in a window.
+    Position ``i`` may attend to position ``j`` only when both belong to the same
+    document, which stops packed sequences from leaking context across boundaries.
+    Pass the result as the ``attention_mask`` to :func:`combine_attention_bias`, which
+    folds it into the structural (block-causal) bias.
+    """
+    return segment_ids[:, :, None] == segment_ids[:, None, :]
+
+
 def seed_everything(seed: int, *, deterministic: bool = True) -> None:
     """Seed Python, NumPy (if installed), and PyTorch RNGs."""
     os.environ["PYTHONHASHSEED"] = str(seed)

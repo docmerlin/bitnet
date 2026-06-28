@@ -51,7 +51,7 @@ from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
 from model import BitNetDeep
 from optim import CMUD, build_cmud
-from utils import load_checkpoint_payload, seed_everything
+from utils import document_attention_keep_mask, load_checkpoint_payload, seed_everything
 
 try:
     from datasets import load_dataset
@@ -269,9 +269,13 @@ class TrainingWrapper(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         reset_memory: bool = True,
+        segment_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if reset_memory:
             reset_infini_memory(self.model)
+
+        if segment_ids is not None:
+            attention_mask = document_attention_keep_mask(segment_ids)
 
         x = self.model.embed_tokens(input_ids)
         x = self.model.subln(x)
@@ -487,6 +491,11 @@ class PackedSequenceStream:
         self.sequence_length = sequence_length
         self.max_document_tokens = max_document_tokens
         self.buffer: List[int] = []
+        # Parallel per-token document ids so packed windows can mask cross-document
+        # attention. The counter only needs to be locally unique within a window;
+        # ids are re-based to start at zero on emit.
+        self.segment_buffer: List[int] = []
+        self.next_segment_id = 0
 
     def __iter__(self) -> "PackedSequenceStream":
         return self
@@ -502,17 +511,22 @@ class PackedSequenceStream:
             if len(token_ids) < 2:
                 continue
             self.buffer.extend(token_ids)
+            self.segment_buffer.extend([self.next_segment_id] * len(token_ids))
+            self.next_segment_id += 1
 
         window = self.buffer[: self.sequence_length + 1]
         del self.buffer[: self.sequence_length]
+        segment_window = self.segment_buffer[: self.sequence_length]
+        del self.segment_buffer[: self.sequence_length]
 
+        base_id = segment_window[0]
         input_ids = torch.tensor(window[:-1], dtype=torch.long)
         labels = torch.tensor(window[1:], dtype=torch.long)
-        attention_mask = torch.ones(self.sequence_length, dtype=torch.long)
+        segment_ids = torch.tensor([s - base_id for s in segment_window], dtype=torch.long)
         return {
             "input_ids": input_ids,
             "labels": labels,
-            "attention_mask": attention_mask,
+            "segment_ids": segment_ids,
         }
 
 
@@ -530,7 +544,7 @@ class BatchStream:
         batch = [next(self.sequence_stream) for _ in range(self.micro_batch_size)]
         return {
             key: torch.stack([sample[key] for sample in batch], dim=0)
-            for key in ("input_ids", "labels", "attention_mask")
+            for key in ("input_ids", "labels", "segment_ids")
         }
 
 
@@ -899,10 +913,10 @@ def evaluate(
             batch = next(eval_stream)
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            segment_ids = batch["segment_ids"].to(device)
 
             with autocast_context(device, amp_enabled, amp_dtype):
-                logits = runner(input_ids, attention_mask)
+                logits = runner(input_ids, segment_ids=segment_ids)
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
             losses.append(float(loss.item()))
 
@@ -1185,10 +1199,10 @@ def main() -> None:
                 batch = next(active_train_batch_stream)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
+                segment_ids = batch["segment_ids"].to(device)
 
                 with autocast_context(device, amp_enabled, amp_dtype):
-                    logits = runner(input_ids, attention_mask)
+                    logits = runner(input_ids, segment_ids=segment_ids)
                     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
                     scaled_loss = loss / args.grad_accumulation_steps
 
