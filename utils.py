@@ -221,14 +221,3 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
     cos = cos.unsqueeze(0).unsqueeze(0).to(dtype=x.dtype)
     sin = sin.unsqueeze(0).unsqueeze(0).to(dtype=x.dtype)
     return (x * cos) + (rotate_half(x) * sin)
-
-
-def ternary_quantize(weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert dense weights to ternary values with abs-mean scaling."""
-    scale = weights.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
-    ternary = torch.where(
-        weights > 0.5 * scale,
-        torch.ones_like(weights),
-        torch.where(weights < -0.5 * scale, -torch.ones_like(weights), torch.zeros_like(weights)),
-    )
-    return ternary.to(torch.int8), scale.squeeze(-1)

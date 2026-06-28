@@ -53,12 +53,10 @@ The BLT code is intentionally isolated from the older `train.py` path so BLT exp
 - `model.py`: main `BitNetDeep` model
 - `train.py`: streaming training pipeline for the BitNet path
 - `layers/hybrid_block.py`: main hybrid transformer block
-- `layers/block_attnres.py`: standalone block-local attention module (legacy/alternate block; production model uses AttnRes wrappers inside `hybrid_block.py`)
 - `layers/infini_attention.py`: Infini-Attention-style module with memory handling
 - `layers/h_bitlinear.py`: ternary / Hadamard linear layer implementation
 - `tokenizer/`: hierarchical tokenizer implementation
 - `utils.py`: rotary embedding and ternary helper functions
-- `test_forward.py`: quick forward-pass smoke test for the BitNet path
 - `run_train.sh`: full BitNet training launcher
 - `run_local_train.sh`: smaller local BitNet training launcher
 
@@ -83,7 +81,6 @@ The repo currently uses simple script-style regression tests rather than a full 
 
 BitNet path examples:
 
-- `tests/test_block_attnres.py`
 - `tests/test_hybrid_block.py`
 - `tests/test_infini_attention_memory.py`
 - `tests/test_h_bitlinear.py`
@@ -118,7 +115,6 @@ python3 -m pip install -r requirements.txt
 
 Dependency notes:
 
-- `test_forward.py` needs `tiktoken`
 - `train.py` needs `datasets` and `tiktoken`
 - `python3 -m blt --hf-dataset ...` needs `datasets`
 - real Meta BLT distillation also needs:
@@ -132,7 +128,7 @@ Dependency notes:
 ### BitNet forward smoke test
 
 ```bash
-python3 test_forward.py
+python3 tests/test_train_smoke.py
 ```
 
 This exercises:
@@ -456,7 +452,7 @@ This repo currently relies on script-style tests that can be run directly with `
 Examples:
 
 ```bash
-python3 test_forward.py
+python3 tests/test_train_smoke.py
 python3 tests/test_hybrid_block.py
 python3 tests/test_infini_attention_memory.py
 python3 tests/test_utils.py
