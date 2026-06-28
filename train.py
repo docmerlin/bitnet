@@ -877,6 +877,29 @@ def load_checkpoint(
     return TrainerState(**payload["trainer_state"])
 
 
+def language_modeling_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    z_loss_coef: float = 0.0,
+) -> torch.Tensor:
+    """Token cross-entropy plus an optional z-loss regularizer.
+
+    The z-loss penalizes the squared log-partition ``logsumexp(logits)`` so the
+    softmax normalizer stays near one. It keeps logits from drifting in
+    low-precision ternary training and lets the optimizer run a higher learning
+    rate without diverging. It is a training-time term only; evaluation reports
+    plain cross-entropy so perplexity stays comparable.
+    """
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_labels = labels.reshape(-1)
+    loss = F.cross_entropy(flat_logits, flat_labels)
+    if z_loss_coef > 0.0:
+        log_z = torch.logsumexp(flat_logits.float(), dim=-1)
+        loss = loss + z_loss_coef * log_z.pow(2).mean()
+    return loss
+
+
 @torch.no_grad()
 def evaluate(
     runner: nn.Module,
@@ -992,6 +1015,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="LR for the Lion path and the C-Lion fallback group of C-MUD")
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--z-loss-coef", type=float, default=1e-4,
+                        help="Coefficient for the logit z-loss regularizer (0 disables it)")
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
 
@@ -1203,7 +1228,7 @@ def main() -> None:
 
                 with autocast_context(device, amp_enabled, amp_dtype):
                     logits = runner(input_ids, segment_ids=segment_ids)
-                    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                    loss = language_modeling_loss(logits, labels, z_loss_coef=args.z_loss_coef)
                     scaled_loss = loss / args.grad_accumulation_steps
 
                 if scaler is not None:

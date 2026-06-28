@@ -19,6 +19,7 @@ from train import (
     TrainerState,
     TrainingWrapper,
     create_optimizer,
+    language_modeling_loss,
     load_checkpoint,
     save_checkpoint,
 )
@@ -121,6 +122,23 @@ def test_checkpoint_save_load_roundtrip() -> bool:
     return True
 
 
+def test_z_loss_matches_cross_entropy_when_disabled() -> bool:
+    torch.manual_seed(0)
+    logits = torch.randn(2, 5, 32)
+    labels = torch.randint(0, 32, (2, 5))
+
+    plain = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+    disabled = language_modeling_loss(logits, labels, z_loss_coef=0.0)
+    assert torch.allclose(plain, disabled), (plain, disabled)
+
+    # A positive coefficient adds a strictly positive log-partition penalty.
+    regularized = language_modeling_loss(logits, labels, z_loss_coef=1e-3)
+    assert regularized > plain, (regularized, plain)
+    print("language-modeling z-loss tests passed")
+    return True
+
+
 if __name__ == "__main__":
     test_single_training_step_updates_parameters()
     test_checkpoint_save_load_roundtrip()
+    test_z_loss_matches_cross_entropy_when_disabled()
