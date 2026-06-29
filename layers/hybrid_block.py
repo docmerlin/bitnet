@@ -116,11 +116,5 @@ class HybridTransformerBlock(nn.Module):
         mlp_out = self.ffn_down(F.silu(gate_up) * value)
         
         x = self.mlp_res(residual, mlp_out)
-        
+
         return x
-
-
-# For backward compatibility / easy testing
-class TransformerBlock(HybridTransformerBlock):
-    """Alias for the hybrid block. Every layer now uses the full combination."""
-    pass

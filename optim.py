@@ -149,7 +149,7 @@ class CMUD(Optimizer):
 
     Each parameter group must set ``kind`` to ``"mud"`` or ``"clion"``. MUD groups use
     ``momentum``/``nesterov``/``passes``; C-Lion groups use ``betas`` and ``eight_bit``.
-    ``cautious`` and ``weight_decay`` apply to both.
+    The cautious sign-agreement mask and ``weight_decay`` apply to both.
     """
 
     def __init__(
@@ -162,7 +162,6 @@ class CMUD(Optimizer):
         passes: int = 1,
         betas: Tuple[float, float] = (0.95, 0.98),
         weight_decay: float = 0.0,
-        cautious: bool = True,
         eight_bit: bool = True,
     ) -> None:
         if lr <= 0.0:
@@ -181,7 +180,6 @@ class CMUD(Optimizer):
             "passes": passes,
             "betas": betas,
             "weight_decay": weight_decay,
-            "cautious": cautious,
             "eight_bit": eight_bit,
             "kind": "clion",
         }
@@ -208,7 +206,6 @@ class CMUD(Optimizer):
         nesterov = group["nesterov"]
         passes = group["passes"]
         weight_decay = group["weight_decay"]
-        cautious = group["cautious"]
 
         for param in group["params"]:
             if param.grad is None:
@@ -232,8 +229,7 @@ class CMUD(Optimizer):
             # Appendix A code constant, from Liu et al. 2025 (Muon RMS-matching scale).
             update = update * (0.2 * (max(param.size(0), param.size(1)) ** 0.5))
 
-            if cautious:
-                update = cautious_mask(update, grad)
+            update = cautious_mask(update, grad)
             if weight_decay != 0.0:
                 param.mul_(1.0 - lr * weight_decay)
             param.add_(update, alpha=-lr)
@@ -242,7 +238,6 @@ class CMUD(Optimizer):
         lr = group["lr"]
         beta1, beta2 = group["betas"]
         weight_decay = group["weight_decay"]
-        cautious = group["cautious"]
         eight_bit = group["eight_bit"]
 
         for param in group["params"]:
@@ -262,8 +257,7 @@ class CMUD(Optimizer):
             # ``exp_avg.mul(beta1)`` allocates a fresh tensor, so the momentum buffer
             # is left intact for the beta2 EMA update below.
             update = exp_avg.mul(beta1).add_(grad, alpha=1.0 - beta1).sign_()
-            if cautious:
-                update = cautious_mask(update, grad)
+            update = cautious_mask(update, grad)
             param.add_(update, alpha=-lr)
 
             exp_avg.mul_(beta2).add_(grad, alpha=1.0 - beta2)
@@ -309,7 +303,6 @@ def build_cmud(
     momentum: float = 0.95,
     passes: int = 1,
     betas: Tuple[float, float] = (0.95, 0.98),
-    cautious: bool = True,
     eight_bit: bool = True,
 ) -> CMUD:
     """Build a :class:`CMUD` with MUD and C-Lion parameter groups for ``model``."""
@@ -335,6 +328,5 @@ def build_cmud(
         passes=passes,
         betas=betas,
         weight_decay=weight_decay,
-        cautious=cautious,
         eight_bit=eight_bit,
     )

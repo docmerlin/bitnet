@@ -7,8 +7,7 @@ Features:
 - hierarchical tokenization with sequence packing
 - two-stage quantization schedule for ternary warmup -> full QAT
 - progressive Block Attention Residual growth
-- C-MUD optimizer (cautious MomentUm Decorrelation + 8-bit C-Lion fallback),
-  with the legacy Lion optimizer available via --optimizer lion
+- C-MUD optimizer (cautious MomentUm Decorrelation + 8-bit C-Lion fallback)
 - cosine LR schedule with warmup and cooldown
 - optional gradient checkpointing, mixed precision, torch.compile, validation,
   checkpointing, TensorBoard, and WandB logging
@@ -36,7 +35,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -189,64 +188,6 @@ class TrainerState:
     tokens_processed: int = 0
     samples_processed: int = 0
     best_val_loss: float = float("inf")
-
-
-class Lion(Optimizer):
-    """Lion optimizer with decoupled weight decay.
-
-    Lion is a good fit for ternary/QAT setups because its sign-based update is
-    robust to noisy gradients while still tracking full-precision shadow weights.
-    """
-
-    def __init__(
-        self,
-        params: Iterable[torch.nn.Parameter],
-        lr: float = 1e-4,
-        betas: Tuple[float, float] = (0.9, 0.99),
-        weight_decay: float = 0.0,
-    ) -> None:
-        if lr <= 0.0:
-            raise ValueError("Lion learning rate must be positive")
-        if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Lion betas must be in [0, 1)")
-
-        defaults = {"lr": lr, "betas": betas, "weight_decay": weight_decay}
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure: Optional[Any] = None) -> Optional[torch.Tensor]:
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr = group["lr"]
-            beta1, beta2 = group["betas"]
-            weight_decay = group["weight_decay"]
-
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-
-                grad = param.grad
-                if grad.is_sparse:
-                    raise RuntimeError("Lion does not support sparse gradients")
-
-                state = self.state[param]
-                if not state:
-                    state["exp_avg"] = torch.zeros_like(param)
-
-                exp_avg = state["exp_avg"]
-
-                if weight_decay != 0.0:
-                    param.mul_(1.0 - lr * weight_decay)
-
-                update = exp_avg.mul(beta1).add(grad, alpha=1.0 - beta1)
-                param.add_(torch.sign(update), alpha=-lr)
-                exp_avg.mul_(beta2).add_(grad, alpha=1.0 - beta2)
-
-        return loss
 
 
 class TrainingWrapper(nn.Module):
@@ -724,37 +665,15 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
 
 
 def create_optimizer(model: nn.Module, args: argparse.Namespace) -> Optimizer:
-    if args.optimizer == "cmud":
-        return build_cmud(
-            model,
-            lr=args.mud_learning_rate,
-            fallback_lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-            momentum=args.mud_momentum,
-            passes=args.mud_passes,
-            betas=(args.lion_beta1, args.lion_beta2),
-            cautious=not args.no_cautious,
-            eight_bit=not args.no_optimizer_8bit,
-        )
-
-    decay_params: List[nn.Parameter] = []
-    no_decay_params: List[nn.Parameter] = []
-
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if parameter.ndim < 2 or name.endswith("bias") or "norm" in name.lower():
-            no_decay_params.append(parameter)
-        else:
-            decay_params.append(parameter)
-
-    return Lion(
-        [
-            {"params": decay_params, "weight_decay": args.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=args.learning_rate,
+    return build_cmud(
+        model,
+        lr=args.mud_learning_rate,
+        fallback_lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        momentum=args.mud_momentum,
+        passes=args.mud_passes,
         betas=(args.lion_beta1, args.lion_beta2),
+        eight_bit=not args.no_optimizer_8bit,
     )
 
 
@@ -1020,16 +939,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
 
-    # Optimizer selection: C-MUD (cautious MomentUm Decorrelation) for 2D weights
-    # with an 8-bit C-Lion fallback, or the legacy full-precision Lion.
-    parser.add_argument("--optimizer", choices=("cmud", "lion"), default="cmud")
+    # Optimizer: C-MUD (cautious MomentUm Decorrelation) for 2D weights with an
+    # 8-bit C-Lion fallback for everything else.
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3,
                         help="LR for the MUD (matrix) group (MUD paper default)")
     parser.add_argument("--mud-momentum", type=float, default=0.95)
     parser.add_argument("--mud-passes", type=int, default=1,
                         help="MUD triangular-whitening passes (p); 1 = MUD1 (default)")
-    parser.add_argument("--no-cautious", action="store_true",
-                        help="Disable the cautious sign-agreement mask (use plain MUD + Lion)")
     parser.add_argument("--no-optimizer-8bit", action="store_true",
                         help="Keep the C-Lion fallback momentum in full precision")
     parser.add_argument("--warmup-ratio", type=float, default=0.08)

@@ -101,15 +101,6 @@ class InfiniAttention(nn.Module):
         self.memory_v.copy_(state["memory_v"].to(device=self.memory_v.device, dtype=self.memory_v.dtype))
 
     @contextlib.contextmanager
-    def no_memory_updates(self):
-        previous = self.update_memory_buffers
-        self.update_memory_buffers = False
-        try:
-            yield
-        finally:
-            self.update_memory_buffers = previous
-
-    @contextlib.contextmanager
     def use_memory_state(self, state: dict[str, torch.Tensor], *, update_memory_buffers: bool = True):
         previous_state = self.get_memory_state()
         previous_update = self.update_memory_buffers
