@@ -13,7 +13,11 @@ from typing import Optional
 from config import TernaryConfig, config as default_config
 from layers.h_bitlinear import HBitLinear
 from layers.hybrid_block import HybridTransformerBlock
-from utils import document_attention_keep_mask
+from utils import (
+    causal_block_attention_bias,
+    combine_attention_bias,
+    document_attention_keep_mask,
+)
 
 
 class RMSNorm(nn.Module):
@@ -89,6 +93,40 @@ class BitNetDeep(nn.Module):
             if module.bias is not None:
                 module.bias.data.zero_()
 
+    def _build_shared_attention_bias(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Block-causal + optional document bias, computed once for all layers.
+
+        All layers share a single ``num_blocks`` (progressive growth updates every
+        block to the same value), so the structural bias is identical per layer.
+        Built directly in the attention compute dtype (the autocast dtype under
+        AMP, else ``x``'s dtype) so each attention sublayer's cast to its query
+        dtype is a no-op instead of allocating a fresh copy every layer.
+        """
+        batch_size, seq_len, _ = x.shape
+        device_type = x.device.type
+        compute_dtype = (
+            torch.get_autocast_dtype(device_type)
+            if torch.is_autocast_enabled(device_type)
+            else x.dtype
+        )
+        num_blocks = self.layers[0].num_blocks if len(self.layers) else 1
+        base_bias = causal_block_attention_bias(
+            seq_len, num_blocks, dtype=compute_dtype, device=x.device
+        )
+        return combine_attention_bias(
+            attention_mask,
+            base_bias=base_bias,
+            batch_size=batch_size,
+            q_len=seq_len,
+            k_len=seq_len,
+            dtype=compute_dtype,
+            device=x.device,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -106,8 +144,12 @@ class BitNetDeep(nn.Module):
         x = self.embed_tokens(input_ids)
         x = self.subln(x)  # Extra stability for deep ternary net
 
+        # Build the block-causal + document attention bias once and share it across
+        # every layer instead of recomputing it in each attention sublayer.
+        attn_bias, query_valid = self._build_shared_attention_bias(x, attention_mask)
+
         for layer in self.layers:
-            x = layer(x, attention_mask)
+            x = layer(x, attn_bias=attn_bias, query_valid=query_valid)
 
         x = self.norm(x)
         logits = self.lm_head(x)

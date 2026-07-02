@@ -94,13 +94,25 @@ class HybridTransformerBlock(nn.Module):
         # If early training is sluggish, a positive init here opens the attention path.
         self.gate = nn.Parameter(torch.zeros(1))  # learned scalar gate
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        attn_bias: Optional[torch.Tensor] = None,
+        query_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         residual = x
 
         # === Attention sublayer with Infini-Attention + AttnRes ===
         x_norm = self.attn_norm(x)
-        self.infini_attn.num_blocks = self.num_blocks
-        infini_out = self.infini_attn(x_norm, attention_mask)
+        if attn_bias is None:
+            # Fallback path: attention builds its own block-causal bias from num_blocks.
+            self.infini_attn.num_blocks = self.num_blocks
+            infini_out = self.infini_attn(x_norm, attention_mask)
+        else:
+            # Precomputed path: the shared bias already encodes num_blocks.
+            infini_out = self.infini_attn(x_norm, attn_bias=attn_bias, query_valid=query_valid)
 
         # Learned gate to smoothly blend Infini output with residual
         gate = torch.sigmoid(self.gate)

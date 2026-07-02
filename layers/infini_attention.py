@@ -140,7 +140,14 @@ class InfiniAttention(nn.Module):
         self.memory_k.mul_(0.99).add_(0.01 * pooled_k)
         self.memory_v.mul_(0.99).add_(0.01 * pooled_v)
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        attn_bias: Optional[torch.Tensor] = None,
+        query_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         qkv = self.qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
@@ -166,19 +173,25 @@ class InfiniAttention(nn.Module):
 
         scale = self.head_dim ** -0.5
 
-        # Block-causal structure (cached) plus any caller mask -> one fused SDPA call.
-        base_bias = causal_block_attention_bias(
-            seq_len, self.num_blocks, dtype=q.dtype, device=x.device
-        )
-        attn_bias, query_valid = combine_attention_bias(
-            attention_mask,
-            base_bias=base_bias,
-            batch_size=batch_size,
-            q_len=seq_len,
-            k_len=seq_len,
-            dtype=q.dtype,
-            device=x.device,
-        )
+        # The caller may precompute the block-causal + document bias once and share
+        # it across all layers (see BitNetDeep/TrainingWrapper); doing so keeps the
+        # Python-level cache lookup and mask fold out of the compiled per-layer graph.
+        # When no bias is supplied we fall back to computing it here.
+        if attn_bias is None:
+            base_bias = causal_block_attention_bias(
+                seq_len, self.num_blocks, dtype=q.dtype, device=x.device
+            )
+            attn_bias, query_valid = combine_attention_bias(
+                attention_mask,
+                base_bias=base_bias,
+                batch_size=batch_size,
+                q_len=seq_len,
+                k_len=seq_len,
+                dtype=q.dtype,
+                device=x.device,
+            )
+        else:
+            attn_bias = attn_bias.to(dtype=q.dtype)
 
         local_context = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         if query_valid is not None:

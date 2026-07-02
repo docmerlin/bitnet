@@ -31,7 +31,9 @@ import argparse
 import contextlib
 import json
 import math
+import queue
 import random
+import threading
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -221,6 +223,10 @@ class TrainingWrapper(nn.Module):
         x = self.model.embed_tokens(input_ids)
         x = self.model.subln(x)
 
+        # Compute the shared attention bias once (outside the per-layer loop) so the
+        # block-causal cache lookup and mask fold don't run in every layer's graph.
+        attn_bias, query_valid = self.model._build_shared_attention_bias(x, attention_mask)
+
         for layer in self.model.layers:
             if self.gradient_checkpointing and self.training:
                 # Compressive memory is intentionally frozen for the duration of a
@@ -232,7 +238,9 @@ class TrainingWrapper(nn.Module):
                 if isinstance(infini_attn, InfiniAttention):
                     layer_memory_state = infini_attn.get_memory_state()
                 x = checkpoint(
-                    lambda hidden_states, layer=layer, attention_mask=attention_mask: layer(hidden_states, attention_mask),
+                    lambda hidden_states, layer=layer, attn_bias=attn_bias, query_valid=query_valid: layer(
+                        hidden_states, attn_bias=attn_bias, query_valid=query_valid
+                    ),
                     x,
                     use_reentrant=False,
                     context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: self._checkpoint_context(
@@ -241,7 +249,7 @@ class TrainingWrapper(nn.Module):
                     ),
                 )
             else:
-                x = layer(x, attention_mask)
+                x = layer(x, attn_bias=attn_bias, query_valid=query_valid)
 
         x = self.model.norm(x)
         return self.model.lm_head(x)
@@ -487,6 +495,57 @@ class BatchStream:
             key: torch.stack([sample[key] for sample in batch], dim=0)
             for key in ("input_ids", "labels", "segment_ids")
         }
+
+
+class PrefetchStream:
+    """Background-thread prefetcher that overlaps CPU tokenization with GPU compute.
+
+    A daemon worker pulls batches from the underlying (infinite) stream, optionally
+    pins their memory for async host->device copies, and pushes them through a
+    bounded queue. The bound provides backpressure so at most ``buffer_size`` batches
+    are tokenized ahead of the trainer. The GPU no longer stalls on packing/encoding.
+    """
+
+    def __init__(self, stream: Iterator[Dict[str, torch.Tensor]], *, buffer_size: int = 2, pin_memory: bool = False) -> None:
+        self.stream = stream
+        self.pin_memory = pin_memory
+        self.queue: "queue.Queue[Optional[Dict[str, torch.Tensor]]]" = queue.Queue(maxsize=max(1, buffer_size))
+        self._error: Optional[BaseException] = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._started = False
+        self._exhausted = False
+
+    def _worker(self) -> None:
+        try:
+            for batch in self.stream:
+                if self.pin_memory:
+                    batch = {key: value.pin_memory() for key, value in batch.items()}
+                self.queue.put(batch)
+        except BaseException as exc:  # surface producer failures to the consumer
+            self._error = exc
+        finally:
+            # Always emit exactly one sentinel so a normally-terminating stream
+            # (EOF, StopIteration) unblocks the consumer instead of hanging on
+            # an empty queue.
+            self.queue.put(None)
+
+    def __iter__(self) -> "PrefetchStream":
+        return self
+
+    def __next__(self) -> Dict[str, torch.Tensor]:
+        if not self._started:
+            # Lazy start: don't open the underlying dataset / spawn the worker
+            # until first consumed, so an unused stream (e.g. late mixture during
+            # the early stage) holds no handles.
+            self._thread.start()
+            self._started = True
+        if self._exhausted:
+            raise self._error if self._error is not None else StopIteration
+        batch = self.queue.get()
+        if batch is None:
+            self._exhausted = True
+            raise self._error if self._error is not None else StopIteration
+        return batch
 
 
 def choose_device(device_arg: str) -> torch.device:
@@ -1075,24 +1134,13 @@ def main() -> None:
         scaler = torch.cuda.amp.GradScaler()
 
     logger = JsonlLogger(args)
-    early_train_batch_stream = build_batch_stream(
-        early_train_mixture,
-        tokenizer,
-        seed=args.seed,
-        shuffle=True,
-        shuffle_buffer_size=args.shuffle_buffer_size,
-        skip_examples=0,
-        restart_on_eof=True,
-        sequence_length=args.sequence_length,
-        max_document_tokens=args.max_document_tokens,
-        micro_batch_size=args.micro_batch_size,
-    )
-    late_train_batch_stream = None
-    if late_train_mixture is not None:
-        late_train_batch_stream = build_batch_stream(
-            late_train_mixture,
+    pin_memory = device.type == "cuda"
+    non_blocking = device.type == "cuda"
+    early_train_batch_stream: Iterator[Dict[str, torch.Tensor]] = PrefetchStream(
+        build_batch_stream(
+            early_train_mixture,
             tokenizer,
-            seed=args.seed + 17,
+            seed=args.seed,
             shuffle=True,
             shuffle_buffer_size=args.shuffle_buffer_size,
             skip_examples=0,
@@ -1100,6 +1148,25 @@ def main() -> None:
             sequence_length=args.sequence_length,
             max_document_tokens=args.max_document_tokens,
             micro_batch_size=args.micro_batch_size,
+        ),
+        pin_memory=pin_memory,
+    )
+    late_train_batch_stream = None
+    if late_train_mixture is not None:
+        late_train_batch_stream = PrefetchStream(
+            build_batch_stream(
+                late_train_mixture,
+                tokenizer,
+                seed=args.seed + 17,
+                shuffle=True,
+                shuffle_buffer_size=args.shuffle_buffer_size,
+                skip_examples=0,
+                restart_on_eof=True,
+                sequence_length=args.sequence_length,
+                max_document_tokens=args.max_document_tokens,
+                micro_batch_size=args.micro_batch_size,
+            ),
+            pin_memory=pin_memory,
         )
 
     state = TrainerState()
@@ -1132,15 +1199,18 @@ def main() -> None:
             runner.train()
             optimizer.zero_grad(set_to_none=True)
 
-            accumulated_loss = 0.0
+            # Accumulate the loss on-device as a tensor; syncing with .item() every
+            # microbatch would serialize backward against the next forward's kernel
+            # launches. We read it back once per optimization step below.
+            accumulated_loss: Optional[torch.Tensor] = None
             step_tokens = 0
             step_start = time.time()
 
             for _ in range(args.grad_accumulation_steps):
                 batch = next(active_train_batch_stream)
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
-                segment_ids = batch["segment_ids"].to(device)
+                input_ids = batch["input_ids"].to(device, non_blocking=non_blocking)
+                labels = batch["labels"].to(device, non_blocking=non_blocking)
+                segment_ids = batch["segment_ids"].to(device, non_blocking=non_blocking)
 
                 with autocast_context(device, amp_enabled, amp_dtype):
                     logits = runner(input_ids, segment_ids=segment_ids)
@@ -1152,7 +1222,8 @@ def main() -> None:
                 else:
                     scaled_loss.backward()
 
-                accumulated_loss += float(loss.item())
+                detached_loss = loss.detach()
+                accumulated_loss = detached_loss if accumulated_loss is None else accumulated_loss + detached_loss
                 step_tokens += int(input_ids.numel())
                 state.samples_processed += int(input_ids.size(0))
 
@@ -1176,9 +1247,11 @@ def main() -> None:
             current_lr = optimizer.param_groups[0]["lr"]
             elapsed = time.time() - step_start
             tokens_per_second = step_tokens / max(elapsed, 1e-6)
-            loss_value = accumulated_loss / args.grad_accumulation_steps
 
             if state.step == 1 or state.step % args.log_interval == 0:
+                # Read the on-device loss and grad norm back only when we actually log,
+                # so the common step never blocks on a device->host sync.
+                loss_value = float(accumulated_loss) / args.grad_accumulation_steps
                 logger.log(
                     state.step,
                     {

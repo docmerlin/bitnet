@@ -145,6 +145,21 @@ class HBitLinear(nn.Module):
         before the ternary weight multiplication for improved quantization stability.
         """
         if self.hadamard_size is not None:
+            # Dense cached matmul, not a fast Walsh-Hadamard transform. At the
+            # sizes this model uses (n = in_features = 1024, and 2048 for
+            # ffn_down) a single GEMM against a cached n x n matrix beats the
+            # O(n log n) FWHT by ~2.4-4.5x, because the FWHT's log2(n) sequential
+            # butterfly stages are memory-bound and pay per-stage kernel-launch
+            # overhead that a fused GEMM avoids. The GEMM also accumulates in
+            # fp32 on tensor cores, and the cached matrix is pre-normalized to
+            # 1/sqrt(n), so there is no fp16 overflow risk.
+            #
+            # Switch to a FWHT once n grows past ~4096: there the O(n^2) matmul
+            # flops and the n x n matrix's memory (4096^2 fp32 = 64MB/dtype)
+            # dominate and O(n log n) wins. Crossover is device-specific
+            # (measured on MPS) -- re-benchmark on the training GPU before moving
+            # the threshold. A FWHT implementation was removed from this module;
+            # recover it from git history if the size regime changes.
             x = x @ get_hadamard_tensor(self.hadamard_size, x.device, x.dtype)
 
         if bool(getattr(self.config, "use_4bit_activations", True)) and self.enable_activation_quantization:
