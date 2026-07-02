@@ -50,6 +50,7 @@ from config import TernaryConfig, config as default_config
 from layers.hybrid_block import HybridTransformerBlock
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
+from layers.rfmoe import DensityController, iter_rfmoe, rfmoe_aux_activity, rfmoe_density
 from model import BitNetDeep
 from optim import CMUD, build_cmud
 from utils import document_attention_keep_mask, load_checkpoint_payload, seed_everything
@@ -720,6 +721,10 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
         use_hadamard=not args.disable_hadamard,
         use_4bit_activations=True,
         ternary_weight_bits=default_config.ternary_weight_bits,
+        use_rfmoe=args.use_rfmoe,
+        rfmoe_num_experts=args.rfmoe_num_experts,
+        rfmoe_expert_dim=args.rfmoe_expert_dim,
+        rfmoe_theta=args.rfmoe_theta,
     )
 
 
@@ -985,6 +990,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rope-scaling-factor", type=float, default=default_config.rope_scaling["factor"])
     parser.add_argument("--disable-hadamard", action="store_true")
 
+    # Routing-free MoE FFN (roadmap step 1-2). Off by default -> dense GLU FFN.
+    parser.add_argument("--use-rfmoe", action="store_true",
+                        help="Replace the dense FFN with a self-gating MoE FFN")
+    parser.add_argument("--rfmoe-num-experts", type=int, default=8)
+    parser.add_argument("--rfmoe-expert-dim", type=int, default=None,
+                        help="Per-expert hidden dim (default: intermediate_size // 4)")
+    parser.add_argument("--rfmoe-theta", type=float, default=0.01,
+                        help="Fire threshold / inference compute knob")
+    parser.add_argument("--rfmoe-density-target", type=float, default=0.25,
+                        help="Target global activation density for the adaptive-lambda controller")
+    parser.add_argument("--rfmoe-density-eta", type=float, default=0.01,
+                        help="Multiplicative step for the density controller")
+
     # Optimization
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--grad-accumulation-steps", type=int, default=16)
@@ -1087,6 +1105,12 @@ def main() -> None:
             model_config = TernaryConfig(**{k: v for k, v in saved_config.items() if k in valid_fields})
     base_model = BitNetDeep(model_config)
     base_model.to(device)
+
+    # Adaptive-lambda density controller for the RFMoE FFN (None when dense).
+    density_controller = (
+        DensityController(target=args.rfmoe_density_target, eta=args.rfmoe_density_eta)
+        if any(iter_rfmoe(base_model)) else None
+    )
 
     runner = TrainingWrapper(base_model, gradient_checkpointing=args.gradient_checkpointing).to(device)
     should_compile = args.compile and hasattr(torch, "compile") and not args.gradient_checkpointing
@@ -1215,6 +1239,10 @@ def main() -> None:
                 with autocast_context(device, amp_enabled, amp_dtype):
                     logits = runner(input_ids, segment_ids=segment_ids)
                     loss = language_modeling_loss(logits, labels, z_loss_coef=args.z_loss_coef)
+                    if density_controller is not None:
+                        # Penalize the differentiable gate-activity proxy; the LM loss
+                        # keeps useful experts on, so the equilibrium sits at the target.
+                        loss = loss + density_controller.lam * rfmoe_aux_activity(base_model)
                     scaled_loss = loss / args.grad_accumulation_steps
 
                 if scaler is not None:
@@ -1241,6 +1269,10 @@ def main() -> None:
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
+            # Nudge lambda from the last microbatch's measured global density.
+            if density_controller is not None:
+                density_controller.update(rfmoe_density(base_model))
+
             state.step += 1
             state.tokens_processed += step_tokens
 
@@ -1252,6 +1284,10 @@ def main() -> None:
                 # Read the on-device loss and grad norm back only when we actually log,
                 # so the common step never blocks on a device->host sync.
                 loss_value = float(accumulated_loss) / args.grad_accumulation_steps
+                rfmoe_metrics = (
+                    {"rfmoe_density": rfmoe_density(base_model), "rfmoe_lambda": density_controller.lam}
+                    if density_controller is not None else {}
+                )
                 logger.log(
                     state.step,
                     {
@@ -1263,6 +1299,7 @@ def main() -> None:
                         "active_blocks": float(active_blocks),
                         "mixture_stage_id": 0.0 if mixture_stage == "early" else 1.0,
                         "mixture_switch_ratio": args.mixture_switch_ratio,
+                        **rfmoe_metrics,
                         **quant_metrics,
                     },
                 )

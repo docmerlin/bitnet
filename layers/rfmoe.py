@@ -77,7 +77,11 @@ class RFMoE(nn.Module):
         # Add x back inside forward (todo spec h = x + Σ G_i E_i). Set False when
         # an outer residual wrapper (e.g. AttnRes) already owns the residual.
         self.residual = residual
-        self._last_density = 0.0  # mean fire fraction over (token, expert) pairs, for logging/aux loss
+        self._last_density = 0.0   # mean fire fraction over (token, expert) pairs (float, for logging)
+        # Differentiable density proxy: mean pre-threshold gate activity over ALL
+        # tokens/experts. Minimizing it raises biases / shrinks projections ->
+        # fewer fire. The adaptive-lambda controller closes the loop on real density.
+        self._last_activity: torch.Tensor = torch.zeros(())
 
     def add_expert(self, expert_dim: int | None = None, rank: int | None = None, bias_init: float = 3.0) -> RFMoEExpert:
         """Append capacity post-training (roadmap part 2).
@@ -100,6 +104,7 @@ class RFMoE(nn.Module):
         flat = x.reshape(-1, self.hidden_size)   # (T, D)
         out = torch.zeros_like(flat)
         fired = 0
+        activity = out.new_zeros(())             # differentiable density proxy (grad -> a_gate, bias)
         # ponytail: per-expert Python loop with boolean-indexed skip path. Real
         # per-token FLOP saving, but O(num_experts) launches — fine for step-1
         # validation. Batch across experts (grouped GEMM / one padded matmul)
@@ -107,6 +112,7 @@ class RFMoE(nn.Module):
         for expert in self.experts:
             z, s = expert.score(flat)
             gate_value = F.relu(s - expert.bias)      # (T,) 0 below the bias
+            activity = activity + gate_value.mean()   # over ALL tokens, incl. near-misses
             fire = gate_value >= self.theta           # (T,) skip-path mask
             if not bool(fire.any()):
                 continue
@@ -114,9 +120,69 @@ class RFMoE(nn.Module):
             contrib = expert.expert(flat[idx], z[idx])            # only fired tokens run the FFN
             out.index_add_(0, idx, gate_value[idx, None] * contrib)  # score-weighted, NO divide-by-count
             fired += idx.numel()
-        self._last_density = fired / max(flat.size(0) * len(self.experts), 1)
+        num_experts = len(self.experts)
+        self._last_density = fired / max(flat.size(0) * num_experts, 1)
+        self._last_activity = activity / max(num_experts, 1)
         out = out.reshape(shape)
         return out + x if self.residual else out      # residual combine (or outer wrapper's job)
+
+
+def iter_rfmoe(model: nn.Module):
+    """Yield every RFMoE sublayer in a model."""
+    for module in model.modules():
+        if isinstance(module, RFMoE):
+            yield module
+
+
+def rfmoe_aux_activity(model: nn.Module) -> torch.Tensor:
+    """Sum the differentiable gate-activity proxy across all RFMoE layers.
+
+    One summed term + one lambda => only the GLOBAL average density is pinned;
+    individual layers stay free (early layers may go sparse, late layers dense).
+    Returns a 0-dim tensor (0.0 if the model has no RFMoE layers).
+    """
+    acts = [m._last_activity for m in iter_rfmoe(model)]
+    if not acts:
+        return torch.zeros(())
+    return torch.stack(acts).sum()
+
+
+def rfmoe_density(model: nn.Module) -> float:
+    """Mean fire fraction across all RFMoE layers (global empirical density rho)."""
+    densities = [m._last_density for m in iter_rfmoe(model)]
+    return sum(densities) / len(densities) if densities else 0.0
+
+
+class DensityController:
+    """Adaptive-lambda controller: drive global activation density to a target.
+
+    Multiplicative update ``lam <- lam * (1+eta)^sign(rho - target)`` — raise the
+    penalty when the MoE fires too much, relax it when too sparse, so the training
+    equilibrium (density penalty vs. the LM loss wanting useful experts on) sits at
+    ``target``. Biases warm-start ~0 (all experts fire) and a small ``lam`` ramps
+    up to carve out sparsity without collapsing any expert.
+
+    Usage per optimizer step:
+        loss = lm_loss + controller.lam * rfmoe_aux_activity(model)
+        ...backward/step...
+        controller.update(rfmoe_density(model))
+    """
+
+    def __init__(self, target: float = 0.25, eta: float = 0.01, lam: float = 1e-3,
+                 lam_min: float = 1e-6, lam_max: float = 1e3) -> None:
+        self.target = target
+        self.eta = eta
+        self.lam = lam
+        self.lam_min = lam_min
+        self.lam_max = lam_max
+
+    def update(self, density: float) -> float:
+        if density > self.target:
+            self.lam *= (1.0 + self.eta)
+        elif density < self.target:
+            self.lam /= (1.0 + self.eta)
+        self.lam = min(max(self.lam, self.lam_min), self.lam_max)
+        return self.lam
 
 
 if __name__ == "__main__":
@@ -148,3 +214,26 @@ if __name__ == "__main__":
     assert len(moe.experts) == 9
 
     print(f"RFMoE ok. density theta=0.01 -> {density_low:.3f}, theta=5 -> {density_high:.3f}, experts={len(moe.experts)}")
+
+    # Controller update() sign logic: over target -> raise lambda, under -> lower.
+    ctrl = DensityController(target=0.3, eta=0.1, lam=1.0)
+    ctrl.update(0.9); assert ctrl.lam > 1.0, ctrl.lam   # too dense -> more penalty
+    ctrl.update(0.1); ctrl.update(0.1); assert ctrl.lam < 1.0, ctrl.lam  # too sparse -> relax
+
+    # Density is controllable by the penalty: lambda=0 stays dense, strong lambda
+    # drives sparsity (the differentiable activity proxy raises biases / shrinks z).
+    def train_density(lam: float, steps: int = 150) -> float:
+        torch.manual_seed(1)
+        moe2 = RFMoE(hidden, expert_dim=32, num_experts=8, rank=4, theta=0.01)
+        opt2 = torch.optim.SGD(moe2.parameters(), lr=0.1)
+        tgt = torch.randn(4, 10, hidden)
+        for _ in range(steps):
+            loss = F.mse_loss(moe2(x), tgt) + lam * rfmoe_aux_activity(moe2)
+            opt2.zero_grad(); loss.backward(); opt2.step()
+        return rfmoe_density(moe2)
+
+    d_free = train_density(0.0)
+    d_pen = train_density(2.0)
+    assert d_free > 0.9, d_free            # no penalty -> stays dense
+    assert d_pen < d_free, (d_free, d_pen)  # penalty carves out sparsity
+    print(f"density control: lam=0 -> rho {d_free:.3f}, lam=2 -> rho {d_pen:.3f}")
