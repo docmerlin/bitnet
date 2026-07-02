@@ -50,7 +50,13 @@ from config import TernaryConfig, config as default_config
 from layers.hybrid_block import HybridTransformerBlock
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
-from layers.rfmoe import DensityController, iter_rfmoe, rfmoe_aux_activity, rfmoe_density
+from layers.rfmoe import (
+    DensityController,
+    iter_rfmoe,
+    rfmoe_aux_activity,
+    rfmoe_density,
+    rfmoe_locality_loss,
+)
 from model import BitNetDeep
 from optim import CMUD, build_cmud
 from utils import document_attention_keep_mask, load_checkpoint_payload, seed_everything
@@ -1002,6 +1008,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Target global activation density for the adaptive-lambda controller")
     parser.add_argument("--rfmoe-density-eta", type=float, default=0.01,
                         help="Multiplicative step for the density controller")
+    parser.add_argument("--rfmoe-locality-coef", type=float, default=0.0,
+                        help="Weight on the staircase locality loss (0 disables it -> load-balanced)")
+    parser.add_argument("--rfmoe-zipf-s", type=float, default=1.0,
+                        help="Zipf skew of the staircase head (larger -> smaller hot set)")
+    parser.add_argument("--rfmoe-uniform-alpha", type=float, default=0.1,
+                        help="Uniform-tail floor of the staircase (cold-expert keep-alive)")
 
     # Optimization
     parser.add_argument("--micro-batch-size", type=int, default=1)
@@ -1243,6 +1255,12 @@ def main() -> None:
                         # Penalize the differentiable gate-activity proxy; the LM loss
                         # keeps useful experts on, so the equilibrium sits at the target.
                         loss = loss + density_controller.lam * rfmoe_aux_activity(base_model)
+                        if args.rfmoe_locality_coef > 0.0:
+                            # Shape the relative usage distribution into a Zipf-head +
+                            # uniform-tail staircase (concentrate the hot set, keep tail alive).
+                            loss = loss + args.rfmoe_locality_coef * rfmoe_locality_loss(
+                                base_model, s=args.rfmoe_zipf_s, alpha=args.rfmoe_uniform_alpha
+                            )
                     scaled_loss = loss / args.grad_accumulation_steps
 
                 if scaler is not None:

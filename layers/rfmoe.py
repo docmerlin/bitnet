@@ -82,6 +82,13 @@ class RFMoE(nn.Module):
         # tokens/experts. Minimizing it raises biases / shrinks projections ->
         # fewer fire. The adaptive-lambda controller closes the loop on real density.
         self._last_activity: torch.Tensor = torch.zeros(())
+        # Per-expert differentiable usage (mean gate activity per expert) for the
+        # locality/staircase loss, plus a detached EMA used only to RANK experts
+        # (which one is hot) so the permutation is stable batch-to-batch while
+        # gradients still flow through the current usage values.
+        self._last_usage: torch.Tensor = torch.full((num_experts,), 1.0 / num_experts)
+        self.usage_decay = 0.99
+        self.register_buffer("usage_ema", torch.full((num_experts,), 1.0 / num_experts), persistent=False)
 
     def add_expert(self, expert_dim: int | None = None, rank: int | None = None, bias_init: float = 3.0) -> RFMoEExpert:
         """Append capacity post-training (roadmap part 2).
@@ -97,6 +104,10 @@ class RFMoE(nn.Module):
         with torch.no_grad():
             expert.bias.fill_(bias_init)
         self.experts.append(expert)
+        # Extend the ranking EMA; the cold newcomer starts at the current floor so
+        # it ranks in the tail (consistent with the locality staircase).
+        floor = self.usage_ema.min().item()
+        self.usage_ema = torch.cat([self.usage_ema, self.usage_ema.new_full((1,), floor)])
         return expert
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -104,7 +115,7 @@ class RFMoE(nn.Module):
         flat = x.reshape(-1, self.hidden_size)   # (T, D)
         out = torch.zeros_like(flat)
         fired = 0
-        activity = out.new_zeros(())             # differentiable density proxy (grad -> a_gate, bias)
+        usage = []                               # per-expert mean gate activity (differentiable)
         # ponytail: per-expert Python loop with boolean-indexed skip path. Real
         # per-token FLOP saving, but O(num_experts) launches — fine for step-1
         # validation. Batch across experts (grouped GEMM / one padded matmul)
@@ -112,7 +123,7 @@ class RFMoE(nn.Module):
         for expert in self.experts:
             z, s = expert.score(flat)
             gate_value = F.relu(s - expert.bias)      # (T,) 0 below the bias
-            activity = activity + gate_value.mean()   # over ALL tokens, incl. near-misses
+            usage.append(gate_value.mean())           # over ALL tokens, incl. near-misses
             fire = gate_value >= self.theta           # (T,) skip-path mask
             if not bool(fire.any()):
                 continue
@@ -121,8 +132,13 @@ class RFMoE(nn.Module):
             out.index_add_(0, idx, gate_value[idx, None] * contrib)  # score-weighted, NO divide-by-count
             fired += idx.numel()
         num_experts = len(self.experts)
+        usage = torch.stack(usage)                   # (N,)
+        self._last_usage = usage
+        self._last_activity = usage.mean()           # step-2 density proxy = mean over experts
         self._last_density = fired / max(flat.size(0) * num_experts, 1)
-        self._last_activity = activity / max(num_experts, 1)
+        # Detached EMA for stable ranking (rare experts are noisy per batch).
+        with torch.no_grad():
+            self.usage_ema.mul_(self.usage_decay).add_(usage.detach(), alpha=1.0 - self.usage_decay)
         out = out.reshape(shape)
         return out + x if self.residual else out      # residual combine (or outer wrapper's job)
 
@@ -151,6 +167,47 @@ def rfmoe_density(model: nn.Module) -> float:
     """Mean fire fraction across all RFMoE layers (global empirical density rho)."""
     densities = [m._last_density for m in iter_rfmoe(model)]
     return sum(densities) / len(densities) if densities else 0.0
+
+
+def staircase_target(n: int, s: float = 1.0, alpha: float = 0.1,
+                     device=None, dtype=torch.float32) -> torch.Tensor:
+    """Tier-matched usage target: Zipf head + uniform tail (roadmap step 3).
+
+    ``pi = (1-alpha)*Zipf(s) + alpha*Uniform(1/n)`` — a descending, sums-to-1
+    distribution. The Zipf head gives a fine hot-set ordering for tier placement;
+    the uniform component puts a floor ``>= alpha/n`` under every expert so the
+    cold tail stays trained and alive. ``s`` sets head skew (hot-set size),
+    ``alpha`` sets the tail floor height.
+    """
+    ranks = torch.arange(1, n + 1, device=device, dtype=dtype)
+    zipf = ranks.pow(-s)
+    zipf = zipf / zipf.sum()
+    uniform = torch.full((n,), 1.0 / n, device=device, dtype=dtype)
+    return (1.0 - alpha) * zipf + alpha * uniform
+
+
+def rfmoe_locality_loss(model: nn.Module, s: float = 1.0, alpha: float = 0.1,
+                        eps: float = 1e-8) -> torch.Tensor:
+    """Sum of KL(pi || sorted usage) over RFMoE layers — shape usage to a staircase.
+
+    ``p`` = current per-expert usage normalized to a distribution (differentiable).
+    Experts are ranked by the detached usage EMA, so WHICH expert is hot emerges
+    from data and is stable batch-to-batch, while gradients flow through the usage
+    values. ``KL(pi || p)`` diverges as any ``p_i -> 0`` while ``pi_i > 0``, so it
+    both concentrates mass on the head AND forbids any expert going fully dead.
+    Orthogonal to the density controller: this shapes the relative distribution,
+    the controller pins the absolute activation rate.
+    """
+    total = None
+    for m in iter_rfmoe(model):
+        usage = m._last_usage
+        p = usage / usage.sum().clamp(min=eps)                  # (N,) distribution, differentiable
+        order = torch.argsort(m.usage_ema, descending=True)     # detached permutation (stop-grad)
+        p_sorted = p[order]
+        pi = staircase_target(p.numel(), s, alpha, device=p.device, dtype=p.dtype)
+        kl = (pi * (pi.clamp(min=eps).log() - p_sorted.clamp(min=eps).log())).sum()
+        total = kl if total is None else total + kl
+    return total if total is not None else torch.zeros(())
 
 
 class DensityController:
@@ -237,3 +294,25 @@ if __name__ == "__main__":
     assert d_free > 0.9, d_free            # no penalty -> stays dense
     assert d_pen < d_free, (d_free, d_pen)  # penalty carves out sparsity
     print(f"density control: lam=0 -> rho {d_free:.3f}, lam=2 -> rho {d_pen:.3f}")
+
+    # Staircase target: descending, sums to 1, floored (no zero).
+    pi = staircase_target(8, s=1.0, alpha=0.1)
+    assert abs(float(pi.sum()) - 1.0) < 1e-5, float(pi.sum())
+    assert torch.all(pi[:-1] >= pi[1:]), pi          # descending
+    assert float(pi.min()) >= 0.1 / 8 - 1e-6, pi     # uniform floor alpha/n
+
+    # Locality loss shapes usage toward the staircase: KL drops, tail stays alive.
+    torch.manual_seed(2)
+    moe3 = RFMoE(hidden, expert_dim=32, num_experts=8, rank=4, theta=0.01)
+    opt3 = torch.optim.SGD(moe3.parameters(), lr=0.1)
+    tgt3 = torch.randn(4, 10, hidden)
+    moe3(x); kl_start = float(rfmoe_locality_loss(moe3, s=1.0, alpha=0.1).detach())
+    for _ in range(200):
+        loss = F.mse_loss(moe3(x), tgt3) + 0.5 * rfmoe_locality_loss(moe3, s=1.0, alpha=0.1)
+        opt3.zero_grad(); loss.backward(); opt3.step()
+    moe3(x); kl_end = float(rfmoe_locality_loss(moe3, s=1.0, alpha=0.1).detach())
+    p_end = (moe3._last_usage / moe3._last_usage.sum()).detach().sort(descending=True).values
+    assert kl_end < kl_start, (kl_start, kl_end)     # usage moved toward the staircase
+    assert float(p_end.min()) > 0.0, p_end           # no expert went dead (KL floor works)
+    print(f"locality: KL(pi||p) {kl_start:.3f} -> {kl_end:.3f}, "
+          f"hot={float(p_end[0]):.3f} tail={float(p_end[-1]):.3f}")
