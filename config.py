@@ -37,6 +37,13 @@ class TernaryConfig:
     use_4bit_activations: bool = True
     ternary_weight_bits: int = 2  # 1.58-bit effective (-1,0,1)
 
+    # Routing-free MoE FFN (roadmap step 1; off by default -> dense GLU FFN)
+    use_rfmoe: bool = False
+    rfmoe_num_experts: int = 8
+    rfmoe_expert_dim: Optional[int] = None  # None -> intermediate_size // 4
+    rfmoe_rank: Optional[int] = None        # None -> hidden_size // 16
+    rfmoe_theta: float = 0.01               # fire threshold / compute knob
+
     # Stability / quality
     use_qk_norm: bool = True       # per-head RMSNorm on q/k before RoPE (deep ternary stability)
     tie_word_embeddings: bool = True

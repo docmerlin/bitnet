@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
+from layers.rfmoe import RFMoE
 
 
 class AttentionResidual(nn.Module):
@@ -84,9 +85,22 @@ class HybridTransformerBlock(nn.Module):
         self.attn_res = AttentionResidual(hidden_size, init_scale=init_scale)
         self.mlp_res = AttentionResidual(hidden_size, init_scale=init_scale)
 
-        # MLP (using H-BitLinear for down projection to stay ternary)
-        self.ffn_up = HBitLinear(hidden_size, intermediate_size * 2, bias=False, config=config)
-        self.ffn_down = HBitLinear(intermediate_size, hidden_size, bias=False, config=config)
+        # MLP: either a dense GLU FFN (H-BitLinear, ternary) or a routing-free MoE
+        # FFN (roadmap step 1). RFMoE is a drop-in replacement for the whole FFN.
+        self.use_rfmoe = bool(getattr(config, "use_rfmoe", False))
+        if self.use_rfmoe:
+            expert_dim = getattr(config, "rfmoe_expert_dim", None) or intermediate_size // 4
+            self.moe = RFMoE(
+                hidden_size,
+                expert_dim=expert_dim,
+                num_experts=getattr(config, "rfmoe_num_experts", 8),
+                rank=getattr(config, "rfmoe_rank", None),
+                theta=getattr(config, "rfmoe_theta", 0.01),
+                residual=False,  # mlp_res (AttnRes) adds the residual
+            )
+        else:
+            self.ffn_up = HBitLinear(hidden_size, intermediate_size * 2, bias=False, config=config)
+            self.ffn_down = HBitLinear(intermediate_size, hidden_size, bias=False, config=config)
 
         # Learned gate to balance Infini-Attention with residual path.
         # Initialized to 0 so sigmoid(gate)=0.5 at init: the attention path starts
@@ -124,8 +138,11 @@ class HybridTransformerBlock(nn.Module):
         residual = x
         x_norm = self.mlp_norm(x)
         
-        gate_up, value = self.ffn_up(x_norm).chunk(2, dim=-1)
-        mlp_out = self.ffn_down(F.silu(gate_up) * value)
+        if self.use_rfmoe:
+            mlp_out = self.moe(x_norm)  # AttnRes below owns the residual (moe.residual=False)
+        else:
+            gate_up, value = self.ffn_up(x_norm).chunk(2, dim=-1)
+            mlp_out = self.ffn_down(F.silu(gate_up) * value)
         
         x = self.mlp_res(residual, mlp_out)
 
