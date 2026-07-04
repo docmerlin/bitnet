@@ -124,7 +124,8 @@ class RFMoE(nn.Module):
         for expert in self.experts:
             z, s = expert.score(flat)
             gate_value = F.relu(s - expert.bias)      # (T,) 0 below the bias
-            gate_rows.append(gate_value)              # keep full pattern for diversity
+            if self.training:
+                gate_rows.append(gate_value)          # keep full pattern for diversity
             fire = gate_value >= self.theta           # (T,) skip-path mask
             if not bool(fire.any()):
                 continue
@@ -132,16 +133,19 @@ class RFMoE(nn.Module):
             contrib = expert.expert(flat[idx], z[idx])            # only fired tokens run the FFN
             out.index_add_(0, idx, gate_value[idx, None] * contrib)  # score-weighted, NO divide-by-count
             fired += idx.numel()
-        num_experts = len(self.experts)
-        gate_stack = torch.stack(gate_rows)          # (N, T) firing patterns
-        self._last_gate = gate_stack                 # for the diversity loss
-        usage = gate_stack.mean(dim=1)               # (N,) mean gate activity per expert
-        self._last_usage = usage
-        self._last_activity = usage.mean()           # step-2 density proxy = mean over experts
-        self._last_density = fired / max(flat.size(0) * num_experts, 1)
-        # Detached EMA for stable ranking (rare experts are noisy per batch).
-        with torch.no_grad():
-            self.usage_ema.mul_(self.usage_decay).add_(usage.detach(), alpha=1.0 - self.usage_decay)
+        # Aux stats feed the density/locality/diversity losses — training only.
+        # Inference (the theta compute knob) skips the (N, T) stack + EMA update.
+        if self.training:
+            num_experts = len(self.experts)
+            gate_stack = torch.stack(gate_rows)          # (N, T) firing patterns
+            self._last_gate = gate_stack                 # for the diversity loss
+            usage = gate_stack.mean(dim=1)               # (N,) mean gate activity per expert
+            self._last_usage = usage
+            self._last_activity = usage.mean()           # step-2 density proxy = mean over experts
+            self._last_density = fired / max(flat.size(0) * num_experts, 1)
+            # Detached EMA for stable ranking (rare experts are noisy per batch).
+            with torch.no_grad():
+                self.usage_ema.mul_(self.usage_decay).add_(usage.detach(), alpha=1.0 - self.usage_decay)
         out = out.reshape(shape)
         return out + x if self.residual else out      # residual combine (or outer wrapper's job)
 

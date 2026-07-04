@@ -931,13 +931,19 @@ def multi_token_loss(mtp_logits: List[torch.Tensor], labels: torch.Tensor) -> to
     if not mtp_logits:
         return labels.new_zeros((), dtype=torch.float32)
     total = None
+    counted = 0
     for i, depth_logits in enumerate(mtp_logits):
         shift = i + 1                              # depth d=i+2 predicts labels[t + (i+1)]
+        if shift >= depth_logits.size(1):          # no positions have a target this deep
+            continue                               # else empty slice -> cross_entropy NaN
         pred = depth_logits[:, : depth_logits.size(1) - shift]   # (B, S-shift, V)
         target = labels[:, shift:]                               # (B, S-shift)
         depth_loss = F.cross_entropy(pred.reshape(-1, pred.size(-1)), target.reshape(-1))
         total = depth_loss if total is None else total + depth_loss
-    return total / len(mtp_logits)
+        counted += 1
+    if counted == 0:
+        return labels.new_zeros((), dtype=torch.float32)
+    return total / counted
 
 
 @torch.no_grad()
@@ -1301,6 +1307,7 @@ def main() -> None:
             # microbatch would serialize backward against the next forward's kernel
             # launches. We read it back once per optimization step below.
             accumulated_loss: Optional[torch.Tensor] = None
+            density_sum = 0.0            # mean fire-fraction summed over the accum window
             step_tokens = 0
             step_start = time.time()
 
@@ -1342,6 +1349,8 @@ def main() -> None:
 
                 detached_loss = loss.detach()
                 accumulated_loss = detached_loss if accumulated_loss is None else accumulated_loss + detached_loss
+                if density_controller is not None:
+                    density_sum += rfmoe_density(base_model)   # this microbatch's density
                 step_tokens += int(input_ids.numel())
                 state.samples_processed += int(input_ids.size(0))
 
@@ -1359,9 +1368,10 @@ def main() -> None:
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-            # Nudge lambda from the last microbatch's measured global density.
+            # Nudge lambda from the density averaged over the whole accum window,
+            # not just the final microbatch (avoids per-step controller noise).
             if density_controller is not None:
-                density_controller.update(rfmoe_density(base_model))
+                density_controller.update(density_sum / args.grad_accumulation_steps)
 
             state.step += 1
             state.tokens_processed += step_tokens

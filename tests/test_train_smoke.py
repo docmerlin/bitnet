@@ -21,6 +21,7 @@ from train import (
     create_optimizer,
     language_modeling_loss,
     load_checkpoint,
+    multi_token_loss,
     save_checkpoint,
 )
 from utils import load_checkpoint_payload
@@ -137,7 +138,26 @@ def test_z_loss_matches_cross_entropy_when_disabled() -> bool:
     return True
 
 
+def test_multi_token_loss_handles_short_sequences() -> bool:
+    torch.manual_seed(0)
+    seq_len, vocab = 3, 16
+    labels = torch.randint(0, vocab, (2, seq_len))
+
+    # Depth 0 (shift 1) has targets; depths whose shift >= seq_len are empty and
+    # must be skipped, not fed to cross_entropy (which returns NaN on 0 rows).
+    depth_logits = [torch.randn(2, seq_len, vocab) for _ in range(seq_len + 2)]
+    loss = multi_token_loss(depth_logits, labels)
+    assert torch.isfinite(loss), loss
+
+    # All depths empty (seq_len 1) -> zero, still finite.
+    tiny = multi_token_loss([torch.randn(2, 1, vocab)], torch.randint(0, vocab, (2, 1)))
+    assert torch.isfinite(tiny) and float(tiny) == 0.0, tiny
+    print("multi-token-loss short-sequence tests passed")
+    return True
+
+
 if __name__ == "__main__":
     test_single_training_step_updates_parameters()
     test_checkpoint_save_load_roundtrip()
     test_z_loss_matches_cross_entropy_when_disabled()
+    test_multi_token_loss_handles_short_sequences()
