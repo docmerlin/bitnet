@@ -818,6 +818,25 @@ def update_block_growth(model: nn.Module, token_progress: float, args: argparse.
     return blocks
 
 
+def rfmoe_staircase_schedule(token_progress: float, args: argparse.Namespace) -> Tuple[float, float]:
+    """Flat->skew curriculum for the RFMoE locality target (roadmap step 4).
+
+    Anneal from a FLAT target (s=0, alpha=1 -> uniform, so the whole expert
+    population trains up and the tail learns to be competent) to the configured
+    skew (s, alpha) over the first ``rfmoe_curriculum_ratio`` of training, then
+    hold. With ratio<=0 there is no curriculum: the configured target applies
+    from step 0. Returns ``(s, alpha)``.
+    """
+    s_end, alpha_end = args.rfmoe_zipf_s, args.rfmoe_uniform_alpha
+    ratio = args.rfmoe_curriculum_ratio
+    if ratio <= 0.0:
+        return s_end, alpha_end
+    frac = min(max(token_progress, 0.0) / ratio, 1.0)
+    s = frac * s_end                      # 0 -> s_end   (uniform head -> skewed)
+    alpha = 1.0 + frac * (alpha_end - 1.0)  # 1 -> alpha_end (full floor -> configured floor)
+    return s, alpha
+
+
 def save_checkpoint(
     output_dir: Path,
     model: BitNetDeep,
@@ -1051,6 +1070,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Zipf skew of the staircase head (larger -> smaller hot set)")
     parser.add_argument("--rfmoe-uniform-alpha", type=float, default=0.1,
                         help="Uniform-tail floor of the staircase (cold-expert keep-alive)")
+    parser.add_argument("--rfmoe-curriculum-ratio", type=float, default=0.0,
+                        help="Fraction of training to anneal the locality target flat->skew (0 disables)")
 
     # Optimization
     parser.add_argument("--micro-batch-size", type=int, default=1)
@@ -1259,6 +1280,7 @@ def main() -> None:
             train_progress = state.tokens_processed / max(args.total_tokens, 1)
             quant_metrics = update_quantization_schedule(base_model, train_progress, args)
             active_blocks = update_block_growth(base_model, train_progress, args)
+            rfmoe_s, rfmoe_alpha = rfmoe_staircase_schedule(train_progress, args)
             mixture_stage, _ = choose_stage_mixture(
                 train_progress,
                 early_mixture=early_train_mixture,
@@ -1300,8 +1322,9 @@ def main() -> None:
                         if args.rfmoe_locality_coef > 0.0:
                             # Shape the relative usage distribution into a Zipf-head +
                             # uniform-tail staircase (concentrate the hot set, keep tail alive).
+                            # (s, alpha) follow the flat->skew curriculum schedule.
                             loss = loss + args.rfmoe_locality_coef * rfmoe_locality_loss(
-                                base_model, s=args.rfmoe_zipf_s, alpha=args.rfmoe_uniform_alpha
+                                base_model, s=rfmoe_s, alpha=rfmoe_alpha
                             )
                     scaled_loss = loss / args.grad_accumulation_steps
 
@@ -1345,7 +1368,12 @@ def main() -> None:
                 # so the common step never blocks on a device->host sync.
                 loss_value = float(accumulated_loss) / args.grad_accumulation_steps
                 rfmoe_metrics = (
-                    {"rfmoe_density": rfmoe_density(base_model), "rfmoe_lambda": density_controller.lam}
+                    {
+                        "rfmoe_density": rfmoe_density(base_model),
+                        "rfmoe_lambda": density_controller.lam,
+                        "rfmoe_zipf_s": rfmoe_s,
+                        "rfmoe_alpha": rfmoe_alpha,
+                    }
                     if density_controller is not None else {}
                 )
                 logger.log(
