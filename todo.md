@@ -160,14 +160,24 @@ Inference / serving side (the payoff):
   R²MoE (2507.13107, redundancy removal), CP-MoE (2605.20247).
 
 ### Rough build order
-1. Minimal RFMoE FFN block (self-gating expert, skip path, residual combine) — start dense, swap one
-   FFN sublayer to MoE. Validate it trains + the θ knob works on a small run.
-2. Add adaptive-λ density control + global density target + bias warmup.
-3. Swap the balance target uniform → staircase (mixture π). Verify usage distribution matches and the
-   tail stays alive (KL(π‖p) floor).
-4. Add the flat→skew curriculum (anneal α, s).
-5. Add functional-diversity term for the tail.
-6. (Serving) tier experts by usage, expert offload + prefetch. Optional: temporal stickiness loss.
+1. [DONE] Minimal RFMoE FFN block (self-gating expert, skip path, residual combine) — dense experts,
+   swapped behind config.use_rfmoe. θ knob validated. `layers/rfmoe.py`, `layers/hybrid_block.py`.
+2. [DONE] Adaptive-λ density control (`DensityController`, global target, bias warmup ~1e-6). train.py
+   --rfmoe-density-target / --rfmoe-density-eta.
+3. [DONE] Staircase target π=(1-α)Zipf(s)+αUniform, KL(π‖sorted p) with EMA-ranked stop-grad
+   permutation. --rfmoe-locality-coef / --rfmoe-zipf-s / --rfmoe-uniform-alpha.
+4. [DONE] Flat→skew curriculum (anneal s:0→s, α:1→α over --rfmoe-curriculum-ratio).
+5. [DONE] Functional-diversity term: penalize positive pairwise correlation of per-token firing
+   patterns. --rfmoe-diversity-coef.
+6. [TODO] (Serving) tier experts by usage, expert offload + prefetch. Optional: temporal stickiness loss.
+
+### Not yet done (thread 1)
+- PERF: forward is a per-expert Python loop (O(N) launches). Batch into a grouped/padded GEMM before
+  any real (non-toy) training run — current form is validation-only.
+- Ternary experts: RFMoEExpert uses nn.Linear, not HBitLinear. Swap to stay 1.58-bit once the design
+  is frozen (adds Hadamard + ternary STE per expert matrix).
+- add_expert() exists (cold-start high bias, extends ranking EMA) but the freeze-and-train-new-expert
+  loop + niche-finding (thread 2) is not wired into train.py.
 
 ---
 
