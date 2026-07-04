@@ -87,6 +87,7 @@ class RFMoE(nn.Module):
         # (which one is hot) so the permutation is stable batch-to-batch while
         # gradients still flow through the current usage values.
         self._last_usage: torch.Tensor = torch.full((num_experts,), 1.0 / num_experts)
+        self._last_gate: torch.Tensor = torch.zeros(num_experts, 1)  # (N, T) firing patterns, set in forward
         self.usage_decay = 0.99
         self.register_buffer("usage_ema", torch.full((num_experts,), 1.0 / num_experts), persistent=False)
 
@@ -115,7 +116,7 @@ class RFMoE(nn.Module):
         flat = x.reshape(-1, self.hidden_size)   # (T, D)
         out = torch.zeros_like(flat)
         fired = 0
-        usage = []                               # per-expert mean gate activity (differentiable)
+        gate_rows = []                           # per-expert (T,) firing pattern (differentiable)
         # ponytail: per-expert Python loop with boolean-indexed skip path. Real
         # per-token FLOP saving, but O(num_experts) launches — fine for step-1
         # validation. Batch across experts (grouped GEMM / one padded matmul)
@@ -123,7 +124,7 @@ class RFMoE(nn.Module):
         for expert in self.experts:
             z, s = expert.score(flat)
             gate_value = F.relu(s - expert.bias)      # (T,) 0 below the bias
-            usage.append(gate_value.mean())           # over ALL tokens, incl. near-misses
+            gate_rows.append(gate_value)              # keep full pattern for diversity
             fire = gate_value >= self.theta           # (T,) skip-path mask
             if not bool(fire.any()):
                 continue
@@ -132,7 +133,9 @@ class RFMoE(nn.Module):
             out.index_add_(0, idx, gate_value[idx, None] * contrib)  # score-weighted, NO divide-by-count
             fired += idx.numel()
         num_experts = len(self.experts)
-        usage = torch.stack(usage)                   # (N,)
+        gate_stack = torch.stack(gate_rows)          # (N, T) firing patterns
+        self._last_gate = gate_stack                 # for the diversity loss
+        usage = gate_stack.mean(dim=1)               # (N,) mean gate activity per expert
         self._last_usage = usage
         self._last_activity = usage.mean()           # step-2 density proxy = mean over experts
         self._last_density = fired / max(flat.size(0) * num_experts, 1)
@@ -207,6 +210,34 @@ def rfmoe_locality_loss(model: nn.Module, s: float = 1.0, alpha: float = 0.1,
         pi = staircase_target(p.numel(), s, alpha, device=p.device, dtype=p.dtype)
         kl = (pi * (pi.clamp(min=eps).log() - p_sorted.clamp(min=eps).log())).sum()
         total = kl if total is None else total + kl
+    return total if total is not None else torch.zeros(())
+
+
+def rfmoe_diversity_loss(model: nn.Module, eps: float = 1e-8) -> torch.Tensor:
+    """Sum over RFMoE layers of the mean positive pairwise firing-pattern overlap.
+
+    Equal usage != equal function: two experts that fire on the SAME tokens claim
+    the same niche and one is redundant cold weight (roadmap step 5, cf. R2MoE).
+    Each expert's per-token gate pattern is its functional signature; this
+    penalizes the positive off-diagonal correlations between those signatures so
+    experts spread onto distinct token subsets. Anti-correlated experts (already
+    distinct niches) are not penalized. Differentiable, reuses the gate patterns
+    already computed in forward.
+    """
+    total = None
+    for m in iter_rfmoe(model):
+        g = m._last_gate                                   # (N, T) differentiable firing patterns
+        n = g.size(0)
+        if n < 2 or g.size(1) < 2:
+            continue
+        gc = g - g.mean(dim=1, keepdim=True)               # center each expert over tokens
+        gn = gc / gc.norm(dim=1, keepdim=True).clamp(min=eps)
+        corr = gn @ gn.t()                                 # (N, N) cosine of firing patterns
+        off = corr - torch.diag(torch.diagonal(corr))      # zero the diagonal
+        # ponytail: uniform over all pairs. Weight by inverse usage if the tail
+        # needs diversity more than the (unavoidably-overlapping) hot set.
+        overlap = off.clamp(min=0.0).pow(2).sum() / (n * (n - 1))  # only redundancy, not anti-corr
+        total = overlap if total is None else total + overlap
     return total if total is not None else torch.zeros(())
 
 
@@ -316,3 +347,24 @@ if __name__ == "__main__":
     assert float(p_end.min()) > 0.0, p_end           # no expert went dead (KL floor works)
     print(f"locality: KL(pi||p) {kl_start:.3f} -> {kl_end:.3f}, "
           f"hot={float(p_end[0]):.3f} tail={float(p_end[-1]):.3f}")
+
+    # Diversity loss math: identical firing patterns penalized, orthogonal not.
+    moe4 = RFMoE(hidden, expert_dim=32, num_experts=3, rank=4, theta=0.01)
+    moe4._last_gate = torch.tensor([[1.,0,1,0,1,0],[1,0,1,0,1,0],[1,0,1,0,1,0]])  # all identical
+    same = float(rfmoe_diversity_loss(moe4))
+    moe4._last_gate = torch.tensor([[1.,0,0,0,0,0],[0,1,0,0,0,0],[0,0,1,0,0,0]])  # disjoint niches
+    disjoint = float(rfmoe_diversity_loss(moe4))
+    assert same > 0.5 and disjoint < same, (same, disjoint)
+
+    # Training with the diversity term decorrelates expert firing patterns.
+    torch.manual_seed(3)
+    moe5 = RFMoE(hidden, expert_dim=32, num_experts=6, rank=4, theta=0.01)
+    opt5 = torch.optim.SGD(moe5.parameters(), lr=0.2)
+    tgt5 = torch.randn(4, 10, hidden)
+    moe5(x); div_start = float(rfmoe_diversity_loss(moe5).detach())
+    for _ in range(200):
+        loss = F.mse_loss(moe5(x), tgt5) + 1.0 * rfmoe_diversity_loss(moe5)
+        opt5.zero_grad(); loss.backward(); opt5.step()
+    moe5(x); div_end = float(rfmoe_diversity_loss(moe5).detach())
+    assert div_end < div_start, (div_start, div_end)
+    print(f"diversity: identical={same:.3f} disjoint={disjoint:.3f}, overlap {div_start:.3f} -> {div_end:.3f}")

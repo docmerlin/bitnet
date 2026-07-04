@@ -55,6 +55,7 @@ from layers.rfmoe import (
     iter_rfmoe,
     rfmoe_aux_activity,
     rfmoe_density,
+    rfmoe_diversity_loss,
     rfmoe_locality_loss,
 )
 from model import BitNetDeep
@@ -1072,6 +1073,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Uniform-tail floor of the staircase (cold-expert keep-alive)")
     parser.add_argument("--rfmoe-curriculum-ratio", type=float, default=0.0,
                         help="Fraction of training to anneal the locality target flat->skew (0 disables)")
+    parser.add_argument("--rfmoe-diversity-coef", type=float, default=0.0,
+                        help="Weight on the functional-diversity loss (decorrelate expert firing; 0 disables)")
 
     # Optimization
     parser.add_argument("--micro-batch-size", type=int, default=1)
@@ -1326,6 +1329,10 @@ def main() -> None:
                             loss = loss + args.rfmoe_locality_coef * rfmoe_locality_loss(
                                 base_model, s=rfmoe_s, alpha=rfmoe_alpha
                             )
+                        if args.rfmoe_diversity_coef > 0.0:
+                            # Push experts onto distinct token subsets so equal usage
+                            # doesn't collapse into redundant function (esp. the tail).
+                            loss = loss + args.rfmoe_diversity_coef * rfmoe_diversity_loss(base_model)
                     scaled_loss = loss / args.grad_accumulation_steps
 
                 if scaler is not None:
@@ -1373,6 +1380,7 @@ def main() -> None:
                         "rfmoe_lambda": density_controller.lam,
                         "rfmoe_zipf_s": rfmoe_s,
                         "rfmoe_alpha": rfmoe_alpha,
+                        "rfmoe_diversity": float(rfmoe_diversity_loss(base_model).detach()),
                     }
                     if density_controller is not None else {}
                 )
