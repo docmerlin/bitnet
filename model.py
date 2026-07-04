@@ -79,11 +79,34 @@ class BitNetDeep(nn.Module):
         else:
             self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
+        # Multi-token prediction heads (training-time, data efficiency). Each extra
+        # depth gets a small transform of the final hidden, then reuses the SHARED
+        # unembedding (self.lm_head) — so k heads cost k*hidden^2, not k*hidden*vocab.
+        self.mtp_depth = int(getattr(self.config, "mtp_depth", 0))
+        if self.mtp_depth > 0:
+            self.mtp_transforms = nn.ModuleList(
+                nn.Sequential(
+                    RMSNorm(self.config.hidden_size, self.config.rms_norm_eps),
+                    nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=False),
+                )
+                for _ in range(self.mtp_depth)
+            )
+
         self.apply(self._init_weights)
 
         # Tie weights after initialization so the shared tensor is not overwritten.
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
+
+    def mtp_logits(self, hidden: torch.Tensor) -> list[torch.Tensor]:
+        """Per-depth logits from the final hidden (same tensor fed to lm_head).
+
+        Depth ``i`` (0-indexed) predicts the token at offset ``i+2`` from each
+        position. Returns [] when MTP is disabled. Reuses the tied unembedding.
+        """
+        if self.mtp_depth <= 0:
+            return []
+        return [self.lm_head(transform(hidden)) for transform in self.mtp_transforms]
 
     def _init_weights(self, module):
         if isinstance(module, nn.Embedding):

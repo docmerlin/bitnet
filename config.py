@@ -44,6 +44,11 @@ class TernaryConfig:
     rfmoe_rank: Optional[int] = None        # None -> hidden_size // 16
     rfmoe_theta: float = 0.01               # fire threshold / compute knob
 
+    # Multi-token prediction (data-efficiency: extra prediction targets per token).
+    # 0 = off (plain next-token). k extra heads predict tokens t+2..t+1+k from the
+    # final hidden, reusing the tied unembedding. Training-time only.
+    mtp_depth: int = 0
+
     # Stability / quality
     use_qk_norm: bool = True       # per-head RMSNorm on q/k before RoPE (deep ternary stability)
     tie_word_embeddings: bool = True

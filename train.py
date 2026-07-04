@@ -220,6 +220,7 @@ class TrainingWrapper(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         reset_memory: bool = True,
         segment_ids: Optional[torch.Tensor] = None,
+        return_mtp: bool = False,
     ) -> torch.Tensor:
         if reset_memory:
             reset_infini_memory(self.model)
@@ -259,7 +260,11 @@ class TrainingWrapper(nn.Module):
                 x = layer(x, attn_bias=attn_bias, query_valid=query_valid)
 
         x = self.model.norm(x)
-        return self.model.lm_head(x)
+        logits = self.model.lm_head(x)
+        if return_mtp:
+            # Extra prediction heads reuse the final hidden x (post-norm, pre-head).
+            return logits, self.model.mtp_logits(x)
+        return logits
 
 
 def iter_infini_attention_modules(module: nn.Module) -> Iterator[InfiniAttention]:
@@ -731,6 +736,7 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
         rfmoe_num_experts=args.rfmoe_num_experts,
         rfmoe_expert_dim=args.rfmoe_expert_dim,
         rfmoe_theta=args.rfmoe_theta,
+        mtp_depth=args.mtp_depth,
     )
 
 
@@ -889,6 +895,31 @@ def language_modeling_loss(
     return loss
 
 
+def multi_token_loss(mtp_logits: List[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+    """Mean cross-entropy over the extra multi-token-prediction heads.
+
+    ``mtp_logits[i]`` predicts the token at offset ``i+2`` from each position.
+    Since ``labels[t]`` is the token at ``t+1``, depth ``d = i+2`` targets
+    ``labels[:, d-1:]`` aligned with the first ``S-(d-1)`` predictions; the tail
+    positions have no target and are dropped (no ignore_index needed). Averaged
+    across depths so the coefficient's scale is independent of ``mtp_depth``.
+
+    Cross-document boundaries are NOT masked here — the main next-token loss
+    doesn't mask them either (packed windows only mask attention), so MTP stays
+    consistent with existing behavior.
+    """
+    if not mtp_logits:
+        return labels.new_zeros((), dtype=torch.float32)
+    total = None
+    for i, depth_logits in enumerate(mtp_logits):
+        shift = i + 1                              # depth d=i+2 predicts labels[t + (i+1)]
+        pred = depth_logits[:, : depth_logits.size(1) - shift]   # (B, S-shift, V)
+        target = labels[:, shift:]                               # (B, S-shift)
+        depth_loss = F.cross_entropy(pred.reshape(-1, pred.size(-1)), target.reshape(-1))
+        total = depth_loss if total is None else total + depth_loss
+    return total / len(mtp_logits)
+
+
 @torch.no_grad()
 def evaluate(
     runner: nn.Module,
@@ -995,6 +1026,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--rope-scaling-factor", type=float, default=default_config.rope_scaling["factor"])
     parser.add_argument("--disable-hadamard", action="store_true")
+
+    # Multi-token prediction (data efficiency). 0 = plain next-token.
+    parser.add_argument("--mtp-depth", type=int, default=0,
+                        help="Number of extra prediction heads (predict t+2..t+1+k)")
+    parser.add_argument("--mtp-loss-coef", type=float, default=0.3,
+                        help="Weight on the averaged multi-token-prediction loss")
 
     # Routing-free MoE FFN (roadmap step 1-2). Off by default -> dense GLU FFN.
     parser.add_argument("--use-rfmoe", action="store_true",
@@ -1249,8 +1286,13 @@ def main() -> None:
                 segment_ids = batch["segment_ids"].to(device, non_blocking=non_blocking)
 
                 with autocast_context(device, amp_enabled, amp_dtype):
-                    logits = runner(input_ids, segment_ids=segment_ids)
+                    if args.mtp_depth > 0:
+                        logits, mtp_logits = runner(input_ids, segment_ids=segment_ids, return_mtp=True)
+                    else:
+                        logits, mtp_logits = runner(input_ids, segment_ids=segment_ids), []
                     loss = language_modeling_loss(logits, labels, z_loss_coef=args.z_loss_coef)
+                    if mtp_logits:
+                        loss = loss + args.mtp_loss_coef * multi_token_loss(mtp_logits, labels)
                     if density_controller is not None:
                         # Penalize the differentiable gate-activity proxy; the LM loss
                         # keeps useful experts on, so the equilibrium sits at the target.
