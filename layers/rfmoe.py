@@ -78,10 +78,6 @@ class RFMoE(nn.Module):
         # an outer residual wrapper (e.g. AttnRes) already owns the residual.
         self.residual = residual
         self._last_density = 0.0   # mean fire fraction over (token, expert) pairs (float, for logging)
-        # Differentiable density proxy: mean pre-threshold gate activity over ALL
-        # tokens/experts. Minimizing it raises biases / shrinks projections ->
-        # fewer fire. The adaptive-lambda controller closes the loop on real density.
-        self._last_activity: torch.Tensor = torch.zeros(())
         # Per-expert differentiable usage (mean gate activity per expert) for the
         # locality/staircase loss, plus a detached EMA used only to RANK experts
         # (which one is hot) so the permutation is stable batch-to-batch while
@@ -141,7 +137,6 @@ class RFMoE(nn.Module):
             self._last_gate = gate_stack                 # for the diversity loss
             usage = gate_stack.mean(dim=1)               # (N,) mean gate activity per expert
             self._last_usage = usage
-            self._last_activity = usage.mean()           # step-2 density proxy = mean over experts
             self._last_density = fired / max(flat.size(0) * num_experts, 1)
             # Detached EMA for stable ranking (rare experts are noisy per batch).
             with torch.no_grad():
@@ -164,7 +159,7 @@ def rfmoe_aux_activity(model: nn.Module) -> torch.Tensor:
     individual layers stay free (early layers may go sparse, late layers dense).
     Returns a 0-dim tensor (0.0 if the model has no RFMoE layers).
     """
-    acts = [m._last_activity for m in iter_rfmoe(model)]
+    acts = [m._last_usage.mean() for m in iter_rfmoe(model)]
     if not acts:
         return torch.zeros(())
     return torch.stack(acts).sum()

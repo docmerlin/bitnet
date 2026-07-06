@@ -7,6 +7,10 @@ Experimental PyTorch repo, two research tracks:
 
 Early-stage research code. Interfaces, defaults, training behavior evolving fast.
 
+**Distillation teacher.** This repo distills from [Ornith 1.0](https://huggingface.co/deepreinforce-ai) (DeepReinforce AI) — an open-weights, MIT-licensed model family on HuggingFace. Open-weights teachers under permissive licenses only.
+
+⚠️ **Not for Claude distillation.** This repo cannot and should not be used to distill Claude or any Anthropic model. See the Anthropic Terms of Service for policies on model distillation and derivative use.
+
 ## What Is In This Repo
 
 Two distinct model/training paths.

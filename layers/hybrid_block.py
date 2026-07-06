@@ -120,13 +120,13 @@ class HybridTransformerBlock(nn.Module):
 
         # === Attention sublayer with Infini-Attention + AttnRes ===
         x_norm = self.attn_norm(x)
-        if attn_bias is None:
-            # Fallback path: attention builds its own block-causal bias from num_blocks.
-            self.infini_attn.num_blocks = self.num_blocks
-            infini_out = self.infini_attn(x_norm, attention_mask)
-        else:
-            # Precomputed path: the shared bias already encodes num_blocks.
-            infini_out = self.infini_attn(x_norm, attn_bias=attn_bias, query_valid=query_valid)
+        # When attn_bias is precomputed (shared across layers) InfiniAttention uses it
+        # directly; otherwise it falls back to building a block-causal bias from
+        # num_blocks + attention_mask itself, so both paths route through one call.
+        self.infini_attn.num_blocks = self.num_blocks
+        infini_out = self.infini_attn(
+            x_norm, attention_mask, attn_bias=attn_bias, query_valid=query_valid
+        )
 
         # Learned gate to smoothly blend Infini output with residual
         gate = torch.sigmoid(self.gate)

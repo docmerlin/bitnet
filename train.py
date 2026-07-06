@@ -928,8 +928,6 @@ def multi_token_loss(mtp_logits: List[torch.Tensor], labels: torch.Tensor) -> to
     doesn't mask them either (packed windows only mask attention), so MTP stays
     consistent with existing behavior.
     """
-    if not mtp_logits:
-        return labels.new_zeros((), dtype=torch.float32)
     total = None
     counted = 0
     for i, depth_logits in enumerate(mtp_logits):
@@ -938,7 +936,7 @@ def multi_token_loss(mtp_logits: List[torch.Tensor], labels: torch.Tensor) -> to
             continue                               # else empty slice -> cross_entropy NaN
         pred = depth_logits[:, : depth_logits.size(1) - shift]   # (B, S-shift, V)
         target = labels[:, shift:]                               # (B, S-shift)
-        depth_loss = F.cross_entropy(pred.reshape(-1, pred.size(-1)), target.reshape(-1))
+        depth_loss = language_modeling_loss(pred, target)
         total = depth_loss if total is None else total + depth_loss
         counted += 1
     if counted == 0:
@@ -1390,7 +1388,10 @@ def main() -> None:
                         "rfmoe_lambda": density_controller.lam,
                         "rfmoe_zipf_s": rfmoe_s,
                         "rfmoe_alpha": rfmoe_alpha,
-                        "rfmoe_diversity": float(rfmoe_diversity_loss(base_model).detach()),
+                        # Only when the diversity loss is actually active — the N×N
+                        # correlation GEMM is pure waste when the feature is off.
+                        **({"rfmoe_diversity": float(rfmoe_diversity_loss(base_model).detach())}
+                           if args.rfmoe_diversity_coef > 0.0 else {}),
                     }
                     if density_controller is not None else {}
                 )
