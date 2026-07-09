@@ -7,7 +7,7 @@ import contextlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -28,17 +28,8 @@ from blt.model import TernaryBLTModel, TernaryBLTOutput
 from blt.patching.student_entropy import StudentEntropyModel
 from blt.patching.teacher_patcher import UniformPatcher, normalize_patch_lengths_to_targets, patch_start_mask_from_lengths
 from optim import build_cmud
+from training.runtime import choose_device
 from utils import load_checkpoint_payload, seed_everything
-
-
-class TeacherModel(Protocol):
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        *,
-        attention_mask: torch.Tensor | None = None,
-        patch_lengths: torch.Tensor | None = None,
-    ) -> TernaryBLTOutput: ...
 
 
 @dataclass(slots=True)
@@ -81,7 +72,7 @@ class BLTDistillationTrainer:
         *,
         optimizer: torch.optim.Optimizer,
         config: TernaryBLTConfig,
-        teacher: TeacherModel | None = None,
+        teacher: Any | None = None,
         weights: DistillationLossWeights | None = None,
         device: torch.device | None = None,
         student_patcher: StudentEntropyModel | None = None,
@@ -296,16 +287,6 @@ class BLTDistillationTrainer:
 
         student_outputs, teacher_outputs, _, metrics = self._run_forward(batch, step=self.global_step)
         return student_outputs, teacher_outputs, metrics
-
-
-def choose_device(device_arg: str) -> torch.device:
-    if device_arg != "auto":
-        return torch.device(device_arg)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def resolve_amp_dtype(device: torch.device, precision: str) -> torch.dtype | None:

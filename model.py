@@ -1,17 +1,17 @@
 """Main BitNetDeep model.
 
-Every Transformer layer now contains BOTH:
-- Infini-Attention (local masked attention + compressive memory with per-head gating)
-- Attention Residuals (AttnRes) around both the attention and MLP sublayers
-
-This matches the exact requirement: no layer splitting — full combination in every block from layer 0 to the final layer.
+Every Transformer layer contains BOTH Infini-Attention and Attention Residuals.
 """
+from __future__ import annotations
+
+import contextlib
+from typing import Optional, Union
+
 import torch
 import torch.nn as nn
-from typing import Optional
+from torch.utils.checkpoint import checkpoint
 
-from config import TernaryConfig, config as default_config
-from layers.h_bitlinear import HBitLinear
+from config import TernaryConfig
 from layers.hybrid_block import HybridTransformerBlock
 from utils import (
     causal_block_attention_bias,
@@ -20,90 +20,48 @@ from utils import (
 )
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x
-
-
 class BitNetDeep(nn.Module):
-    """Deep Ternary LLM based on BitNet b1.58 with modern techniques.
+    """Deep ternary LLM: hybrid blocks, ternary projections, tied embeddings.
 
-    The model uses:
-    - hybrid transformer layers that combine Infini-Attention and AttnRes in every block
-    - ternary H-BitLinear projections
-    - RMSNorm plus an extra SubLN before the stack
-    - tied embeddings / output projection weights
+    Training knobs on the model:
+    - ``gradient_checkpointing`` freezes Infini memory for recompute-safe backward
+    - ``return_mtp=True`` also returns multi-token-prediction logits
+
+    Always: full-precision lm_head, tied embed/unembed, per-head QK norm.
     """
 
     def __init__(self, config: Optional[TernaryConfig] = None):
         super().__init__()
-        self.config = config or default_config
+        self.config = config or TernaryConfig()
+        self.gradient_checkpointing = False
 
         self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
-        self.norm = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
+        self.norm = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.subln = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
-        # SubLN for extra ternary stability (as per project spec)
-        self.subln = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
+        self.layers = nn.ModuleList(
+            HybridTransformerBlock(self.config)
+            for _ in range(self.config.num_hidden_layers)
+        )
 
-        self.layers = nn.ModuleList()
+        # Full-precision output projection; tied to embeddings.
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
-        # Every single layer now contains BOTH Infini-Attention and Attention Residuals (AttnRes)
-        # as explicitly requested. No layer splitting.
-        for _ in range(self.config.num_hidden_layers):
-            layer = HybridTransformerBlock(
-                hidden_size=self.config.hidden_size,
-                num_heads=self.config.num_attention_heads,
-                intermediate_size=self.config.intermediate_size,
-                memory_dim=self.config.infini_memory_dim,
-                init_scale=self.config.attn_res_init_scale,
-                config=self.config,
-            )
-            self.layers.append(layer)
-
-        # The output projection defaults to full precision (better quality than a
-        # ternary head); set quantize_lm_head=True to keep it ternary.
-        if self.config.quantize_lm_head:
-            self.lm_head = HBitLinear(
-                self.config.hidden_size,
-                self.config.vocab_size,
-                bias=False,
-                config=self.config,
-            )
-        else:
-            self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-
-        # Multi-token prediction heads (training-time, data efficiency). Each extra
-        # depth gets a small transform of the final hidden, then reuses the SHARED
-        # unembedding (self.lm_head) — so k heads cost k*hidden^2, not k*hidden*vocab.
-        self.mtp_depth = int(getattr(self.config, "mtp_depth", 0))
+        self.mtp_depth = int(self.config.mtp_depth)
         if self.mtp_depth > 0:
             self.mtp_transforms = nn.ModuleList(
                 nn.Sequential(
-                    RMSNorm(self.config.hidden_size, self.config.rms_norm_eps),
+                    nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps),
                     nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=False),
                 )
                 for _ in range(self.mtp_depth)
             )
 
         self.apply(self._init_weights)
-
-        # Tie weights after initialization so the shared tensor is not overwritten.
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.embed_tokens.weight
+        self.lm_head.weight = self.embed_tokens.weight
 
     def mtp_logits(self, hidden: torch.Tensor) -> list[torch.Tensor]:
-        """Per-depth logits from the final hidden (same tensor fed to lm_head).
-
-        Depth ``i`` (0-indexed) predicts the token at offset ``i+2`` from each
-        position. Returns [] when MTP is disabled. Reuses the tied unembedding.
-        """
+        """Per-depth logits from the final hidden. Depth i predicts offset i+2."""
         if self.mtp_depth <= 0:
             return []
         return [self.lm_head(transform(hidden)) for transform in self.mtp_transforms]
@@ -121,14 +79,6 @@ class BitNetDeep(nn.Module):
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Block-causal + optional document bias, computed once for all layers.
-
-        All layers share a single ``num_blocks`` (progressive growth updates every
-        block to the same value), so the structural bias is identical per layer.
-        Built directly in the attention compute dtype (the autocast dtype under
-        AMP, else ``x``'s dtype) so each attention sublayer's cast to its query
-        dtype is a no-op instead of allocating a fresh copy every layer.
-        """
         batch_size, seq_len, _ = x.shape
         device_type = x.device.type
         compute_dtype = (
@@ -156,7 +106,8 @@ class BitNetDeep(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         reset_memory: bool = True,
         segment_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_mtp: bool = False,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, list[torch.Tensor]]]:
         if reset_memory:
             for layer in self.layers:
                 layer.infini_attn.reset_memory()
@@ -165,32 +116,31 @@ class BitNetDeep(nn.Module):
             attention_mask = document_attention_keep_mask(segment_ids)
 
         x = self.embed_tokens(input_ids)
-        x = self.subln(x)  # Extra stability for deep ternary net
-
-        # Build the block-causal + document attention bias once and share it across
-        # every layer instead of recomputing it in each attention sublayer.
+        x = self.subln(x)
         attn_bias, query_valid = self._build_shared_attention_bias(x, attention_mask)
 
         for layer in self.layers:
-            x = layer(x, attn_bias=attn_bias, query_valid=query_valid)
+            if self.gradient_checkpointing and self.training:
+                # All layers are HybridTransformerBlock; freeze Infini memory for recompute.
+                layer_memory_state = layer.infini_attn.get_memory_state()
+                x = checkpoint(
+                    lambda hidden_states, layer=layer, attn_bias=attn_bias, query_valid=query_valid: layer(
+                        hidden_states, attn_bias=attn_bias, query_valid=query_valid
+                    ),
+                    x,
+                    use_reentrant=False,
+                    context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: (
+                        contextlib.nullcontext(),
+                        layer.infini_attn.use_memory_state(
+                            layer_memory_state, update_memory_buffers=False
+                        ),
+                    ),
+                )
+            else:
+                x = layer(x, attn_bias=attn_bias, query_valid=query_valid)
 
         x = self.norm(x)
         logits = self.lm_head(x)
+        if return_mtp:
+            return logits, self.mtp_logits(x)
         return logits
-
-
-if __name__ == "__main__":
-    from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
-
-    model = BitNetDeep()
-    tokenizer = HierarchicalTokenizer()
-
-    text = "The quick brown fox jumps over the lazy dog."
-    input_ids = torch.tensor([tokenizer.encode(text)[:64]])  # short sequence for test
-
-    with torch.no_grad():
-        logits = model(input_ids)
-
-    print("BitNetDeep forward pass successful!")
-    print(f"Model params: ~{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
-    print(f"Output logits shape: {logits.shape}")

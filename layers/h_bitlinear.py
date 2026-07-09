@@ -21,11 +21,6 @@ _HADAMARD_BASE_CACHE: dict[int, torch.Tensor] = {}
 _HADAMARD_DEVICE_CACHE: dict[tuple[int, str, int | None, torch.dtype], torch.Tensor] = {}
 
 
-class _DefaultBitLinearConfig:
-    use_hadamard = True
-    use_4bit_activations = True
-
-
 def hadamard_matrix(size: int) -> torch.Tensor:
     """Return a normalized Hadamard matrix for power-of-two ``size``."""
     if size < 1 or size & (size - 1) != 0:
@@ -104,12 +99,13 @@ class HBitLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = False,
-        config: Any | None = None,
+        *,
+        config: Any,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.config = config or _DefaultBitLinearConfig()
+        self.config = config
         self.weight_quantization_mix = 1.0
         self.activation_quantization_mix = 1.0
         self.activation_bits = 4
@@ -122,7 +118,7 @@ class HBitLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        use_hadamard = bool(getattr(self.config, "use_hadamard", True))
+        use_hadamard = bool(config.use_hadamard)
         if use_hadamard and in_features & (in_features - 1) == 0:
             self.hadamard_size = in_features
         else:
@@ -162,7 +158,7 @@ class HBitLinear(nn.Module):
             # recover it from git history if the size regime changes.
             x = x @ get_hadamard_tensor(self.hadamard_size, x.device, x.dtype)
 
-        if bool(getattr(self.config, "use_4bit_activations", True)) and self.enable_activation_quantization:
+        if bool(self.config.use_4bit_activations) and self.enable_activation_quantization:
             quantized_x = quantize_activations(x, bits=self.activation_bits)
             if self.activation_quantization_mix >= 1.0:
                 x = quantized_x
@@ -211,8 +207,3 @@ class HBitLinear(nn.Module):
         )
 
 
-if __name__ == "__main__":
-    layer = HBitLinear(1024, 1024)
-    x = torch.randn(2, 128, 1024)
-    y = layer(x)
-    print(f"HBitLinear test passed. Output shape: {y.shape}")

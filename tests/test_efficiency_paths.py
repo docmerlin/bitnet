@@ -4,12 +4,8 @@ Sharing a precomputed attention bias across layers must produce the same
 output as letting each attention sublayer build the bias itself.
 """
 
-import sys
-from pathlib import Path
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import TernaryConfig
 from layers.infini_attention import InfiniAttention
@@ -37,7 +33,7 @@ def _config() -> TernaryConfig:
 def test_precomputed_bias_matches_fallback() -> bool:
     torch.manual_seed(0)
     config = _config()
-    attn = InfiniAttention(config.hidden_size, config.num_attention_heads, config.infini_memory_dim, config)
+    attn = InfiniAttention(config)
     attn.eval()  # eval so memory buffers don't mutate between the two calls
     x = torch.randn(2, 12, config.hidden_size)
     segment_ids = torch.tensor([[0] * 6 + [1] * 6, [0] * 4 + [1] * 8])

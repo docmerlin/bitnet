@@ -1,0 +1,78 @@
+"""Checkpoint save/load for BitNet training runs."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+import torch
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
+
+from config import TernaryConfig
+from model import BitNetDeep
+from training.memory import reset_infini_memory
+from utils import load_checkpoint_payload
+
+
+@dataclass
+class TrainerState:
+    step: int = 0
+    tokens_processed: int = 0
+    samples_processed: int = 0
+    best_val_loss: float = float("inf")
+
+
+def save_checkpoint(
+    output_dir: Path,
+    model: BitNetDeep,
+    optimizer: Optimizer,
+    scheduler: LambdaLR,
+    scaler: Optional[Any],
+    state: TrainerState,
+    model_config: TernaryConfig,
+    args: Any,
+    checkpoint_name: str,
+) -> Path:
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / checkpoint_name
+
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "trainer_state": asdict(state),
+        "model_config": asdict(model_config),
+        "args": vars(args),
+    }
+    torch.save(payload, checkpoint_path)
+    return checkpoint_path
+
+
+def load_checkpoint(
+    checkpoint_path: Path,
+    model: BitNetDeep,
+    optimizer: Optimizer,
+    scheduler: LambdaLR,
+    scaler: Optional[Any],
+) -> TrainerState:
+    payload = load_checkpoint_payload(checkpoint_path, map_location="cpu")
+    # Tolerate architecture evolution (e.g. qk-norm params added after a checkpoint
+    # was written): load non-strict and surface any mismatch instead of crashing.
+    incompatible = model.load_state_dict(payload["model"], strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"Warning: resumed checkpoint did not match the model exactly. "
+            f"Missing keys: {incompatible.missing_keys}; "
+            f"unexpected keys: {incompatible.unexpected_keys}",
+            flush=True,
+        )
+    reset_infini_memory(model)
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler.load_state_dict(payload["scheduler"])
+    if scaler is not None and payload.get("scaler") is not None:
+        scaler.load_state_dict(payload["scaler"])
+    return TrainerState(**payload["trainer_state"])

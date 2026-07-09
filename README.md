@@ -54,13 +54,19 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 ### Top-level BitNet path
 
 - `config.py`: BitNet model and trainer config
-- `model.py`: main `BitNetDeep` model
-- `train.py`: streaming training pipeline, BitNet path
+- `model.py`: main `BitNetDeep` model (single forward path; checkpointing + MTP)
+- `train.py`: CLI + training loop
+- `data/`: dataset presets, mixture parsing, packing
+- `training/`: losses, schedules, checkpoints, runtime helpers
+- `utils.py`: RoPE / attention-mask helpers
+- `data/streams.py`: packing + PrefetchStream
+- `training/runtime.py`: choose_device, AMP, logger, evaluate
 - `layers/hybrid_block.py`: main hybrid transformer block
 - `layers/infini_attention.py`: Infini-Attention-style module with memory handling
 - `layers/h_bitlinear.py`: ternary / Hadamard linear layer
+- `layers/rfmoe.py`: routing-free MoE FFN
 - `tokenizer/`: hierarchical tokenizer
-- `utils.py`: rotary embedding and ternary helpers
+- `utils.py`: rotary embedding and attention-mask helpers
 - `run_train.sh`: full BitNet training launcher
 - `run_local_train.sh`: smaller local BitNet launcher
 
@@ -81,7 +87,7 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 
 ### Tests
 
-Repo uses simple script-style regression tests, not full pytest suite.
+Repo uses pytest (`python3 -m pytest tests/`).
 
 BitNet path examples:
 
@@ -115,7 +121,7 @@ python3 -m pip install -r requirements.txt
 - `torch`
 - `datasets`
 - `tiktoken`
-- optional logging: `tensorboard`, `wandb`
+- optional: `pytest`
 
 Dependency notes:
 

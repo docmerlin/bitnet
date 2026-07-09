@@ -1,12 +1,6 @@
 """Validation tests for model configuration edge cases."""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from config import TernaryConfig
-from layers.infini_attention import InfiniAttention
 
 
 def test_odd_head_dim_is_rejected() -> bool:
@@ -25,11 +19,18 @@ def test_odd_head_dim_is_rejected() -> bool:
         raise AssertionError("TernaryConfig should reject odd head dimensions for rotary embeddings")
 
     try:
-        InfiniAttention(hidden_size=15, num_heads=3, memory_dim=4)
+        TernaryConfig(
+            vocab_size=32,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=3,
+            head_dim=16,
+            intermediate_size=128,
+        )
     except ValueError as exc:
-        assert "head dimension must be even" in str(exc)
+        assert "divisible" in str(exc)
     else:
-        raise AssertionError("Attention layers should reject odd head dimensions for rotary embeddings")
+        raise AssertionError("TernaryConfig should reject hidden_size not divisible by num_heads")
 
     print("Configuration validation tests passed")
     return True

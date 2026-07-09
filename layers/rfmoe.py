@@ -4,11 +4,10 @@ Step 1 of the MoE roadmap in ``todo.md``. Each expert decides its OWN activation
 from an internal score, so there is no centralized router: adding or removing an
 expert never renormalizes the others (that is what makes the design extensible).
 
-This is the minimal cut — dense float experts, per-expert skip path, score-
-weighted residual combine, and a single global threshold ``theta`` as the
-compute/quality knob. Deferred to later roadmap steps: ternary HBitLinear
-experts, adaptive-lambda density control + global density target, and the
-locality/staircase usage target.
+Dense float experts, per-expert skip path, score-weighted residual combine,
+and a single global threshold ``theta`` as the compute/quality knob. Aux losses
+(density / locality / diversity) live as free functions. Deferred: ternary
+experts, grouped GEMM, extensible ``add_expert`` (see todo.md).
 
 Reference: RFMoE (arXiv 2604.00801), building on AoE (2501.13074) / ReMoE.
 """
@@ -86,26 +85,6 @@ class RFMoE(nn.Module):
         self._last_gate: torch.Tensor = torch.zeros(num_experts, 1)  # (N, T) firing patterns, set in forward
         self.usage_decay = 0.99
         self.register_buffer("usage_ema", torch.full((num_experts,), 1.0 / num_experts), persistent=False)
-
-    def add_expert(self, expert_dim: int | None = None, rank: int | None = None, bias_init: float = 3.0) -> RFMoEExpert:
-        """Append capacity post-training (roadmap part 2).
-
-        The new expert starts COLD (high ``bias_init``) so it rarely fires, lands
-        in the offload tier, and doesn't perturb existing routing — the other
-        experts' fire decisions never depended on the expert count.
-        """
-        ref = self.experts[0]
-        expert_dim = expert_dim or ref.w_up.out_features
-        rank = rank or ref.a_gate.out_features
-        expert = RFMoEExpert(self.hidden_size, expert_dim, rank).to(ref.a_gate.weight.device)
-        with torch.no_grad():
-            expert.bias.fill_(bias_init)
-        self.experts.append(expert)
-        # Extend the ranking EMA; the cold newcomer starts at the current floor so
-        # it ranks in the tail (consistent with the locality staircase).
-        floor = self.usage_ema.min().item()
-        self.usage_ema = torch.cat([self.usage_ema, self.usage_ema.new_full((1,), floor)])
-        return expert
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
@@ -270,100 +249,3 @@ class DensityController:
             self.lam /= (1.0 + self.eta)
         self.lam = min(max(self.lam, self.lam_min), self.lam_max)
         return self.lam
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    hidden = 64
-    moe = RFMoE(hidden, expert_dim=32, num_experts=8, rank=4, theta=0.01)
-    x = torch.randn(4, 10, hidden)
-
-    y = moe(x)
-    assert y.shape == x.shape, y.shape
-
-    # Grad flows through the self-gating + experts: one SGD step lowers the loss.
-    target = torch.randn_like(y)
-    opt = torch.optim.SGD(moe.parameters(), lr=0.1)
-    loss0 = F.mse_loss(moe(x), target)
-    opt.zero_grad(); loss0.backward(); opt.step()
-    loss1 = F.mse_loss(moe(x), target)
-    assert loss1 < loss0, (float(loss0), float(loss1))
-
-    # theta knob: raising the threshold fires fewer experts.
-    moe.theta = 0.01; moe(x); density_low = moe._last_density
-    moe.theta = 5.0;  moe(x); density_high = moe._last_density
-    assert density_high < density_low, (density_low, density_high)
-
-    # Append a cold expert: forward stays valid, expert count grows.
-    moe.theta = 0.01
-    moe.add_expert()
-    assert moe(x).shape == x.shape
-    assert len(moe.experts) == 9
-
-    print(f"RFMoE ok. density theta=0.01 -> {density_low:.3f}, theta=5 -> {density_high:.3f}, experts={len(moe.experts)}")
-
-    # Controller update() sign logic: over target -> raise lambda, under -> lower.
-    ctrl = DensityController(target=0.3, eta=0.1, lam=1.0)
-    ctrl.update(0.9); assert ctrl.lam > 1.0, ctrl.lam   # too dense -> more penalty
-    ctrl.update(0.1); ctrl.update(0.1); assert ctrl.lam < 1.0, ctrl.lam  # too sparse -> relax
-
-    # Density is controllable by the penalty: lambda=0 stays dense, strong lambda
-    # drives sparsity (the differentiable activity proxy raises biases / shrinks z).
-    def train_density(lam: float, steps: int = 150) -> float:
-        torch.manual_seed(1)
-        moe2 = RFMoE(hidden, expert_dim=32, num_experts=8, rank=4, theta=0.01)
-        opt2 = torch.optim.SGD(moe2.parameters(), lr=0.1)
-        tgt = torch.randn(4, 10, hidden)
-        for _ in range(steps):
-            loss = F.mse_loss(moe2(x), tgt) + lam * rfmoe_aux_activity(moe2)
-            opt2.zero_grad(); loss.backward(); opt2.step()
-        return rfmoe_density(moe2)
-
-    d_free = train_density(0.0)
-    d_pen = train_density(2.0)
-    assert d_free > 0.9, d_free            # no penalty -> stays dense
-    assert d_pen < d_free, (d_free, d_pen)  # penalty carves out sparsity
-    print(f"density control: lam=0 -> rho {d_free:.3f}, lam=2 -> rho {d_pen:.3f}")
-
-    # Staircase target: descending, sums to 1, floored (no zero).
-    pi = staircase_target(8, s=1.0, alpha=0.1)
-    assert abs(float(pi.sum()) - 1.0) < 1e-5, float(pi.sum())
-    assert torch.all(pi[:-1] >= pi[1:]), pi          # descending
-    assert float(pi.min()) >= 0.1 / 8 - 1e-6, pi     # uniform floor alpha/n
-
-    # Locality loss shapes usage toward the staircase: KL drops, tail stays alive.
-    torch.manual_seed(2)
-    moe3 = RFMoE(hidden, expert_dim=32, num_experts=8, rank=4, theta=0.01)
-    opt3 = torch.optim.SGD(moe3.parameters(), lr=0.1)
-    tgt3 = torch.randn(4, 10, hidden)
-    moe3(x); kl_start = float(rfmoe_locality_loss(moe3, s=1.0, alpha=0.1).detach())
-    for _ in range(200):
-        loss = F.mse_loss(moe3(x), tgt3) + 0.5 * rfmoe_locality_loss(moe3, s=1.0, alpha=0.1)
-        opt3.zero_grad(); loss.backward(); opt3.step()
-    moe3(x); kl_end = float(rfmoe_locality_loss(moe3, s=1.0, alpha=0.1).detach())
-    p_end = (moe3._last_usage / moe3._last_usage.sum()).detach().sort(descending=True).values
-    assert kl_end < kl_start, (kl_start, kl_end)     # usage moved toward the staircase
-    assert float(p_end.min()) > 0.0, p_end           # no expert went dead (KL floor works)
-    print(f"locality: KL(pi||p) {kl_start:.3f} -> {kl_end:.3f}, "
-          f"hot={float(p_end[0]):.3f} tail={float(p_end[-1]):.3f}")
-
-    # Diversity loss math: identical firing patterns penalized, orthogonal not.
-    moe4 = RFMoE(hidden, expert_dim=32, num_experts=3, rank=4, theta=0.01)
-    moe4._last_gate = torch.tensor([[1.,0,1,0,1,0],[1,0,1,0,1,0],[1,0,1,0,1,0]])  # all identical
-    same = float(rfmoe_diversity_loss(moe4))
-    moe4._last_gate = torch.tensor([[1.,0,0,0,0,0],[0,1,0,0,0,0],[0,0,1,0,0,0]])  # disjoint niches
-    disjoint = float(rfmoe_diversity_loss(moe4))
-    assert same > 0.5 and disjoint < same, (same, disjoint)
-
-    # Training with the diversity term decorrelates expert firing patterns.
-    torch.manual_seed(3)
-    moe5 = RFMoE(hidden, expert_dim=32, num_experts=6, rank=4, theta=0.01)
-    opt5 = torch.optim.SGD(moe5.parameters(), lr=0.2)
-    tgt5 = torch.randn(4, 10, hidden)
-    moe5(x); div_start = float(rfmoe_diversity_loss(moe5).detach())
-    for _ in range(200):
-        loss = F.mse_loss(moe5(x), tgt5) + 1.0 * rfmoe_diversity_loss(moe5)
-        opt5.zero_grad(); loss.backward(); opt5.step()
-    moe5(x); div_end = float(rfmoe_diversity_loss(moe5).detach())
-    assert div_end < div_start, (div_start, div_end)
-    print(f"diversity: identical={same:.3f} disjoint={disjoint:.3f}, overlap {div_start:.3f} -> {div_end:.3f}")

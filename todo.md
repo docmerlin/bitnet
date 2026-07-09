@@ -15,16 +15,14 @@ Shipped (see `layers/rfmoe.py`, `train.py`, `config.py`):
 - Flat→skew curriculum (anneal s:0→s, α:1→α). `--rfmoe-curriculum-ratio`.
 - Functional-diversity loss (decorrelate per-token firing). `--rfmoe-diversity-coef`.
 - MTP (multi-token prediction) for AR data efficiency, k extra heads reuse tied unembedding. `--mtp-depth/-loss-coef`.
-- `add_expert()` primitive (cold-start high bias, extends ranking EMA).
-
 ## Next actions
 
 1. **PERF (blocker for any real run):** RFMoE forward is per-expert Python loop (O(N) launches).
    Batch into grouped/padded GEMM. Current form validation-only.
 2. **Ternary experts:** `RFMoEExpert` uses `nn.Linear` — swap to `HBitLinear` (Hadamard + ternary STE)
    once design frozen, stay 1.58-bit.
-3. **Extensible MoE (thread 2):** wire freeze-and-train-new-expert loop + niche-finding into train.py.
-   `add_expert` exists; training loop + unclaimed-niche targeting do not.
+3. **Extensible MoE (thread 2):** `add_expert` primitive + freeze-and-train-new-expert loop + niche-finding.
+   Not in tree yet (Yagni until this thread is live).
 4. **Serving:** tier experts by usage (hot→VRAM, warm→RAM, cold→SSD), offload + prefetch.
    Optional temporal-stickiness loss (penalize active-set change token-to-token → less page thrash).
 5. **Diffusion (thread 3):** large new direction; locality reg (built) is prerequisite (see below).

@@ -1,11 +1,7 @@
 """Smoke tests for BLT distillation training."""
 
-import sys
-from pathlib import Path
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from blt.config import TernaryBLTConfig
 from blt.model import TernaryBLTModel

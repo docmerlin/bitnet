@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,19 +10,11 @@ from tempfile import TemporaryDirectory
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from config import TernaryConfig
 from model import BitNetDeep
-from train import (
-    TrainerState,
-    TrainingWrapper,
-    create_optimizer,
-    language_modeling_loss,
-    load_checkpoint,
-    multi_token_loss,
-    save_checkpoint,
-)
+from training.checkpoint import TrainerState, load_checkpoint, save_checkpoint
+from training.losses import language_modeling_loss, multi_token_loss
+from training.runtime import create_optimizer
 from utils import load_checkpoint_payload
 
 
@@ -58,16 +49,15 @@ def _tiny_args(optimizer: str = "cmud") -> argparse.Namespace:
 def test_single_training_step_updates_parameters() -> bool:
     config = _tiny_config()
     model = BitNetDeep(config)
-    runner = TrainingWrapper(model, gradient_checkpointing=False)
     optimizer = create_optimizer(model, _tiny_args())
 
     before = model.layers[0].gate.item()
     input_ids = torch.randint(0, config.vocab_size, (2, 16))
     labels = input_ids.clone()
 
-    runner.train()
+    model.train()
     optimizer.zero_grad(set_to_none=True)
-    logits = runner(input_ids)
+    logits = model(input_ids)
     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
     loss.backward()
     optimizer.step()

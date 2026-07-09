@@ -1,19 +1,15 @@
 """Regression tests for Infini-Attention memory buffer updates."""
 
 import contextlib
-import sys
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from config import TernaryConfig
 from layers.hybrid_block import HybridTransformerBlock
 from model import BitNetDeep
-from train import TrainingWrapper
+
 
 
 def build_block() -> HybridTransformerBlock:
@@ -28,14 +24,7 @@ def build_block() -> HybridTransformerBlock:
         infini_memory_dim=8,
         attn_res_init_scale=0.1,
     )
-    return HybridTransformerBlock(
-        hidden_size=config.hidden_size,
-        num_heads=config.num_attention_heads,
-        intermediate_size=config.intermediate_size,
-        memory_dim=config.infini_memory_dim,
-        init_scale=config.attn_res_init_scale,
-        config=config,
-    )
+    return HybridTransformerBlock(config)
 
 
 def build_model() -> BitNetDeep:
@@ -184,13 +173,13 @@ def test_training_wrapper_checkpointing_matches_reference_gradients() -> bool:
     input_ids = torch.randint(0, config.vocab_size, (2, 8))
     labels = torch.randint(0, config.vocab_size, (2, 8))
 
-    reference_runner = TrainingWrapper(reference_model, gradient_checkpointing=False)
-    checkpoint_runner = TrainingWrapper(checkpoint_model, gradient_checkpointing=True)
-    reference_runner.train()
-    checkpoint_runner.train()
+    reference_model.gradient_checkpointing = False
+    checkpoint_model.gradient_checkpointing = True
+    reference_model.train()
+    checkpoint_model.train()
 
-    reference_logits = reference_runner(input_ids)
-    checkpoint_logits = checkpoint_runner(input_ids)
+    reference_logits = reference_model(input_ids)
+    checkpoint_logits = checkpoint_model(input_ids)
     reference_loss = F.cross_entropy(reference_logits.reshape(-1, reference_logits.size(-1)), labels.reshape(-1))
     checkpoint_loss = F.cross_entropy(checkpoint_logits.reshape(-1, checkpoint_logits.size(-1)), labels.reshape(-1))
     reference_loss.backward()
@@ -210,7 +199,7 @@ def test_training_wrapper_checkpointing_matches_reference_gradients() -> bool:
             f"Checkpointed training should match the reference gradient for {reference_name}"
         )
 
-    print("TrainingWrapper checkpoint gradient regression tests passed")
+    print("BitNetDeep checkpoint gradient regression tests passed")
     return True
 
 

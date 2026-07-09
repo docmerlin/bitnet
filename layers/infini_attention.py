@@ -1,9 +1,8 @@
 """Infini-Attention with per-head memory gating.
 
-This module is the pure attention sublayer used inside ``HybridTransformerBlock``.
-The block owns pre-norm and AttnRes residual handling; this module only produces
-the attention output after mixing local block-causal attention with compressive
-memory attention.
+Pure attention sublayer inside ``HybridTransformerBlock``. The block owns
+pre-norm and AttnRes; this module mixes local block-causal attention with
+compressive memory attention.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from config import TernaryConfig
 from layers.h_bitlinear import HBitLinear
 from utils import (
     apply_rotary_emb,
@@ -27,14 +27,10 @@ from utils import (
 class InfiniAttention(nn.Module):
     """Attention with compressive memory and per-head gating."""
 
-    def __init__(
-        self,
-        hidden_size: int = 1024,
-        num_heads: int = 32,
-        memory_dim: int = 64,
-        config: Optional[object] = None,
-    ) -> None:
+    def __init__(self, config: TernaryConfig) -> None:
         super().__init__()
+        hidden_size = config.hidden_size
+        num_heads = config.num_attention_heads
         if hidden_size % num_heads != 0:
             raise ValueError("hidden_size must be divisible by num_heads")
 
@@ -43,25 +39,28 @@ class InfiniAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head dimension must be even for rotary embeddings")
-        self.memory_dim = memory_dim
+        self.memory_dim = config.infini_memory_dim
         self.config = config
-        self.num_blocks = max(1, getattr(config, "block_size", 1))
+        self.num_blocks = max(1, config.block_size)
 
         self.qkv = HBitLinear(hidden_size, hidden_size * 3, bias=False, config=config)
         self.o_proj = HBitLinear(hidden_size, hidden_size, bias=False, config=config)
         self.gate = nn.Parameter(torch.zeros(num_heads))
         self.update_memory_buffers = True
 
-        # Per-head QK normalization stabilizes attention logits in deep ternary nets.
-        self.use_qk_norm = bool(getattr(config, "use_qk_norm", True))
-        if self.use_qk_norm:
-            eps = float(getattr(config, "rms_norm_eps", 1e-5))
-            self.q_norm = nn.RMSNorm(self.head_dim, eps=eps)
-            self.k_norm = nn.RMSNorm(self.head_dim, eps=eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # This is transient recurrence state, not learned model state.
-        self.register_buffer("memory_k", torch.zeros(num_heads, memory_dim, self.head_dim), persistent=False)
-        self.register_buffer("memory_v", torch.zeros(num_heads, memory_dim, self.head_dim), persistent=False)
+        self.register_buffer(
+            "memory_k",
+            torch.zeros(num_heads, self.memory_dim, self.head_dim),
+            persistent=False,
+        )
+        self.register_buffer(
+            "memory_v",
+            torch.zeros(num_heads, self.memory_dim, self.head_dim),
+            persistent=False,
+        )
 
     def _load_from_state_dict(
         self,
@@ -113,10 +112,9 @@ class InfiniAttention(nn.Module):
             self.load_memory_state(previous_state)
 
     def _rope_scaling_factor(self, seq_len: int) -> float:
-        rope_scaling = getattr(self.config, "rope_scaling", None)
+        rope_scaling = self.config.rope_scaling
         if not rope_scaling:
             return 1.0
-
         original = rope_scaling.get("original_max_position_embeddings", seq_len)
         factor = rope_scaling.get("factor", 1.0)
         return float(factor if seq_len > original else 1.0)
@@ -155,17 +153,14 @@ class InfiniAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
-        rope_scale = self._rope_scaling_factor(seq_len)
         cos, sin = build_rope_cache(
             seq_len=seq_len,
             dim=self.head_dim,
-            theta=rope_theta,
-            scaling_factor=rope_scale,
+            theta=self.config.rope_theta,
+            scaling_factor=self._rope_scaling_factor(seq_len),
             device=x.device,
         )
         q = apply_rotary_emb(q, cos, sin)
@@ -173,10 +168,7 @@ class InfiniAttention(nn.Module):
 
         scale = self.head_dim ** -0.5
 
-        # The caller may precompute the block-causal + document bias once and share
-        # it across all layers (see BitNetDeep/TrainingWrapper); doing so keeps the
-        # Python-level cache lookup and mask fold out of the compiled per-layer graph.
-        # When no bias is supplied we fall back to computing it here.
+        # Shared bias from BitNetDeep.forward when available; else build here.
         if attn_bias is None:
             base_bias = causal_block_attention_bias(
                 seq_len, self.num_blocks, dtype=q.dtype, device=x.device
@@ -215,10 +207,3 @@ class InfiniAttention(nn.Module):
                 self._update_memory(k, v)
 
         return output
-
-
-if __name__ == "__main__":
-    layer = InfiniAttention()
-    x = torch.randn(2, 128, 1024)
-    y = layer(x)
-    print(f"InfiniAttention test passed. Output shape: {y.shape}")

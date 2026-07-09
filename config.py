@@ -14,6 +14,7 @@ class TernaryConfig:
     - RoPE with YaRN/NTK scaling for long context
     - EVERY layer uses BOTH Infini-Attention and Attention Residuals (AttnRes)
     - Hierarchical tokenizer targets a 128k-token byte-and-merge vocabulary
+    - Always: tied embeddings, full-precision lm_head, per-head QK norm
     """
     vocab_size: int = 131072  # ~128k target (first-stage ~100k + hierarchical merges)
     hidden_size: int = 1024
@@ -24,7 +25,6 @@ class TernaryConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     rope_scaling: dict = None  # YaRN/NTK params set in __post_init__
-    max_position_embeddings: int = 8192
     initializer_range: float = 0.02
 
     # Hybrid block parameters (every layer now uses both Infini-Attention + AttnRes)
@@ -35,24 +35,16 @@ class TernaryConfig:
     # Ternary training / inference
     use_hadamard: bool = True
     use_4bit_activations: bool = True
-    ternary_weight_bits: int = 2  # 1.58-bit effective (-1,0,1)
 
-    # Routing-free MoE FFN (roadmap step 1; off by default -> dense GLU FFN)
+    # Routing-free MoE FFN (off by default -> dense GLU FFN)
     use_rfmoe: bool = False
     rfmoe_num_experts: int = 8
     rfmoe_expert_dim: Optional[int] = None  # None -> intermediate_size // 4
     rfmoe_rank: Optional[int] = None        # None -> hidden_size // 16
     rfmoe_theta: float = 0.01               # fire threshold / compute knob
 
-    # Multi-token prediction (data-efficiency: extra prediction targets per token).
-    # 0 = off (plain next-token). k extra heads predict tokens t+2..t+1+k from the
-    # final hidden, reusing the tied unembedding. Training-time only.
+    # Multi-token prediction (data-efficiency). 0 = off (plain next-token).
     mtp_depth: int = 0
-
-    # Stability / quality
-    use_qk_norm: bool = True       # per-head RMSNorm on q/k before RoPE (deep ternary stability)
-    tie_word_embeddings: bool = True
-    quantize_lm_head: bool = False  # keep the output projection in full precision for quality
 
     def __post_init__(self):
         if self.rope_scaling is None:
@@ -65,5 +57,3 @@ class TernaryConfig:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for rotary embeddings")
-
-config = TernaryConfig()

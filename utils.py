@@ -1,4 +1,8 @@
-"""Utility helpers for the deep ternary BitNet model."""
+"""Tensor helpers: RoPE, attention bias, seeding, checkpoint load.
+
+Runtime IO (PrefetchStream) lives in ``data.streams``; device selection in
+``training.runtime``.
+"""
 
 from __future__ import annotations
 

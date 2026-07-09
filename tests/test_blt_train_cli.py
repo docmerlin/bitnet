@@ -1,12 +1,9 @@
 """CLI/runtime smoke tests for BLT distillation."""
 
-import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from blt.config import TernaryBLTConfig
 from blt.model import TernaryBLTModel

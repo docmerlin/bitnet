@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils import (
     causal_block_attention_bias,
     combine_attention_bias,
     document_attention_keep_mask,
 )
-from train import PackedSequenceStream
+from data.streams import PackedSequenceStream
 
 
 def test_document_keep_mask_is_block_diagonal() -> bool:

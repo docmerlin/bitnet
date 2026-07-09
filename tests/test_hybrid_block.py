@@ -3,12 +3,8 @@
 This tests that every layer contains both Infini-Attention and Attention Residuals (AttnRes).
 Run with: python3 tests/test_hybrid_block.py
 """
-import sys
-from pathlib import Path
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import TernaryConfig
 from layers.hybrid_block import HybridTransformerBlock
@@ -33,14 +29,7 @@ def test_hybrid_block():
         attn_res_init_scale=0.1,
     )
 
-    block = HybridTransformerBlock(
-        hidden_size=config.hidden_size,
-        num_heads=config.num_attention_heads,
-        intermediate_size=config.intermediate_size,
-        memory_dim=config.infini_memory_dim,
-        init_scale=config.attn_res_init_scale,
-        config=config,
-    )
+    block = HybridTransformerBlock(config)
 
     # Test 1: Forward pass shape
     batch_size, seq_len = 2, 16

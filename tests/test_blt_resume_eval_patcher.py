@@ -1,13 +1,10 @@
 """Regression tests for BLT resume/eval/patcher workflow."""
 
-import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
 import torch.nn as nn
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from blt.config import TernaryBLTConfig
 from blt.model import TernaryBLTModel
