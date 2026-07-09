@@ -21,12 +21,14 @@ import torch.nn.functional as F
 class RFMoEExpert(nn.Module):
     """One self-gating GLU expert.
 
-    ``FFN(x) = [sigmoid(x A_gate B_gate) ⊙ (x W_up)] W_down``
+    ``FFN(x) = W_down(silu(W_mid([sigmoid(x A_gate B_gate) ⊙ (x W_up)])))``
 
+    Body depth matches dense hybrid (up → mid → down), but the expand gate stays
+    paper-style sigmoid GLU — not SwiGLU (dense hybrid / BLT use silu(gate)*up).
     The rank-r projection ``z = x A_gate`` is computed ONCE: its L2 norm is the
     self-score that makes the fire decision, and the same ``z`` feeds the gate
     branch ``B_gate``. So a token that doesn't fire pays only the cheap D×r
-    projection and skips ``W_up``/``B_gate``/``W_down`` — that is the FLOP saving.
+    projection and skips the expert body — that is the FLOP saving.
     """
 
     def __init__(self, hidden_size: int, expert_dim: int, rank: int) -> None:
@@ -34,11 +36,11 @@ class RFMoEExpert(nn.Module):
         self.a_gate = nn.Linear(hidden_size, rank, bias=False)        # D -> r  (score + gate, dual use)
         self.b_gate = nn.Linear(rank, expert_dim, bias=False)         # r -> D_act
         self.w_up = nn.Linear(hidden_size, expert_dim, bias=False)    # D -> D_act
+        self.w_mid = nn.Linear(expert_dim, expert_dim, bias=False)    # D_act -> D_act
         self.w_down = nn.Linear(expert_dim, hidden_size, bias=False)  # D_act -> D
         # Per-expert fire bias. Warm-started ~0 so every expert fires early
         # (explore/specialize); a density loss ramps it up later to enforce
-        # sparsity (roadmap step 2). This scalar is the only decision-dedicated
-        # parameter — appending an expert adds just {this bias + the 4 matrices}.
+        # sparsity. This scalar is the only decision-dedicated parameter.
         self.bias = nn.Parameter(torch.full((1,), 1e-6))
 
     def score(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -47,7 +49,8 @@ class RFMoEExpert(nn.Module):
 
     def expert(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         gate = torch.sigmoid(self.b_gate(z))     # (n, D_act)
-        return self.w_down(gate * self.w_up(x))  # (n, D)
+        hidden = gate * self.w_up(x)
+        return self.w_down(F.silu(self.w_mid(hidden)))
 
 
 class RFMoE(nn.Module):

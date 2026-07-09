@@ -56,12 +56,12 @@ class HybridTransformerBlock(nn.Module):
                 residual=False,
             )
         else:
-            self.ffn_up = HBitLinear(
-                config.hidden_size, config.intermediate_size * 2, bias=False, config=config
-            )
-            self.ffn_down = HBitLinear(
-                config.intermediate_size, config.hidden_size, bias=False, config=config
-            )
+            # SwiGLU expand (fused gate+value) -> mid (silu) -> down. Three HBitLinears /
+            # three stages; mid stays at intermediate width.
+            inter = config.intermediate_size
+            self.ffn_up = HBitLinear(config.hidden_size, inter * 2, bias=False, config=config)
+            self.ffn_mid = HBitLinear(inter, inter, bias=False, config=config)
+            self.ffn_down = HBitLinear(inter, config.hidden_size, bias=False, config=config)
 
         # sigmoid(0)=0.5 at init: attention path starts damped.
         self.gate = nn.Parameter(torch.zeros(1))
@@ -88,5 +88,7 @@ class HybridTransformerBlock(nn.Module):
             mlp_out = self.moe(x_norm)
         else:
             gate_up, value = self.ffn_up(x_norm).chunk(2, dim=-1)
-            mlp_out = self.ffn_down(F.silu(gate_up) * value)
+            hidden = F.silu(gate_up) * value
+            hidden = F.silu(self.ffn_mid(hidden))
+            mlp_out = self.ffn_down(hidden)
         return self.mlp_res(residual, mlp_out)

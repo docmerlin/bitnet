@@ -591,8 +591,41 @@ def run_distillation(
     last_eval_metrics: dict[str, float] | None = None if checkpoint is None else dict(checkpoint.get("eval_metrics") or {})
 
     if checkpoint is not None:
-        student.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        from training.arch_upgrade import (
+            filter_ffn_mid_keys,
+            init_missing_ffn_mid_identity,
+        )
+
+        # Non-strict so architecture bumps (e.g. TernaryMLP mid_proj) soft-load.
+        incompatible = student.load_state_dict(checkpoint["model"], strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            print(
+                f"Warning: resumed checkpoint did not match the student exactly. "
+                f"Missing keys: {incompatible.missing_keys}; "
+                f"unexpected keys: {incompatible.unexpected_keys}",
+                flush=True,
+            )
+        mid_missing = filter_ffn_mid_keys(incompatible.missing_keys)
+        architecture_bump = bool(mid_missing)
+        if architecture_bump:
+            upgraded = init_missing_ffn_mid_identity(student, incompatible.missing_keys)
+            print(
+                "Architecture bump: checkpoint predates 3-stage FFN mid layers. "
+                f"Applied identity init to {len(upgraded)} mid weight(s). "
+                "Optimizer will NOT be restored (param groups would be inconsistent). "
+                "Global step is restored for logging/patcher warmup only — prefer a "
+                "same-architecture checkpoint for a true warm resume.",
+                flush=True,
+            )
+        if not architecture_bump:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except (ValueError, RuntimeError) as exc:
+                print(
+                    f"Warning: optimizer state not restored ({exc}). "
+                    "Continuing with a freshly initialized optimizer.",
+                    flush=True,
+                )
         start_step = int(checkpoint.get("step", 0))
         print(
             "Resume restores optimizer and student-patcher state only. Data streams restart from "
@@ -605,9 +638,23 @@ def run_distillation(
         if saved_patcher_state is not None:
             if student_patcher is None:
                 raise ValueError("checkpoint includes a student patcher; resume with --student-patcher-mode enabled")
-            student_patcher.load_state_dict(saved_patcher_state)
-            if patcher_optimizer is not None and saved_patcher_optimizer_state is not None:
-                patcher_optimizer.load_state_dict(saved_patcher_optimizer_state)
+            patcher_incompatible = student_patcher.load_state_dict(saved_patcher_state, strict=False)
+            if patcher_incompatible.missing_keys or patcher_incompatible.unexpected_keys:
+                print(
+                    f"Warning: student patcher checkpoint mismatch. "
+                    f"Missing keys: {patcher_incompatible.missing_keys}; "
+                    f"unexpected keys: {patcher_incompatible.unexpected_keys}",
+                    flush=True,
+                )
+            if (
+                not architecture_bump
+                and patcher_optimizer is not None
+                and saved_patcher_optimizer_state is not None
+            ):
+                try:
+                    patcher_optimizer.load_state_dict(saved_patcher_optimizer_state)
+                except (ValueError, RuntimeError) as exc:
+                    print(f"Warning: patcher optimizer state not restored ({exc}).", flush=True)
 
     weights = DistillationLossWeights(
         hard_ce=args.hard_ce_weight,

@@ -1,5 +1,6 @@
 """BitNet training helpers."""
 
+from training.arch_upgrade import filter_ffn_mid_keys, init_missing_ffn_mid_identity, is_ffn_mid_key
 from training.checkpoint import TrainerState, load_checkpoint, save_checkpoint
 from training.losses import compute_train_loss, language_modeling_loss, multi_token_loss
 from training.memory import (
@@ -36,6 +37,9 @@ __all__ = [
     "configure_mixed_precision",
     "create_optimizer",
     "evaluate",
+    "filter_ffn_mid_keys",
+    "init_missing_ffn_mid_identity",
+    "is_ffn_mid_key",
     "language_modeling_loss",
     "load_checkpoint",
     "lr_schedule_multiplier",

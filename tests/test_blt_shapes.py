@@ -49,6 +49,26 @@ def test_blt_forward_shapes() -> bool:
     assert output.decoder_hidden.shape == (2, 6, config.decoder_dim)
     assert output.patch_ids.shape == (2, 6)
     assert output.patch_lengths.sum(dim=1).tolist() == [6, 6]
+
+    # Every stack uses TernaryMLP with mid_proj (SwiGLU expand → mid → down).
+    local_hidden = max(int(config.local_dim * config.ffn_multiplier_local), config.local_dim)
+    global_hidden = max(int(config.global_dim * config.ffn_multiplier_global), config.global_dim)
+    decoder_hidden = max(int(config.decoder_dim * config.ffn_multiplier_decoder), config.decoder_dim)
+    enc_mlp = model.local_encoder.blocks[0].mlp
+    glob_mlp = model.global_transformer.blocks[0].mlp
+    dec_mlp = model.local_decoder.blocks[0].mlp
+    for mlp, h in ((enc_mlp, local_hidden), (glob_mlp, global_hidden), (dec_mlp, decoder_hidden)):
+        assert hasattr(mlp, "mid_proj"), "TernaryMLP missing mid_proj"
+        assert mlp.mid_proj.weight.shape == (h, h), mlp.mid_proj.weight.shape
+
+    # Mid participates in backward (not dead/unused).
+    model.train()
+    loss = output.logits.float().mean()
+    loss.backward()
+    for mlp in (enc_mlp, glob_mlp, dec_mlp):
+        assert mlp.mid_proj.weight.grad is not None, "mid_proj must get gradients"
+        assert float(mlp.mid_proj.weight.grad.abs().sum()) > 0.0
+
     print("Ternary BLT shape tests passed")
     return True
 

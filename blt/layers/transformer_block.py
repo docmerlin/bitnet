@@ -70,16 +70,26 @@ class TernarySelfAttention(nn.Module):
 
 
 class TernaryMLP(nn.Module):
+    """SwiGLU expand → mid (silu) → down; 4 HBitLinears / 3 stages.
+
+    Shared by local-encoder, global, and local-decoder ``TransformerBlock``s.
+    ``gate_proj``/``up_proj`` are separate (unlike hybrid dense which fuses them
+    into one ``ffn_up`` of width ``2*inter``).
+    """
+
     def __init__(self, dim: int, multiplier: float, *, config: TernaryBLTConfig) -> None:
         super().__init__()
         hidden_dim = max(int(dim * multiplier), dim)
+        self.hidden_dim = hidden_dim
         self.gate_proj = HBitLinear(dim, hidden_dim, config=config)
         self.up_proj = HBitLinear(dim, hidden_dim, config=config)
+        self.mid_proj = HBitLinear(hidden_dim, hidden_dim, config=config)
         self.down_proj = HBitLinear(hidden_dim, dim, config=config)
         self.dropout = config.dropout
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        hidden = F.silu(self.mid_proj(hidden))
         if self.dropout > 0.0:
             hidden = F.dropout(hidden, p=self.dropout, training=self.training)
         return self.down_proj(hidden)

@@ -20,6 +20,12 @@ def test_rfmoe_forward_and_grad() -> None:
     torch.manual_seed(0)
     hidden = 64
     moe = RFMoE(hidden, expert_dim=32, num_experts=8, rank=4, theta=0.01)
+    # Each expert body is 3-stage (up/mid/down).
+    expert = moe.experts[0]
+    assert hasattr(expert, "w_mid")
+    assert expert.w_mid.weight.shape == (32, 32)
+    assert expert.w_up.weight.shape == (32, hidden)
+    assert expert.w_down.weight.shape == (hidden, 32)
     x = torch.randn(4, 10, hidden)
     y = moe(x)
     assert y.shape == x.shape
@@ -29,6 +35,8 @@ def test_rfmoe_forward_and_grad() -> None:
     loss0 = F.mse_loss(moe(x), target)
     opt.zero_grad()
     loss0.backward()
+    assert expert.w_mid.weight.grad is not None, "w_mid must participate in backward"
+    assert float(expert.w_mid.weight.grad.abs().sum()) > 0.0, "w_mid grad should be nonzero"
     opt.step()
     loss1 = F.mse_loss(moe(x), target)
     assert loss1 < loss0

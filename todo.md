@@ -33,11 +33,16 @@ Shipped (see `layers/rfmoe.py`, `train.py`, `config.py`):
 
 Ref: RFMoE (arXiv 2604.00801), on AoE (2501.13074) + ReMoE.
 
-Per expert, GLU: `FFN(x) = [σ(x A_gate B_gate) ⊙ (x W_up)] W_down`. `A_gate` D×r dual-use (score + gate).
+Per expert body (3 mats, depth matches dense hybrid FFN):  
+`E_i(x) = W_down(silu(W_mid([σ(x A_gate B_gate) ⊙ (x W_up)])))`.  
+Expand gate is sigmoid-GLU (paper), not SwiGLU; mid/down are shared depth with dense up→mid→down.  
+`A_gate` D×r dual-use (score + gate).
 - Score `s_i = ‖x A_gate‖₂`; gate `G_i = ReLU(s_i − b_i)`; fire `1{G_i ≥ θ}`.
-- `z = x A_gate` computed ONCE: norm decides, same z feeds B_gate. Skip path = FLOP saving.
+- `z = x A_gate` computed ONCE: norm decides, same z feeds B_gate. Skip path = FLOP saving
+  (skip W_up/W_mid/W_down + B_gate when not firing).
 - Combine `h = x + Σ G_i·E_i` — NO divide-by-count (score = mix weight; RMSNorm renormalizes).
 - Sizing `r ≈ D/16`. Decision-dedicated params = scalar `b_i` + global `θ`.
+- Expert tensors: `{A_gate, B_gate, W_up, W_mid, W_down, b_i}`.
 - Train: pre-threshold `G_i` = differentiable proxy. Bias warmup `b_i≈1e-6` (all fire early),
   λ ramps sparsity. GLOBAL density target, not per-layer.
 - Gains (paper, ≤0.8B): PPL −12–19%, θ gives 20× fewer acts / −31% FLOPs. UNPROVEN >0.8B. Research bet.
@@ -56,7 +61,7 @@ Target = staircase (uniform within memory tier, step down across): `π = (1−α
 
 Why self-gating enables it: standard router `G∈D×N` bakes in N — adding expert N+1 renormalizes ALL
 routing (softmax over N), breaks load balance, needs router retrain. RFMoE has no central router: append
-`{FFN, A_gate, b_i}`, existing fire decisions unchanged, residual-add preserves old behavior when frozen.
+`{W_up, W_mid, W_down, A_gate, B_gate, b_i}`, existing fire decisions unchanged, residual-add preserves old behavior when frozen.
 
 Procedure: append with HIGH b_i (cold) → freeze everything else → train new expert on new domain → push
 into unclaimed niche (diversity term) → re-tune θ so density stays pinned (else cost grows with N).

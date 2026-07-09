@@ -21,7 +21,10 @@ class TernaryConfig:
     num_hidden_layers: int = 64
     num_attention_heads: int = 32
     head_dim: int = 32  # hidden_size // num_attention_heads
-    intermediate_size: int = 2048  # 2x hidden for FFN (standard for BitNet)
+    # 2x hidden. Dense FFN is SwiGLU expand + square mid + down (3 stages).
+    # Mid alone adds ~intermediate_size^2 params (and FLOPs) per block — large jump
+    # vs the classic 2-mat FFN; power-of-two intermediate also enables Hadamard on mid.
+    intermediate_size: int = 2048
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     rope_scaling: dict = None  # YaRN/NTK params set in __post_init__

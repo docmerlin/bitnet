@@ -81,11 +81,18 @@ def test_hybrid_block():
     block.train()
     block.num_blocks = config.block_size
 
-    # Test 2: Contains both mechanisms
+    # Test 2: Contains both mechanisms + 3-stage dense FFN layout
     assert hasattr(block, 'infini_attn'), "Missing InfiniAttention"
     assert hasattr(block, 'attn_res'), "Missing AttentionResidual for attention"
     assert hasattr(block, 'mlp_res'), "Missing AttentionResidual for MLP"
     assert hasattr(block, 'gate'), "Missing learned gate"
+    assert hasattr(block, 'ffn_up') and hasattr(block, 'ffn_mid') and hasattr(block, 'ffn_down'), (
+        "Dense FFN should be three HBitLinear layers (up/mid/down)"
+    )
+    d, inter = config.hidden_size, config.intermediate_size
+    assert block.ffn_up.weight.shape == (inter * 2, d), block.ffn_up.weight.shape
+    assert block.ffn_mid.weight.shape == (inter, inter), block.ffn_mid.weight.shape
+    assert block.ffn_down.weight.shape == (d, inter), block.ffn_down.weight.shape
 
     # Test 3: Learned gate is between 0 and 1
     gate_value = torch.sigmoid(block.gate)
@@ -125,13 +132,15 @@ def test_hybrid_block():
         rtol=1e-4,
     ), "num_blocks=1 should restore full causal attention"
 
-    # Test 5: Basic gradient flow
+    # Test 5: Gradient flows through input and through ffn_mid (mid is not dead weight)
     x.requires_grad_(True)
     reset_memory(block)
     output = block(x, attention_mask)
     loss = output.mean()
     loss.backward()
     assert x.grad is not None, "Gradients not flowing"
+    assert block.ffn_mid.weight.grad is not None, "ffn_mid must participate in backward"
+    assert float(block.ffn_mid.weight.grad.abs().sum()) > 0.0, "ffn_mid grad should be nonzero"
 
     print("✅ All HybridTransformerBlock tests passed!")
     print(f"   - Every layer contains both Infini-Attention and AttnRes")

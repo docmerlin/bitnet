@@ -112,6 +112,75 @@ def test_checkpoint_save_load_roundtrip() -> bool:
     return True
 
 
+def test_soft_resume_pre_mid_checkpoint_identity_inits_mid() -> bool:
+    """Pre-mid checkpoints load non-strict; mid mats get identity, not Kaiming."""
+    from torch.optim.lr_scheduler import LambdaLR
+
+    config = _tiny_config()
+    model = BitNetDeep(config)
+    args = _tiny_args()
+    optimizer = create_optimizer(model, args)
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    state = TrainerState(step=11, tokens_processed=256, samples_processed=8)
+
+    with TemporaryDirectory() as tempdir:
+        output_dir = Path(tempdir)
+        checkpoint_path = save_checkpoint(
+            output_dir=output_dir,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            state=state,
+            model_config=config,
+            args=args,
+            checkpoint_name="pre_mid.pt",
+        )
+        payload = load_checkpoint_payload(checkpoint_path, map_location="cpu")
+        # Simulate a 2-stage FFN checkpoint: drop all mid weights.
+        stripped = {
+            k: v for k, v in payload["model"].items()
+            if "ffn_mid" not in k and "w_mid" not in k and "mid_proj" not in k
+        }
+        assert any("ffn_up" in k for k in stripped)
+        assert not any("ffn_mid" in k for k in stripped)
+        payload["model"] = stripped
+        # Corrupt optimizer param-group sizes so a naive load would fail if attempted.
+        payload["optimizer"] = {"param_groups": [], "state": {}}
+        torch.save(payload, checkpoint_path)
+
+        restored = BitNetDeep(config)
+        # Scramble mid so we can detect identity upgrade.
+        with torch.no_grad():
+            for name, param in restored.named_parameters():
+                if "ffn_mid" in name and name.endswith("weight"):
+                    param.normal_()
+        restored_opt = create_optimizer(restored, args)
+        restored_sched = LambdaLR(restored_opt, lr_lambda=lambda _: 1.0)
+        restored_state = load_checkpoint(
+            checkpoint_path, restored, restored_opt, restored_sched, None,
+        )
+        assert restored_state.step == 11
+        assert restored_state.tokens_processed == 256
+
+        mid_mats = [
+            p for n, p in restored.named_parameters()
+            if "ffn_mid" in n and n.endswith("weight")
+        ]
+        assert mid_mats, "expected dense ffn_mid weights"
+        for mat in mid_mats:
+            eye = torch.eye(mat.size(0), dtype=mat.dtype)
+            assert torch.allclose(mat.detach().cpu(), eye, atol=1e-5), mat
+
+        # Non-mid weights should still match the source model (up/down restored).
+        src_up = model.layers[0].ffn_up.weight.detach()
+        dst_up = restored.layers[0].ffn_up.weight.detach()
+        assert torch.allclose(src_up, dst_up), "ffn_up should restore from stripped ckpt"
+
+    print("BitNet pre-mid soft-resume identity-init tests passed")
+    return True
+
+
 def test_z_loss_matches_cross_entropy_when_disabled() -> bool:
     torch.manual_seed(0)
     logits = torch.randn(2, 5, 32)
@@ -149,5 +218,6 @@ def test_multi_token_loss_handles_short_sequences() -> bool:
 if __name__ == "__main__":
     test_single_training_step_updates_parameters()
     test_checkpoint_save_load_roundtrip()
+    test_soft_resume_pre_mid_checkpoint_identity_inits_mid()
     test_z_loss_matches_cross_entropy_when_disabled()
     test_multi_token_loss_handles_short_sequences()
