@@ -45,8 +45,9 @@ Key properties:
     plus loop position embeddings — applied only at loop boundaries (Zeitoun et al.)
   - **Trainability:** R curriculum (`--min-num-loops`→`--num-loops` over
     `--loop-curriculum-ratio`, default 1→4 over 20% tokens); gradient checkpointing
-    default on / compile off (XOR); small-scale sublayer outs for deep residual identity;
-    logs `active_loops` + HC/AttnRes health scalars
+    default on / compile off (XOR); `--checkpoint-granularity loop|layer` (default
+    **loop** = recompute each recurrent pass, not every mid layer); small-scale
+    sublayer outs for deep residual identity; logs `active_loops` + HC/AttnRes health
 - hierarchical tokenizer path under `tokenizer/`
 - streaming Hugging Face dataset training in `train.py`
 

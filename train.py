@@ -191,6 +191,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "Mutually exclusive with --compile in practice.",
     )
     parser.add_argument(
+        "--checkpoint-granularity",
+        choices=("loop", "layer"),
+        default="loop",
+        help="When checkpointing: 'loop' recomputes each full recurrent pass "
+        "(fewer segments, faster; default). 'layer' checkpoints every block "
+        "(max VRAM save, more recompute).",
+    )
+    parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -261,6 +269,7 @@ def main() -> None:
             model_config = TernaryConfig(**{k: v for k, v in saved_config.items() if k in valid_fields})
     base_model = BitNetDeep(model_config)
     base_model.gradient_checkpointing = args.gradient_checkpointing
+    base_model.checkpoint_granularity = args.checkpoint_granularity
     base_model.to(device)
 
     density_controller = (
@@ -284,7 +293,11 @@ def main() -> None:
         print(f"torch.compile enabled (mode={args.compile_mode}).", flush=True)
         runner = torch.compile(runner, mode=args.compile_mode)
     elif args.gradient_checkpointing:
-        print("Gradient checkpointing enabled (torch.compile off).", flush=True)
+        print(
+            f"Gradient checkpointing enabled "
+            f"(granularity={args.checkpoint_granularity}; torch.compile off).",
+            flush=True,
+        )
 
     max_loops = int(model_config.num_loops)
     min_loops = min(int(args.min_num_loops), max_loops)

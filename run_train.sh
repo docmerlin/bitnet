@@ -45,6 +45,7 @@ python3 train.py \
   --vocab-size 131072 \
   --precision bf16 \
   --gradient-checkpointing \
+  --checkpoint-granularity loop \
   --no-compile \
   --log-interval 10 \
   --eval-interval 250 \

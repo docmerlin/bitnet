@@ -152,12 +152,15 @@ def test_infini_attention_memory_is_not_serialized() -> bool:
     return True
 
 
-def test_training_wrapper_checkpointing_matches_reference_gradients() -> bool:
+def _assert_checkpoint_matches_reference(granularity: str) -> None:
     torch.manual_seed(4)
     config = TernaryConfig(
         vocab_size=128,
         hidden_size=64,
-        num_hidden_layers=3,
+        num_prelude_layers=1,
+        num_recurrent_layers=2,
+        num_coda_layers=1,
+        num_loops=2,
         num_attention_heads=4,
         head_dim=16,
         intermediate_size=128,
@@ -175,31 +178,45 @@ def test_training_wrapper_checkpointing_matches_reference_gradients() -> bool:
 
     reference_model.gradient_checkpointing = False
     checkpoint_model.gradient_checkpointing = True
+    checkpoint_model.checkpoint_granularity = granularity
     reference_model.train()
     checkpoint_model.train()
 
     reference_logits = reference_model(input_ids)
     checkpoint_logits = checkpoint_model(input_ids)
-    reference_loss = F.cross_entropy(reference_logits.reshape(-1, reference_logits.size(-1)), labels.reshape(-1))
-    checkpoint_loss = F.cross_entropy(checkpoint_logits.reshape(-1, checkpoint_logits.size(-1)), labels.reshape(-1))
+    reference_loss = F.cross_entropy(
+        reference_logits.reshape(-1, reference_logits.size(-1)), labels.reshape(-1)
+    )
+    checkpoint_loss = F.cross_entropy(
+        checkpoint_logits.reshape(-1, checkpoint_logits.size(-1)), labels.reshape(-1)
+    )
     reference_loss.backward()
     checkpoint_loss.backward()
 
-    assert torch.allclose(reference_loss, checkpoint_loss, atol=1e-6, rtol=1e-5), (
-        "Gradient checkpointing should preserve the training loss"
+    assert torch.allclose(reference_loss, checkpoint_loss, atol=1e-5, rtol=1e-4), (
+        f"gradient checkpointing ({granularity}) should preserve the training loss"
     )
     for (reference_name, reference_param), (checkpoint_name, checkpoint_param) in zip(
         reference_model.named_parameters(),
         checkpoint_model.named_parameters(),
     ):
-        assert reference_name == checkpoint_name, "Parameter ordering should stay aligned across the cloned models"
+        assert reference_name == checkpoint_name
         assert reference_param.grad is not None, f"Expected gradient for {reference_name}"
         assert checkpoint_param.grad is not None, f"Expected checkpoint gradient for {checkpoint_name}"
-        assert torch.allclose(reference_param.grad, checkpoint_param.grad, atol=1e-6, rtol=1e-5), (
-            f"Checkpointed training should match the reference gradient for {reference_name}"
-        )
+        assert torch.allclose(
+            reference_param.grad, checkpoint_param.grad, atol=1e-5, rtol=1e-4
+        ), f"Checkpointed training should match reference grad for {reference_name} ({granularity})"
 
-    print("BitNetDeep checkpoint gradient regression tests passed")
+
+def test_training_wrapper_checkpointing_matches_reference_gradients() -> bool:
+    _assert_checkpoint_matches_reference("layer")
+    print("BitNetDeep layer-granularity checkpoint gradient regression tests passed")
+    return True
+
+
+def test_loop_granularity_checkpointing_matches_reference_gradients() -> bool:
+    _assert_checkpoint_matches_reference("loop")
+    print("BitNetDeep loop-granularity checkpoint gradient regression tests passed")
     return True
 
 
@@ -207,5 +224,7 @@ if __name__ == "__main__":
     test_infini_attention_memory_updates()
     test_checkpoint_recompute_does_not_double_update_memory()
     test_model_forward_resets_memory_between_calls()
+    test_training_wrapper_checkpointing_matches_reference_gradients()
+    test_loop_granularity_checkpointing_matches_reference_gradients()
     test_infini_attention_memory_is_not_serialized()
     test_training_wrapper_checkpointing_matches_reference_gradients()

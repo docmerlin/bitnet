@@ -6,7 +6,7 @@ Depth is looped: unique prelude once, recurrent stack × R, unique coda once.
 from __future__ import annotations
 
 import contextlib
-from typing import Optional, Union
+from typing import Iterable, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -21,12 +21,16 @@ from utils import (
     document_attention_keep_mask,
 )
 
+# "layer" = checkpoint each HybridTransformerBlock (max VRAM save, more recompute).
+# "loop"  = checkpoint each full recurrent pass (fewer recomputes; default for deep R).
+CheckpointGranularity = str  # "layer" | "loop"
+
 
 class BitNetDeep(nn.Module):
     """Deep ternary LLM: hybrid blocks, ternary projections, tied embeddings.
 
     Training knobs on the model:
-    - ``gradient_checkpointing`` freezes Infini memory for recompute-safe backward
+    - ``gradient_checkpointing`` + ``checkpoint_granularity`` (``layer`` | ``loop``)
     - ``return_mtp=True`` also returns multi-token-prediction logits
     - ``num_loops`` on forward overrides config for test-time depth scaling
 
@@ -34,8 +38,7 @@ class BitNetDeep(nn.Module):
 
     Layer layout (flat ``self.layers`` for checkpoint key stability):
     ``layers[0:P]`` prelude once → ``layers[P:P+R]`` recurrent × loops →
-    ``layers[P+R:]`` coda once. Infini memory accumulates across all applications
-    within a forward; reset only when ``reset_memory=True``.
+    ``layers[P+R:]`` coda once.
 
     Recurrent core uses Hyperloop-style loop-boundary hyper-connections: 4 residual
     streams, input-dependent pre/post, diagonal ``H_res`` (no Sinkhorn). Always on
@@ -49,6 +52,8 @@ class BitNetDeep(nn.Module):
         super().__init__()
         self.config = config or TernaryConfig()
         self.gradient_checkpointing = False
+        # Default "loop": one recompute per recurrent iteration (not per mid layer).
+        self.checkpoint_granularity: CheckpointGranularity = "loop"
 
         self.num_prelude = int(self.config.num_prelude_layers)
         self.num_recurrent = int(self.config.num_recurrent_layers)
@@ -127,6 +132,26 @@ class BitNetDeep(nn.Module):
             device=x.device,
         )
 
+    @staticmethod
+    def _snapshot_infini_states(
+        layers: Sequence[HybridTransformerBlock],
+    ) -> List[dict[str, torch.Tensor]]:
+        return [layer.infini_attn.get_memory_state() for layer in layers]
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _freeze_infini_states(
+        layers: Sequence[HybridTransformerBlock],
+        states: Sequence[dict[str, torch.Tensor]],
+    ):
+        """On recompute: restore Infini banks and disable writes (no double-update)."""
+        with contextlib.ExitStack() as stack:
+            for layer, state in zip(layers, states):
+                stack.enter_context(
+                    layer.infini_attn.use_memory_state(state, update_memory_buffers=False)
+                )
+            yield
+
     def _run_layer(
         self,
         layer: HybridTransformerBlock,
@@ -135,9 +160,19 @@ class BitNetDeep(nn.Module):
         query_valid: Optional[torch.Tensor],
         *,
         update_memory: Optional[bool] = None,
+        force_checkpoint: Optional[bool] = None,
     ) -> torch.Tensor:
-        if self.gradient_checkpointing and self.training:
-            # Freeze Infini memory for recompute-safe backward (no double-write).
+        """Run one block. Checkpoint when enabled and granularity is ``layer``."""
+        do_ckpt = (
+            self.gradient_checkpointing
+            and self.training
+            and (
+                force_checkpoint
+                if force_checkpoint is not None
+                else self.checkpoint_granularity == "layer"
+            )
+        )
+        if do_ckpt:
             layer_memory_state = layer.infini_attn.get_memory_state()
             return checkpoint(
                 lambda hidden_states, layer=layer, attn_bias=attn_bias, query_valid=query_valid, update_memory=update_memory: layer(
@@ -160,6 +195,82 @@ class BitNetDeep(nn.Module):
             attn_bias=attn_bias,
             query_valid=query_valid,
             update_memory=update_memory,
+        )
+
+    def _run_stack(
+        self,
+        layers: Iterable[HybridTransformerBlock],
+        x: torch.Tensor,
+        attn_bias: Optional[torch.Tensor],
+        query_valid: Optional[torch.Tensor],
+        *,
+        update_memory: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Run a sequence of blocks without per-layer checkpointing."""
+        for layer in layers:
+            x = layer(
+                x,
+                attn_bias=attn_bias,
+                query_valid=query_valid,
+                update_memory=update_memory,
+            )
+        return x
+
+    def _run_recurrent_iteration(
+        self,
+        recurrent: Sequence[HybridTransformerBlock],
+        x: torch.Tensor,
+        attn_bias: Optional[torch.Tensor],
+        query_valid: Optional[torch.Tensor],
+        *,
+        update_memory: bool,
+    ) -> torch.Tensor:
+        """One full middle-stack pass; optional loop-granularity checkpoint."""
+        use_loop_ckpt = (
+            self.gradient_checkpointing
+            and self.training
+            and self.checkpoint_granularity == "loop"
+            and len(recurrent) > 0
+        )
+        if not use_loop_ckpt:
+            # Layer granularity (or ckpt off): each block handled in _run_layer.
+            for layer in recurrent:
+                x = self._run_layer(
+                    layer,
+                    x,
+                    attn_bias,
+                    query_valid,
+                    update_memory=update_memory,
+                )
+            return x
+
+        # Checkpoint the entire recurrent stack as one segment (R checkpoints total).
+        layers_list = list(recurrent)
+        mem_states = self._snapshot_infini_states(layers_list)
+
+        def run_stack(
+            hidden_states: torch.Tensor,
+            layers_list=layers_list,
+            attn_bias=attn_bias,
+            query_valid=query_valid,
+            update_memory=update_memory,
+        ) -> torch.Tensor:
+            return self._run_stack(
+                layers_list,
+                hidden_states,
+                attn_bias,
+                query_valid,
+                update_memory=update_memory,
+            )
+
+        return checkpoint(
+            run_stack,
+            x,
+            use_reentrant=False,
+            context_fn=lambda layers_list=layers_list, mem_states=mem_states: (
+                contextlib.nullcontext(),
+                self._freeze_infini_states(layers_list, mem_states),
+            ),
         )
 
     def forward(
@@ -188,7 +299,7 @@ class BitNetDeep(nn.Module):
         if loops < 1:
             raise ValueError("num_loops must be >= 1")
 
-        # Prelude once
+        # Prelude once (layer-granularity checkpoint when enabled)
         for layer in self.layers[:p]:
             x = self._run_layer(layer, x, attn_bias, query_valid)
 
@@ -200,14 +311,13 @@ class BitNetDeep(nn.Module):
             for loop_i in range(loops):
                 write_memory = loop_i == loops - 1
                 x_in, _h_pre, h_post, h_res = self.loop_hc.project_in(y)
-                for layer in recurrent:
-                    x_in = self._run_layer(
-                        layer,
-                        x_in,
-                        attn_bias,
-                        query_valid,
-                        update_memory=write_memory,
-                    )
+                x_in = self._run_recurrent_iteration(
+                    recurrent,
+                    x_in,
+                    attn_bias,
+                    query_valid,
+                    update_memory=write_memory,
+                )
                 e_l = self.loop_hc.loop_embedding(
                     loop_i, device=x_in.device, dtype=x_in.dtype
                 )
@@ -216,7 +326,7 @@ class BitNetDeep(nn.Module):
             x = self.loop_hc.fold(y)
         # else: no recurrent core — prelude output flows straight to coda
 
-        # Coda once (default write policy; outside the recurrent last-write rule)
+        # Coda once
         for layer in self.layers[p + r :]:
             x = self._run_layer(layer, x, attn_bias, query_valid)
 
