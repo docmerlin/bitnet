@@ -23,7 +23,7 @@ from utils import (
 
 # "layer" = checkpoint each HybridTransformerBlock (max VRAM save, more recompute).
 # "loop"  = checkpoint each full recurrent pass (fewer recomputes; default for deep R).
-CheckpointGranularity = str  # "layer" | "loop"
+CheckpointGranularity = str  # Literal["layer", "loop"] preferred at call sites
 
 
 class BitNetDeep(nn.Module):
@@ -160,17 +160,12 @@ class BitNetDeep(nn.Module):
         query_valid: Optional[torch.Tensor],
         *,
         update_memory: Optional[bool] = None,
-        force_checkpoint: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run one block. Checkpoint when enabled and granularity is ``layer``."""
         do_ckpt = (
             self.gradient_checkpointing
             and self.training
-            and (
-                force_checkpoint
-                if force_checkpoint is not None
-                else self.checkpoint_granularity == "layer"
-            )
+            and self.checkpoint_granularity == "layer"
         )
         if do_ckpt:
             layer_memory_state = layer.infini_attn.get_memory_state()

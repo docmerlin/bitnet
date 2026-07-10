@@ -56,12 +56,17 @@ class LoopHyperConnection(nn.Module):
         self._init_identity_friendly()
 
     def _init_identity_friendly(self) -> None:
-        """Bias toward average-read / unit residual / small write at step 0."""
+        """Bias toward average-read / unit residual / small write at step 0.
+
+        ``H_pre`` uses sigmoid (Hyperloop), not softmax. For equal stream content
+        ``x_in = (Σ_i σ_i) · x``; set bias so each σ ≈ 1/n and Σσ ≈ 1 (not 0.5·n).
+        """
         n = self.num_streams
+        # σ(b) ≈ 1/n  ⇒  b = log((1/n) / (1 - 1/n)) = -log(n - 1)
+        pre_bias = float(-torch.log(torch.tensor(float(n - 1))))
         with torch.no_grad():
-            # H_pre ≈ 1/n via equal logits after sigmoid → soft average of streams.
             self.w_pre.weight.zero_()
-            self.w_pre.bias.fill_(0.0)
+            self.w_pre.bias.fill_(pre_bias)
             # H_post = 2·σ(·): bias so σ≈0 → post≈0 (no write at init).
             self.w_post.weight.zero_()
             self.w_post.bias.fill_(-3.0)

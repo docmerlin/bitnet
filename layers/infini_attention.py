@@ -203,9 +203,12 @@ class InfiniAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         output = self.o_proj(context)
 
-        # Memory is always readable. Writes are optional (loop policy B: write only
-        # on the last recurrent pass). Explicit update_memory overrides the module flag.
-        do_update = self.update_memory_buffers if update_memory is None else update_memory
+        # Memory is always readable. Writes need both:
+        # - caller request (update_memory / default module flag), and
+        # - module flag still True (checkpoint recompute freezes the flag so an
+        #   explicit update_memory=True cannot double-write on recompute).
+        requested = self.update_memory_buffers if update_memory is None else bool(update_memory)
+        do_update = requested and self.update_memory_buffers
         if self.training and do_update:
             with torch.no_grad():
                 self._update_memory(k, v)
