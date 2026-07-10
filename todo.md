@@ -8,13 +8,19 @@ stay VRAM-resident; offload cold tail. Self-gating experts → also extensible
 
 ## Status
 
-Shipped (see `layers/rfmoe.py`, `train.py`, `config.py`):
+Shipped (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
 - RFMoE self-gating FFN, off by default behind `use_rfmoe`. θ inference knob.
 - Adaptive-λ density control → global density target. `--rfmoe-density-target/-eta`.
 - Staircase locality loss KL(π‖sorted p), EMA-ranked stop-grad. `--rfmoe-locality-coef/-zipf-s/-uniform-alpha`.
 - Flat→skew curriculum (anneal s:0→s, α:1→α). `--rfmoe-curriculum-ratio`.
 - Functional-diversity loss (decorrelate per-token firing). `--rfmoe-diversity-coef`.
 - MTP (multi-token prediction) for AR data efficiency, k extra heads reuse tied unembedding. `--mtp-depth/-loss-coef`.
+- **Looped / recurrent-depth BitNetDeep:** prelude 8 + recurrent 48 × R + coda 8 (default R=4).
+  Flat `layers.i` ModuleList; forward schedules loops. CLI structure flags + `--num-loops`.
+  Infini policy B: read every loop, write only last recurrent loop. Eval override: `num_loops=`.
+- **Hyperloop loop HC** (`layers/loop_mhc.py`): 4 streams, diagonal `H_res` (no Sinkhorn),
+  pre/post + loop embeds at each recurrent iteration. Hardcoded, not config knobs.
+
 ## Next actions
 
 1. **PERF (blocker for any real run):** RFMoE forward is per-expert Python loop (O(N) launches).
@@ -26,6 +32,14 @@ Shipped (see `layers/rfmoe.py`, `train.py`, `config.py`):
 4. **Serving:** tier experts by usage (hot→VRAM, warm→RAM, cold→SSD), offload + prefetch.
    Optional temporal-stickiness loss (penalize active-set change token-to-token → less page thrash).
 5. **Diffusion (thread 3):** large new direction; locality reg (built) is prerequisite (see below).
+6. **Looped follow-ups (optional):** stochastic/Poisson R, input injection each loop,
+   adaptive halt at eval, thinner middle rebalance.
+7. **Shipped trainability (2026-07):** R curriculum (`--min-num-loops` → `--num-loops` over
+   `--loop-curriculum-ratio`), loop health metrics in logger, checkpoint XOR compile
+   (checkpoint default on), ×0.01 init scale on attn `o_proj` + FFN down for deep residual.
+
+Note: linear R curriculum is the default train path; full always-max R via
+`--loop-curriculum-ratio 0`.
 
 ---
 

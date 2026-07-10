@@ -96,31 +96,50 @@ def autocast_context(
 
 def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenizer) -> TernaryConfig:
     defaults = TernaryConfig()
-    return TernaryConfig(
-        vocab_size=len(tokenizer),
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_layers,
-        num_attention_heads=args.num_heads,
-        head_dim=args.hidden_size // args.num_heads,
-        intermediate_size=args.intermediate_size,
-        rms_norm_eps=defaults.rms_norm_eps,
-        rope_theta=defaults.rope_theta,
-        rope_scaling={
+    kwargs: dict = {
+        "vocab_size": len(tokenizer),
+        "hidden_size": args.hidden_size,
+        "num_attention_heads": args.num_heads,
+        "head_dim": args.hidden_size // args.num_heads,
+        "intermediate_size": args.intermediate_size,
+        "rms_norm_eps": defaults.rms_norm_eps,
+        "rope_theta": defaults.rope_theta,
+        "rope_scaling": {
             "type": "yarn",
             "factor": args.rope_scaling_factor,
             "original_max_position_embeddings": defaults.rope_scaling["original_max_position_embeddings"],
         },
-        initializer_range=defaults.initializer_range,
-        block_size=args.final_blocks,
-        infini_memory_dim=defaults.infini_memory_dim,
-        use_hadamard=not args.disable_hadamard,
-        use_4bit_activations=True,
-        use_rfmoe=args.use_rfmoe,
-        rfmoe_num_experts=args.rfmoe_num_experts,
-        rfmoe_expert_dim=args.rfmoe_expert_dim,
-        rfmoe_theta=args.rfmoe_theta,
-        mtp_depth=args.mtp_depth,
-    )
+        "initializer_range": defaults.initializer_range,
+        "block_size": args.final_blocks,
+        "infini_memory_dim": defaults.infini_memory_dim,
+        "use_hadamard": not args.disable_hadamard,
+        "use_4bit_activations": True,
+        "use_rfmoe": args.use_rfmoe,
+        "rfmoe_num_experts": args.rfmoe_num_experts,
+        "rfmoe_expert_dim": args.rfmoe_expert_dim,
+        "rfmoe_theta": args.rfmoe_theta,
+        "mtp_depth": args.mtp_depth,
+    }
+
+    prelude = getattr(args, "num_prelude_layers", None)
+    recurrent = getattr(args, "num_recurrent_layers", None)
+    coda = getattr(args, "num_coda_layers", None)
+    loops = getattr(args, "num_loops", None)
+    structure_set = any(v is not None for v in (prelude, recurrent, coda))
+
+    if structure_set:
+        kwargs["num_prelude_layers"] = prelude
+        kwargs["num_recurrent_layers"] = recurrent
+        kwargs["num_coda_layers"] = coda
+        kwargs["num_loops"] = loops
+    elif getattr(args, "num_layers", None) is not None:
+        kwargs["num_hidden_layers"] = args.num_layers
+        kwargs["num_loops"] = loops
+    else:
+        # Production looped default (8 / 48 / 8, R=4) via TernaryConfig resolution.
+        kwargs["num_loops"] = loops
+
+    return TernaryConfig(**kwargs)
 
 
 def create_optimizer(model: nn.Module, args: argparse.Namespace) -> Optimizer:

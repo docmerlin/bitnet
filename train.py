@@ -40,6 +40,8 @@ from training.runtime import (
 )
 from training.schedules import (
     choose_stage_mixture,
+    collect_loop_train_metrics,
+    loop_count_for_progress,
     lr_schedule_multiplier,
     rfmoe_staircase_schedule,
     update_block_growth,
@@ -87,7 +89,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vocab-size", type=int, default=131_072)
 
     parser.add_argument("--hidden-size", type=int, default=defaults.hidden_size)
-    parser.add_argument("--num-layers", type=int, default=defaults.num_hidden_layers)
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Flat unique layer count (prelude=0, recurrent=N, coda=0). "
+        "Ignored when any of --num-prelude/recurrent/coda-layers is set. "
+        "Default with no structure flags: 8/48/8 looped.",
+    )
+    parser.add_argument(
+        "--num-prelude-layers",
+        type=int,
+        default=None,
+        help="Unique layers run once before the recurrent core (default 8).",
+    )
+    parser.add_argument(
+        "--num-recurrent-layers",
+        type=int,
+        default=None,
+        help="Unique layers in the looped middle stack (default 48).",
+    )
+    parser.add_argument(
+        "--num-coda-layers",
+        type=int,
+        default=None,
+        help="Unique layers run once after the recurrent core (default 8).",
+    )
+    parser.add_argument(
+        "--num-loops",
+        type=int,
+        default=None,
+        help="Max recurrent loops after curriculum (default 4 with structure, 1 if flat --num-layers).",
+    )
+    parser.add_argument(
+        "--min-num-loops",
+        type=int,
+        default=1,
+        help="Starting loop count for the depth curriculum (ramps up to --num-loops).",
+    )
+    parser.add_argument(
+        "--loop-curriculum-ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of training over which active loops ramp min→max (0 = always max).",
+    )
     parser.add_argument("--num-heads", type=int, default=defaults.num_attention_heads)
     parser.add_argument("--intermediate-size", type=int, default=defaults.intermediate_size)
     parser.add_argument("--sequence-length", type=int, default=1024)
@@ -138,8 +183,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-growth-ratio", type=float, default=0.6)
 
     parser.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
-    parser.add_argument("--gradient-checkpointing", action="store_true")
-    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Activation checkpointing (default on for deep/looped training). "
+        "Mutually exclusive with --compile in practice.",
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="torch.compile the model (CUDA only). Default off — conflicts with "
+        "gradient checkpointing; use --no-gradient-checkpointing --compile for speed.",
+    )
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
 
     parser.add_argument("--log-interval", type=int, default=10)
@@ -159,6 +216,18 @@ def main() -> None:
         parser.error("--final-blocks must be greater than or equal to --initial-blocks")
     if not 0.0 <= args.mixture_switch_ratio <= 1.0:
         parser.error("--mixture-switch-ratio must be between 0.0 and 1.0")
+    if args.min_num_loops < 1:
+        parser.error("--min-num-loops must be >= 1")
+    if not 0.0 <= args.loop_curriculum_ratio <= 1.0:
+        parser.error("--loop-curriculum-ratio must be between 0.0 and 1.0")
+    if args.compile and args.gradient_checkpointing:
+        print(
+            "Note: --compile and --gradient-checkpointing both set; "
+            "using gradient checkpointing and skipping torch.compile "
+            "(deep looped training needs recompute more than compile). "
+            "Pass --no-gradient-checkpointing to prefer compile.",
+            flush=True,
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -200,18 +269,33 @@ def main() -> None:
     )
 
     runner = base_model
-    should_compile = args.compile and hasattr(torch, "compile") and not args.gradient_checkpointing
-    if should_compile and device.type != "cuda":
+    # Policy: checkpoint XOR compile. Checkpoint wins when both requested.
+    should_compile = (
+        bool(args.compile)
+        and not bool(args.gradient_checkpointing)
+        and hasattr(torch, "compile")
+    )
+    if args.compile and args.gradient_checkpointing:
+        pass  # already warned at parse time
+    elif should_compile and device.type != "cuda":
         print("Skipping torch.compile: only enabled on CUDA.", flush=True)
         should_compile = False
     if should_compile:
+        print(f"torch.compile enabled (mode={args.compile_mode}).", flush=True)
         runner = torch.compile(runner, mode=args.compile_mode)
-    elif args.compile and args.gradient_checkpointing:
-        print("Skipping torch.compile because gradient checkpointing is enabled.", flush=True)
+    elif args.gradient_checkpointing:
+        print("Gradient checkpointing enabled (torch.compile off).", flush=True)
 
+    max_loops = int(model_config.num_loops)
+    min_loops = min(int(args.min_num_loops), max_loops)
     parameter_count = sum(param.numel() for param in base_model.parameters())
     print(f"Device: {device}")
     print(f"Model parameters: {parameter_count / 1e6:.2f}M")
+    print(
+        f"Loop curriculum: R={min_loops}→{max_loops} over "
+        f"{args.loop_curriculum_ratio:.0%} of tokens "
+        f"(effective depth at max ≈ {model_config.effective_depth})"
+    )
     print(f"Tokenizer vocab size: {len(tokenizer)}")
     if late_train_mixture is None:
         print(f"Training mixture: {args.train_mixture}")
@@ -297,6 +381,12 @@ def main() -> None:
             train_progress = state.tokens_processed / max(args.total_tokens, 1)
             quant_metrics = update_quantization_schedule(base_model, train_progress, args)
             active_blocks = update_block_growth(base_model, train_progress, args)
+            active_loops = loop_count_for_progress(
+                train_progress,
+                min_loops=min_loops,
+                max_loops=max_loops,
+                curriculum_ratio=args.loop_curriculum_ratio,
+            )
             rfmoe_s, rfmoe_alpha = rfmoe_staircase_schedule(train_progress, args)
             mixture_stage, _ = choose_stage_mixture(
                 train_progress,
@@ -324,9 +414,18 @@ def main() -> None:
 
                 with autocast_context(device, amp_enabled, amp_dtype):
                     if args.mtp_depth > 0:
-                        logits, mtp_logits = runner(input_ids, segment_ids=segment_ids, return_mtp=True)
+                        logits, mtp_logits = runner(
+                            input_ids,
+                            segment_ids=segment_ids,
+                            return_mtp=True,
+                            num_loops=active_loops,
+                        )
                     else:
-                        logits, mtp_logits = runner(input_ids, segment_ids=segment_ids), []
+                        logits, mtp_logits = runner(
+                            input_ids,
+                            segment_ids=segment_ids,
+                            num_loops=active_loops,
+                        ), []
                     loss = compute_train_loss(
                         base_model,
                         logits,
@@ -391,6 +490,9 @@ def main() -> None:
                     }
                     if density_controller is not None else {}
                 )
+                loop_metrics = collect_loop_train_metrics(
+                    base_model, active_loops=active_loops
+                )
                 logger.log(
                     state.step,
                     {
@@ -402,6 +504,7 @@ def main() -> None:
                         "active_blocks": float(active_blocks),
                         "mixture_stage_id": 0.0 if mixture_stage == "early" else 1.0,
                         "mixture_switch_ratio": args.mixture_switch_ratio,
+                        **loop_metrics,
                         **rfmoe_metrics,
                         **quant_metrics,
                     },

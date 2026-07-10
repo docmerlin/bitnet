@@ -30,7 +30,23 @@ Key properties:
 - unified hybrid block every layer (`layers/hybrid_block.py`)
 - each block combines:
   - Infini-Attention style local + memory attention
-  - Attention Residuals (AttnRes)
+  - **Sandwich RMSNorm** residual: `post(x + scale * sublayer(pre(x)))` on attn and FFN
+    (pre-norm + residual-stream post-norm; stabilizes looped unrolls)
+  - Attention Residuals (learned scale on each residual branch)
+- **looped / recurrent-depth** layout (default): 8 prelude + 48 unique recurrent × `R` loops + 8 coda
+  - same 64 unique params as a flat 64-layer stack; effective depth = `8 + 48R + 8` (default `R=4` → 208)
+  - CLI: `--num-prelude-layers`, `--num-recurrent-layers`, `--num-coda-layers`, `--num-loops`
+  - flat ablation: `--num-layers N` alone → `(0, N, 0)` with `R=1`
+  - test-time depth: `model(..., num_loops=R)` without new parameters
+  - Infini memory **policy B**: every loop can **read** compressive memory; only the
+    **last** recurrent loop **writes** (no R-fold self-pollution of the bank)
+  - **Hyperloop-style loop HC** (always on for the recurrent core): 4 residual streams,
+    input-dependent `H_pre`/`H_post`, **diagonal** `H_res=diag(σ(·))` (no Sinkhorn),
+    plus loop position embeddings — applied only at loop boundaries (Zeitoun et al.)
+  - **Trainability:** R curriculum (`--min-num-loops`→`--num-loops` over
+    `--loop-curriculum-ratio`, default 1→4 over 20% tokens); gradient checkpointing
+    default on / compile off (XOR); small-scale sublayer outs for deep residual identity;
+    logs `active_loops` + HC/AttnRes health scalars
 - hierarchical tokenizer path under `tokenizer/`
 - streaming Hugging Face dataset training in `train.py`
 
@@ -53,8 +69,8 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 
 ### Top-level BitNet path
 
-- `config.py`: BitNet model and trainer config
-- `model.py`: main `BitNetDeep` model (single forward path; checkpointing + MTP)
+- `config.py`: BitNet model and trainer config (loop structure + effective depth)
+- `model.py`: main `BitNetDeep` model (looped prelude/core/coda forward; checkpointing + MTP)
 - `train.py`: CLI + training loop
 - `data/`: dataset presets, mixture parsing, packing
 - `training/`: losses, schedules, checkpoints, runtime helpers

@@ -30,6 +30,12 @@ def test_hybrid_block():
     )
 
     block = HybridTransformerBlock(config)
+    # Near-identity residual init is for training depth; unscale for path tests.
+    with torch.no_grad():
+        block.infini_attn.o_proj.weight.mul_(100.0)
+        block.ffn_down.weight.mul_(100.0)
+        block.attn_res.scale.fill_(1.0)
+        block.mlp_res.scale.fill_(1.0)
 
     # Test 1: Forward pass shape
     batch_size, seq_len = 2, 16
@@ -81,10 +87,14 @@ def test_hybrid_block():
     block.train()
     block.num_blocks = config.block_size
 
-    # Test 2: Contains both mechanisms + 3-stage dense FFN layout
+    # Test 2: Contains both mechanisms + sandwich norms + 3-stage dense FFN layout
     assert hasattr(block, 'infini_attn'), "Missing InfiniAttention"
     assert hasattr(block, 'attn_res'), "Missing AttentionResidual for attention"
     assert hasattr(block, 'mlp_res'), "Missing AttentionResidual for MLP"
+    assert hasattr(block, 'attn_norm') and hasattr(block, 'mlp_norm'), "Missing pre-norms"
+    assert hasattr(block.attn_res, 'norm') and hasattr(block.mlp_res, 'norm'), (
+        "Missing sandwich post-norms on residual branches"
+    )
     assert hasattr(block, 'gate'), "Missing learned gate"
     assert hasattr(block, 'ffn_up') and hasattr(block, 'ffn_mid') and hasattr(block, 'ffn_down'), (
         "Dense FFN should be three HBitLinear layers (up/mid/down)"
@@ -149,6 +159,38 @@ def test_hybrid_block():
     return True
 
 
+def test_sandwich_residual_renormalizes_stream() -> bool:
+    """post_norm(x + scale * y) bounds residual growth vs branch-only post-norm."""
+    from layers.hybrid_block import AttentionResidual
+
+    torch.manual_seed(0)
+    hidden = 32
+    res = AttentionResidual(hidden, init_scale=1.0, eps=1e-5)
+    # Force identity-ish post-norm scale for a clean magnitude check after many adds.
+    with torch.no_grad():
+        res.norm.weight.fill_(1.0)
+
+    x = torch.randn(2, 4, hidden)
+    delta = torch.randn(2, 4, hidden) * 3.0
+    # Repeated sandwich residuals should not explode RMS the way unnormalized add does.
+    y = x
+    for _ in range(16):
+        y = res(y, delta)
+    rms = y.pow(2).mean(dim=-1).sqrt().mean().item()
+    # RMSNorm keeps last-dim RMS near 1 (weight=1); allow small slack.
+    assert 0.5 < rms < 2.0, f"sandwich residual stream RMS out of band: {rms}"
+
+    # Contract: output is post-norm of (x + scale * sublayer)
+    x0 = torch.randn(1, 2, hidden)
+    s0 = torch.randn(1, 2, hidden)
+    out = res(x0, s0)
+    expected = res.norm(x0 + res.scale * s0)
+    assert torch.allclose(out, expected, atol=1e-6), "AttentionResidual must be sandwich post form"
+    print("Sandwich residual renormalization tests passed")
+    return True
+
+
 if __name__ == "__main__":
     test_hybrid_block()
+    test_sandwich_residual_renormalizes_stream()
     print("\nHybrid block with both mechanisms in every layer is working correctly.")

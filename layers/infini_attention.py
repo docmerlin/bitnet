@@ -145,6 +145,7 @@ class InfiniAttention(nn.Module):
         *,
         attn_bias: Optional[torch.Tensor] = None,
         query_valid: Optional[torch.Tensor] = None,
+        update_memory: Optional[bool] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         qkv = self.qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
@@ -202,7 +203,10 @@ class InfiniAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         output = self.o_proj(context)
 
-        if self.training and self.update_memory_buffers:
+        # Memory is always readable. Writes are optional (loop policy B: write only
+        # on the last recurrent pass). Explicit update_memory overrides the module flag.
+        do_update = self.update_memory_buffers if update_memory is None else update_memory
+        if self.training and do_update:
             with torch.no_grad():
                 self._update_memory(k, v)
 

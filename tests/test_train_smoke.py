@@ -51,7 +51,7 @@ def test_single_training_step_updates_parameters() -> bool:
     model = BitNetDeep(config)
     optimizer = create_optimizer(model, _tiny_args())
 
-    before = model.layers[0].gate.item()
+    before = model.layers[0].ffn_up.weight.detach().clone()
     input_ids = torch.randint(0, config.vocab_size, (2, 16))
     labels = input_ids.clone()
 
@@ -61,9 +61,9 @@ def test_single_training_step_updates_parameters() -> bool:
     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
     loss.backward()
     optimizer.step()
-    after = model.layers[0].gate.item()
+    after = model.layers[0].ffn_up.weight.detach()
 
-    assert after != before, "Expected at least one parameter to change after one optimizer step"
+    assert not torch.equal(after, before), "Expected at least one parameter to change after one optimizer step"
     print("BitNet single-step training smoke tests passed")
     return True
 

@@ -1,6 +1,7 @@
 """Main BitNetDeep model.
 
 Every Transformer layer contains BOTH Infini-Attention and Attention Residuals.
+Depth is looped: unique prelude once, recurrent stack × R, unique coda once.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from torch.utils.checkpoint import checkpoint
 
 from config import TernaryConfig
 from layers.hybrid_block import HybridTransformerBlock
+from layers.loop_mhc import LoopHyperConnection
 from utils import (
     causal_block_attention_bias,
     combine_attention_bias,
@@ -26,14 +28,31 @@ class BitNetDeep(nn.Module):
     Training knobs on the model:
     - ``gradient_checkpointing`` freezes Infini memory for recompute-safe backward
     - ``return_mtp=True`` also returns multi-token-prediction logits
+    - ``num_loops`` on forward overrides config for test-time depth scaling
 
     Always: full-precision lm_head, tied embed/unembed, per-head QK norm.
+
+    Layer layout (flat ``self.layers`` for checkpoint key stability):
+    ``layers[0:P]`` prelude once → ``layers[P:P+R]`` recurrent × loops →
+    ``layers[P+R:]`` coda once. Infini memory accumulates across all applications
+    within a forward; reset only when ``reset_memory=True``.
+
+    Recurrent core uses Hyperloop-style loop-boundary hyper-connections: 4 residual
+    streams, input-dependent pre/post, diagonal ``H_res`` (no Sinkhorn). Always on
+    when the recurrent stack runs; not exposed as config knobs.
+
+    Infini memory policy (B): every recurrent loop **reads** compressive memory;
+    only the **last** loop **writes** it (avoids R-fold self-pollution of the bank).
     """
 
     def __init__(self, config: Optional[TernaryConfig] = None):
         super().__init__()
         self.config = config or TernaryConfig()
         self.gradient_checkpointing = False
+
+        self.num_prelude = int(self.config.num_prelude_layers)
+        self.num_recurrent = int(self.config.num_recurrent_layers)
+        self.num_coda = int(self.config.num_coda_layers)
 
         self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
         self.norm = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
@@ -42,6 +61,12 @@ class BitNetDeep(nn.Module):
         self.layers = nn.ModuleList(
             HybridTransformerBlock(self.config)
             for _ in range(self.config.num_hidden_layers)
+        )
+
+        # Hyperloop loop-boundary HC (hardcoded 4 streams, diagonal H_res).
+        self.loop_hc = LoopHyperConnection(
+            hidden_size=self.config.hidden_size,
+            rms_norm_eps=self.config.rms_norm_eps,
         )
 
         # Full-precision output projection; tied to embeddings.
@@ -59,6 +84,8 @@ class BitNetDeep(nn.Module):
 
         self.apply(self._init_weights)
         self.lm_head.weight = self.embed_tokens.weight
+        # Re-apply HC-friendly biases after global init (do not wipe with N(0, σ)).
+        self.loop_hc._init_identity_friendly()
 
     def mtp_logits(self, hidden: torch.Tensor) -> list[torch.Tensor]:
         """Per-depth logits from the final hidden. Depth i predicts offset i+2."""
@@ -100,6 +127,41 @@ class BitNetDeep(nn.Module):
             device=x.device,
         )
 
+    def _run_layer(
+        self,
+        layer: HybridTransformerBlock,
+        x: torch.Tensor,
+        attn_bias: Optional[torch.Tensor],
+        query_valid: Optional[torch.Tensor],
+        *,
+        update_memory: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if self.gradient_checkpointing and self.training:
+            # Freeze Infini memory for recompute-safe backward (no double-write).
+            layer_memory_state = layer.infini_attn.get_memory_state()
+            return checkpoint(
+                lambda hidden_states, layer=layer, attn_bias=attn_bias, query_valid=query_valid, update_memory=update_memory: layer(
+                    hidden_states,
+                    attn_bias=attn_bias,
+                    query_valid=query_valid,
+                    update_memory=update_memory,
+                ),
+                x,
+                use_reentrant=False,
+                context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: (
+                    contextlib.nullcontext(),
+                    layer.infini_attn.use_memory_state(
+                        layer_memory_state, update_memory_buffers=False
+                    ),
+                ),
+            )
+        return layer(
+            x,
+            attn_bias=attn_bias,
+            query_valid=query_valid,
+            update_memory=update_memory,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -107,6 +169,7 @@ class BitNetDeep(nn.Module):
         reset_memory: bool = True,
         segment_ids: Optional[torch.Tensor] = None,
         return_mtp: bool = False,
+        num_loops: Optional[int] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, list[torch.Tensor]]]:
         if reset_memory:
             for layer in self.layers:
@@ -119,25 +182,43 @@ class BitNetDeep(nn.Module):
         x = self.subln(x)
         attn_bias, query_valid = self._build_shared_attention_bias(x, attention_mask)
 
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                # All layers are HybridTransformerBlock; freeze Infini memory for recompute.
-                layer_memory_state = layer.infini_attn.get_memory_state()
-                x = checkpoint(
-                    lambda hidden_states, layer=layer, attn_bias=attn_bias, query_valid=query_valid: layer(
-                        hidden_states, attn_bias=attn_bias, query_valid=query_valid
-                    ),
-                    x,
-                    use_reentrant=False,
-                    context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: (
-                        contextlib.nullcontext(),
-                        layer.infini_attn.use_memory_state(
-                            layer_memory_state, update_memory_buffers=False
-                        ),
-                    ),
+        p = self.num_prelude
+        r = self.num_recurrent
+        loops = int(self.config.num_loops if num_loops is None else num_loops)
+        if loops < 1:
+            raise ValueError("num_loops must be >= 1")
+
+        # Prelude once
+        for layer in self.layers[:p]:
+            x = self._run_layer(layer, x, attn_bias, query_valid)
+
+        # Recurrent core × R with Hyperloop-style HC at each loop boundary.
+        # Infini policy B: read every loop; write compressive memory only on last loop.
+        recurrent = self.layers[p : p + r]
+        if r > 0:
+            y = self.loop_hc.expand(x)  # (B, T, n=4, C)
+            for loop_i in range(loops):
+                write_memory = loop_i == loops - 1
+                x_in, _h_pre, h_post, h_res = self.loop_hc.project_in(y)
+                for layer in recurrent:
+                    x_in = self._run_layer(
+                        layer,
+                        x_in,
+                        attn_bias,
+                        query_valid,
+                        update_memory=write_memory,
+                    )
+                e_l = self.loop_hc.loop_embedding(
+                    loop_i, device=x_in.device, dtype=x_in.dtype
                 )
-            else:
-                x = layer(x, attn_bias=attn_bias, query_valid=query_valid)
+                u = x_in + e_l
+                y = self.loop_hc.write_back(y, u, h_post, h_res)
+            x = self.loop_hc.fold(y)
+        # else: no recurrent core — prelude output flows straight to coda
+
+        # Coda once (default write policy; outside the recurrent last-write rule)
+        for layer in self.layers[p + r :]:
+            x = self._run_layer(layer, x, attn_bias, query_valid)
 
         x = self.norm(x)
         logits = self.lm_head(x)

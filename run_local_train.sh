@@ -3,10 +3,11 @@ set -euo pipefail
 
 # Reasonable local training profile for weak hardware.
 #
-# This intentionally uses a smaller model than the full 64-layer / 1024-hidden
-# research target so the end-to-end training stack can run on a Mac Mini or
-# similar machine. Remove the model-shape overrides below to train the full
-# configuration from config.py.
+# Smaller looped shape than the full research target so the end-to-end training
+# stack can run on a Mac Mini or similar machine:
+# - 2 prelude + 4 recurrent × 4 loops + 2 coda (8 unique, effective depth 20)
+# Remove the model-shape overrides below to train the full configuration from
+# config.py (8/48/8 × R=4).
 
 python3 train.py \
   --output-dir runs/bitnet_local \
@@ -24,7 +25,12 @@ python3 train.py \
   --initial-blocks 8 \
   --final-blocks 16 \
   --hidden-size 512 \
-  --num-layers 12 \
+  --num-prelude-layers 2 \
+  --num-recurrent-layers 4 \
+  --num-coda-layers 2 \
+  --num-loops 4 \
+  --min-num-loops 1 \
+  --loop-curriculum-ratio 0.2 \
   --num-heads 16 \
   --intermediate-size 1024 \
   --vocab-size 32768 \

@@ -3,9 +3,10 @@ set -euo pipefail
 
 # Full training profile for regular GPU hardware.
 #
-# This uses the intended research model shape:
+# Intended research model shape (looped recurrent-depth):
 # - hidden size 1024
-# - 64 layers
+# - 8 prelude + 48 unique recurrent × 4 loops + 8 coda (64 unique params)
+# - effective depth 8+192+8 = 208
 # - 32 heads
 # - 128k hierarchical vocabulary target
 # - early broad web/data mixture
@@ -13,7 +14,7 @@ set -euo pipefail
 #
 # The defaults below assume a reasonably capable CUDA machine. If you have less
 # VRAM, reduce --sequence-length, keep --micro-batch-size at 1, and increase
-# --grad-accumulation-steps.
+# --grad-accumulation-steps. Drop --num-loops to 1 for a flat 64-layer stack.
 
 python3 train.py \
   --output-dir runs/bitnet_full \
@@ -33,13 +34,18 @@ python3 train.py \
   --initial-blocks 8 \
   --final-blocks 32 \
   --hidden-size 1024 \
-  --num-layers 64 \
+  --num-prelude-layers 8 \
+  --num-recurrent-layers 48 \
+  --num-coda-layers 8 \
+  --num-loops 4 \
+  --min-num-loops 1 \
+  --loop-curriculum-ratio 0.2 \
   --num-heads 32 \
   --intermediate-size 2048 \
   --vocab-size 131072 \
   --precision bf16 \
   --gradient-checkpointing \
-  --compile \
+  --no-compile \
   --log-interval 10 \
   --eval-interval 250 \
   --save-interval 500
