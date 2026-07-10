@@ -20,12 +20,15 @@ from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
 from layers.rfmoe import RFMoE
 
+# Near-identity residual under deep unrolls; still nonzero for grad flow.
+SUBLAYER_OUT_INIT_SCALE = 0.01
+
 
 class AttentionResidual(nn.Module):
-    """Sandwich residual branch: post_norm(x + scale * sublayer_out).
+    """Sandwich residual post-norm: ``post_norm(x + scale * sublayer_out)``.
 
-    Paired with a pre-norm before the sublayer (owned by ``HybridTransformerBlock``)
-    this is full sandwich RMSNorm around attention / FFN.
+    Name is historical (AttnRes scale); paired with pre-norm on the block this is
+    full sandwich RMSNorm around attention / FFN.
     """
 
     def __init__(self, hidden_size: int, init_scale: float = 0.1, eps: float = 1e-5):
@@ -93,9 +96,8 @@ class HybridTransformerBlock(nn.Module):
         # sigmoid(0)=0.5 at init: attention path starts damped.
         self.gate = nn.Parameter(torch.zeros(1))
 
-        # Deep / looped residual: shrink last proj of each sublayer so sandwich
-        # residual starts near pass-through while gradients still flow (R>1).
-        self._scale_sublayer_outputs(0.01)
+        # Deep / looped residual: shrink last proj so sandwich starts near pass-through.
+        self._scale_sublayer_outputs(SUBLAYER_OUT_INIT_SCALE)
 
     def _scale_sublayer_outputs(self, scale: float) -> None:
         with torch.no_grad():

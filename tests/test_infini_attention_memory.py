@@ -55,12 +55,19 @@ def test_infini_attention_memory_updates() -> bool:
     assert not torch.allclose(initial_state["memory_k"], updated_state["memory_k"]), "Training forward should update memory"
     assert not torch.allclose(initial_state["memory_v"], updated_state["memory_v"]), "Training forward should update memory"
 
+    # Eval may update when allowed (multi-segment). Freeze flag still blocks writes.
     block.eval()
-    eval_state = block.infini_attn.get_memory_state()
-    _ = block(x)
-    post_eval_state = block.infini_attn.get_memory_state()
-    assert torch.allclose(eval_state["memory_k"], post_eval_state["memory_k"]), "Eval forward should not mutate memory_k"
-    assert torch.allclose(eval_state["memory_v"], post_eval_state["memory_v"]), "Eval forward should not mutate memory_v"
+    frozen = block.infini_attn.get_memory_state()
+    with block.infini_attn.use_memory_state(frozen, update_memory_buffers=False):
+        _ = block(x)
+    assert torch.allclose(frozen["memory_k"], block.infini_attn.memory_k), (
+        "Frozen eval path must not mutate memory"
+    )
+    block.infini_attn.reset_memory()
+    _ = block(x)  # default update_memory=None → write allowed in eval
+    assert not torch.allclose(
+        block.infini_attn.memory_k, torch.zeros_like(block.infini_attn.memory_k)
+    ), "Eval forward should update memory when writes are allowed"
 
     print("InfiniAttention memory update gating tests passed")
     return True

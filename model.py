@@ -21,38 +21,33 @@ from utils import (
     document_attention_keep_mask,
 )
 
-# "layer" = checkpoint each HybridTransformerBlock (max VRAM save, more recompute).
-# "loop"  = checkpoint each full recurrent pass (fewer recomputes; default for deep R).
-CheckpointGranularity = str  # Literal["layer", "loop"] preferred at call sites
+# Checkpoint granularity:
+#   layer — max VRAM save (recompute each block); slowest
+#   loop  — recompute each full mid-stack pass (default); fewer segments, higher peak
+#           acts within a pass than layer mode
+CheckpointGranularity = str  # "layer" | "loop"
 
 
 class BitNetDeep(nn.Module):
     """Deep ternary LLM: hybrid blocks, ternary projections, tied embeddings.
 
-    Training knobs on the model:
-    - ``gradient_checkpointing`` + ``checkpoint_granularity`` (``layer`` | ``loop``)
-    - ``return_mtp=True`` also returns multi-token-prediction logits
-    - ``num_loops`` on forward overrides config for test-time depth scaling
+    Control flow::
 
-    Always: full-precision lm_head, tied embed/unembed, per-head QK norm.
+        embed → subln
+        → prelude layers (once; Infini may write)
+        → for r in 1..R:
+              HC.project_in → recurrent stack → +e_r → HC.write_back
+              (Infini: read every pass; write only on last r)
+        → mean streams → coda → norm → lm_head
 
-    Layer layout (flat ``self.layers`` for checkpoint key stability):
-    ``layers[0:P]`` prelude once → ``layers[P:P+R]`` recurrent × loops →
-    ``layers[P+R:]`` coda once.
-
-    Recurrent core uses Hyperloop-style loop-boundary hyper-connections: 4 residual
-    streams, input-dependent pre/post, diagonal ``H_res`` (no Sinkhorn). Always on
-    when the recurrent stack runs; not exposed as config knobs.
-
-    Infini memory policy (B): every recurrent loop **reads** compressive memory;
-    only the **last** loop **writes** it (avoids R-fold self-pollution of the bank).
+    Knobs: ``gradient_checkpointing`` + ``checkpoint_granularity`` (loop|layer),
+    ``num_loops`` override on forward, ``return_mtp``.
     """
 
     def __init__(self, config: Optional[TernaryConfig] = None):
         super().__init__()
         self.config = config or TernaryConfig()
         self.gradient_checkpointing = False
-        # Default "loop": one recompute per recurrent iteration (not per mid layer).
         self.checkpoint_granularity: CheckpointGranularity = "loop"
 
         self.num_prelude = int(self.config.num_prelude_layers)
@@ -294,12 +289,11 @@ class BitNetDeep(nn.Module):
         if loops < 1:
             raise ValueError("num_loops must be >= 1")
 
-        # Prelude once (layer-granularity checkpoint when enabled)
+        # Prelude once (may seed Infini memory; recurrent early loops can read it).
         for layer in self.layers[:p]:
             x = self._run_layer(layer, x, attn_bias, query_valid)
 
-        # Recurrent core × R with Hyperloop-style HC at each loop boundary.
-        # Infini policy B: read every loop; write compressive memory only on last loop.
+        # Recurrent × R + Hyperloop HC. Infini B: read all loops, write last only.
         recurrent = self.layers[p : p + r]
         if r > 0:
             y = self.loop_hc.expand(x)  # (B, T, n=4, C)

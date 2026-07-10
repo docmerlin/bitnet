@@ -194,9 +194,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--checkpoint-granularity",
         choices=("loop", "layer"),
         default="loop",
-        help="When checkpointing: 'loop' recomputes each full recurrent pass "
-        "(fewer segments, faster; default). 'layer' checkpoints every block "
-        "(max VRAM save, more recompute).",
+        help="When checkpointing: 'loop' = one recompute per mid-stack pass "
+        "(default; fewer segments, higher peak acts within a pass). "
+        "'layer' = every block (max VRAM save, more recompute).",
     )
     parser.add_argument(
         "--compile",

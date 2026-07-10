@@ -61,6 +61,10 @@ class InfiniAttention(nn.Module):
             torch.zeros(num_heads, self.memory_dim, self.head_dim),
             persistent=False,
         )
+        # RoPE cache: (seq_len, device, dtype, scale_factor) -> (cos, sin)
+        self._rope_cache_key: Optional[tuple] = None
+        self._rope_cos: Optional[torch.Tensor] = None
+        self._rope_sin: Optional[torch.Tensor] = None
 
     def _load_from_state_dict(
         self,
@@ -101,6 +105,11 @@ class InfiniAttention(nn.Module):
 
     @contextlib.contextmanager
     def use_memory_state(self, state: dict[str, torch.Tensor], *, update_memory_buffers: bool = True):
+        """Temporarily load ``state`` (and optionally freeze writes).
+
+        Intended for gradient-checkpoint **recompute** only: on exit, restores the
+        prior buffers/flag so a no-write recompute cannot clobber post-forward memory.
+        """
         previous_state = self.get_memory_state()
         previous_update = self.update_memory_buffers
         self.load_memory_state(state)
@@ -118,6 +127,27 @@ class InfiniAttention(nn.Module):
         original = rope_scaling.get("original_max_position_embeddings", seq_len)
         factor = rope_scaling.get("factor", 1.0)
         return float(factor if seq_len > original else 1.0)
+
+    def _get_rope(self, seq_len: int, *, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        scale = self._rope_scaling_factor(seq_len)
+        key = (seq_len, device.type, device.index, str(dtype), scale)
+        if (
+            self._rope_cache_key != key
+            or self._rope_cos is None
+            or self._rope_sin is None
+            or self._rope_cos.device != device
+        ):
+            cos, sin = build_rope_cache(
+                seq_len=seq_len,
+                dim=self.head_dim,
+                theta=self.config.rope_theta,
+                scaling_factor=scale,
+                device=device,
+            )
+            self._rope_cache_key = key
+            self._rope_cos = cos
+            self._rope_sin = sin
+        return self._rope_cos, self._rope_sin
 
     def _update_memory(self, k: torch.Tensor, v: torch.Tensor) -> None:
         """Compress the current sequence into the fixed-size memory buffers."""
@@ -157,13 +187,7 @@ class InfiniAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        cos, sin = build_rope_cache(
-            seq_len=seq_len,
-            dim=self.head_dim,
-            theta=self.config.rope_theta,
-            scaling_factor=self._rope_scaling_factor(seq_len),
-            device=x.device,
-        )
+        cos, sin = self._get_rope(seq_len, device=x.device, dtype=q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
@@ -203,13 +227,12 @@ class InfiniAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         output = self.o_proj(context)
 
-        # Memory is always readable. Writes need both:
-        # - caller request (update_memory / default module flag), and
-        # - module flag still True (checkpoint recompute freezes the flag so an
-        #   explicit update_memory=True cannot double-write on recompute).
+        # Always readable. Writes when requested AND module flag allows (ckpt recompute
+        # freezes the flag). Allowed in eval too so multi-segment decode can accumulate
+        # with reset_memory=False.
         requested = self.update_memory_buffers if update_memory is None else bool(update_memory)
         do_update = requested and self.update_memory_buffers
-        if self.training and do_update:
+        if do_update:
             with torch.no_grad():
                 self._update_memory(k, v)
 

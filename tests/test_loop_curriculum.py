@@ -42,8 +42,11 @@ def test_small_sublayer_output_init() -> bool:
     ref = HBitLinear(64, 64, bias=False, config=cfg)
     block = HybridTransformerBlock(cfg)
     ref_rms = ref.weight.float().pow(2).mean().sqrt().item()
+    from layers.hybrid_block import SUBLAYER_OUT_INIT_SCALE
+
     out_rms = block.infini_attn.o_proj.weight.float().pow(2).mean().sqrt().item()
     assert out_rms < 0.2 * ref_rms, f"o_proj should be downscaled, {out_rms} vs {ref_rms}"
+    assert 0.0 < SUBLAYER_OUT_INIT_SCALE < 1.0
     x = torch.randn(1, 4, 64)
     y = block(x)
     assert y.shape == x.shape
