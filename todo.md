@@ -8,7 +8,35 @@ stay VRAM-resident; offload cold tail. Self-gating experts → also extensible
 
 ## Status
 
-Shipped (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
+**Training status: COLD / phase 1 smoke complete.** Only two diagnostic optimization
+steps (128 tokens) have run. No usable trained checkpoint, baseline, convergence result,
+or downstream evaluation exists yet. Items below are implemented and unit-tested, not
+empirically validated by a real training run.
+
+Training progress:
+- [x] Model, loss, curriculum, checkpoint, and RFMoE append paths implemented.
+- [x] Unit tests pass.
+- [x] Phase 1: run a short end-to-end smoke train; verify finite loss, gradients,
+  checkpoint save/resume, and memory/runtime behavior.
+- [ ] Phase 2: choose data and model scale; train the first base model from scratch.
+- [ ] Phase 3: evaluate base-model loss/quality, RFMoE density, expert usage, locality,
+  loop health, and inference performance.
+- [ ] Phase 4: only after a usable base checkpoint exists, append experts and run the
+  new-domain retention/specialization experiment.
+
+Phase 1 smoke result (2026-07-11, MPS, FineWeb-Edu, 0.03M-parameter RFMoE diagnostic):
+- Step 1: 64 tokens, train loss 6.24388, grad norm 1.38943, val loss 6.20489.
+- Resumed from saved checkpoint for step 2: 128 total tokens, train loss 6.23199,
+  grad norm 1.38470, val loss 6.20075; final checkpoint saved under `runs/smoke-resume/`.
+- RFMoE density was 1.0, expected during flat warmup; no sparsity conclusion possible.
+- MPS requires sequence length divisible by Infini-Attention memory dimension 64;
+  training CLI now rejects incompatible lengths before startup.
+- This proves wiring only. Token count and model size are intentionally too small for
+  quality, convergence, throughput, or RFMoE specialization claims.
+- PaTH-FoX follow-up smoke (MPS): two checkpointed RFMoE steps with 16-token local
+  windows completed and resumed successfully; loss stayed finite (6.28328 → 6.27290).
+
+Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
 - RFMoE self-gating FFN, off by default behind `use_rfmoe`. θ inference knob.
 - Adaptive-λ density control → global density target. `--rfmoe-density-target/-eta`.
 - Staircase locality loss KL(π‖sorted p), EMA-ranked stop-grad. `--rfmoe-locality-coef/-zipf-s/-uniform-alpha`.
@@ -20,21 +48,38 @@ Shipped (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
   Infini policy B: read every loop, write only last recurrent loop. Eval override: `num_loops=`.
 - **Hyperloop loop HC** (`layers/loop_mhc.py`): 4 streams, diagonal `H_res` (no Sinkhorn),
   pre/post + loop embeds at each recurrent iteration. Hardcoded, not config knobs.
+- RFMoE grouped/padded GEMM execution: scores batch across experts; active token/expert pairs
+  pack into batched expert-body matmuls while checkpoint parameter keys stay stable.
+- Ternary RFMoE experts: all score, gate, and body projections use `HBitLinear` weight/
+  activation quantization while retaining grouped execution.
+- Extensible RFMoE primitive: append cold experts dynamically, inherit quantization state,
+  grow usage buffers, freeze old model weights, and train only appended experts with existing
+  diversity loss as niche objective. Model config tracks new count for checkpoint reconstruction.
+- PaTH-FoX replaces RoPE/YaRN in the BitNet path: low-rank data-dependent Householder
+  transitions plus forget gates use paper-exact logits. Local UT attention is capped by
+  `--path-window-size` (64 default), so attention storage/work stays linear in total context;
+  fixed-size Infini memory carries compressed information beyond local windows. BLT keeps RoPE.
 
 ## Next actions
 
-1. **PERF (blocker for any real run):** RFMoE forward is per-expert Python loop (O(N) launches).
-   Batch into grouped/padded GEMM. Current form validation-only.
-2. **Ternary experts:** `RFMoEExpert` uses `nn.Linear` — swap to `HBitLinear` (Hadamard + ternary STE)
-   once design frozen, stay 1.58-bit.
-3. **Extensible MoE (thread 2):** `add_expert` primitive + freeze-and-train-new-expert loop + niche-finding.
-   Not in tree yet (Yagni until this thread is live).
-4. **Serving:** tier experts by usage (hot→VRAM, warm→RAM, cold→SSD), offload + prefetch.
+1. **First smoke train:** use a small configuration and short run to validate the complete
+   data→forward→loss→backward→optimizer→checkpoint/resume path. This is not a quality run.
+2. **First base-model run:** choose dataset, tokenizer/checkpoint strategy, model scale,
+   token budget, batch/accumulation, and evaluation cadence; then train from scratch.
+3. **Base-model evaluation:** establish loss/quality baseline and measure RFMoE density,
+   expert usage/locality, loop health, PaTH long-context retrieval, throughput, and memory
+   before adding experts. Compare 8K/16K/32K/64K contexts and local-window ablations.
+4. **Extensible MoE experiment:** choose domain/task boundary, append experts flat (`b≈0`),
+   train new-only with diversity, then raise bias into cold tier and measure retained old-domain loss.
+5. **Serving:** tier experts by usage (hot→VRAM, warm→RAM, cold→SSD), offload + prefetch.
    Optional temporal-stickiness loss (penalize active-set change token-to-token → less page thrash).
-5. **Diffusion (thread 3):** large new direction; locality reg (built) is prerequisite (see below).
-6. **Looped follow-ups (optional):** stochastic/Poisson R, input injection each loop,
+6. **PaTH performance:** replace the current correct PyTorch PaTH-FoX UT reference path with
+   a full optimized Triton kernel (FlashLinearAttention-style block scan, online softmax,
+   efficient transformed-query/key preprocessing, and decode/cache support).
+7. **Diffusion (thread 3):** large new direction; locality reg (built) is prerequisite (see below).
+8. **Looped follow-ups (optional):** stochastic/Poisson R, input injection each loop,
    adaptive halt at eval, thinner middle rebalance.
-7. **Shipped trainability (2026-07):** R curriculum (`--min-num-loops` → `--num-loops` over
+9. **Implemented trainability (2026-07):** R curriculum (`--min-num-loops` → `--num-loops` over
    `--loop-curriculum-ratio`), loop health metrics in logger, checkpoint XOR compile
    (checkpoint default on), ×0.01 init scale on attn `o_proj` + FFN down for deep residual.
 
@@ -77,8 +122,9 @@ Why self-gating enables it: standard router `G∈D×N` bakes in N — adding exp
 routing (softmax over N), breaks load balance, needs router retrain. RFMoE has no central router: append
 `{W_up, W_mid, W_down, A_gate, B_gate, b_i}`, existing fire decisions unchanged, residual-add preserves old behavior when frozen.
 
-Procedure: append with HIGH b_i (cold) → freeze everything else → train new expert on new domain → push
-into unclaimed niche (diversity term) → re-tune θ so density stays pinned (else cost grows with N).
+Procedure, after base training: append with low b_i so the new expert receives gradients → freeze
+everything else → train it on a new domain → push into an unclaimed niche (diversity term) → raise
+b_i into the cold tier → re-tune θ so density stays pinned (else cost grows with N).
 
 Hard problems: niche-finding (bias too high=dead, too low=duplicates) is THE problem; density drift with N;
 joint-optimality loss vs from-scratch (frozen olds can't co-adapt); new-expert under-training (train flat

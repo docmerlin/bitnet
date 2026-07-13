@@ -1,22 +1,20 @@
 """Validation tests for model configuration edge cases."""
 
 from config import TernaryConfig
+from blt.config import TernaryBLTConfig
+from train import build_arg_parser
 
 
-def test_odd_head_dim_is_rejected() -> bool:
-    try:
-        TernaryConfig(
-            vocab_size=32,
-            hidden_size=15,
-            num_hidden_layers=1,
-            num_attention_heads=3,
-            head_dim=5,
-            intermediate_size=30,
-        )
-    except ValueError as exc:
-        assert "head_dim must be even" in str(exc)
-    else:
-        raise AssertionError("TernaryConfig should reject odd head dimensions for rotary embeddings")
+def test_head_dimensions_are_validated() -> bool:
+    config = TernaryConfig(
+        vocab_size=32,
+        hidden_size=15,
+        num_hidden_layers=1,
+        num_attention_heads=3,
+        head_dim=5,
+        intermediate_size=30,
+    )
+    assert config.head_dim == 5  # PaTH does not require paired rotary dimensions.
 
     try:
         TernaryConfig(
@@ -92,6 +90,27 @@ def test_loop_structure_validation() -> bool:
     return True
 
 
+def test_blt_decoder_cross_attention_dimension_is_validated() -> None:
+    try:
+        TernaryBLTConfig(decoder_dim=40, n_heads_cross=8)
+    except ValueError as exc:
+        assert "decoder cross-attention head_dim" in str(exc)
+    else:
+        raise AssertionError("BLT config should reject odd decoder cross-attention head dimensions")
+
+
+def test_train_sequence_length_must_match_infini_memory_dimension() -> None:
+    parser = build_arg_parser()
+    try:
+        parser.parse_args(["--sequence-length", "16"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("train CLI should reject sequence lengths not divisible by 64")
+
+    assert parser.parse_args(["--sequence-length", "64"]).sequence_length == 64
+
+
 if __name__ == "__main__":
-    test_odd_head_dim_is_rejected()
+    test_head_dimensions_are_validated()
     test_loop_structure_validation()

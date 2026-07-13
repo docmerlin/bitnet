@@ -164,8 +164,11 @@ def test_infini_memory_write_only_last_loop() -> bool:
     with torch.no_grad():
         model(input_ids, reset_memory=True, num_loops=3)
 
-    # One middle layer × only last of 3 loops → exactly one write.
-    assert writes["n"] == 1, f"expected 1 memory write (last loop only), got {writes['n']}"
+    # Only final loop writes; one update per bounded local chunk lets later chunks read it.
+    expected_writes = len(list(attn._chunk_ranges(input_ids.size(1))))
+    assert writes["n"] == expected_writes, (
+        f"expected {expected_writes} final-loop chunk writes, got {writes['n']}"
+    )
     assert not torch.allclose(attn.memory_k, torch.zeros_like(attn.memory_k)), (
         "last loop should leave non-zero Infini memory"
     )
@@ -173,7 +176,7 @@ def test_infini_memory_write_only_last_loop() -> bool:
     writes["n"] = 0
     with torch.no_grad():
         model(input_ids, reset_memory=True, num_loops=1)
-    assert writes["n"] == 1, "R=1 still writes once (that loop is the last)"
+    assert writes["n"] == expected_writes, "R=1 still writes each chunk in its final loop"
 
     print("Infini memory write-only-last-loop tests passed")
     return True

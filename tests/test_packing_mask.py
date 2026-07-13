@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 
 import torch
 
@@ -10,7 +11,7 @@ from utils import (
     combine_attention_bias,
     document_attention_keep_mask,
 )
-from data.streams import PackedSequenceStream
+from data.streams import PackedSequenceStream, TextDatasetStream
 
 
 def test_document_keep_mask_is_block_diagonal() -> bool:
@@ -77,12 +78,30 @@ def test_packed_stream_partitions_and_rebases_documents() -> bool:
     # 4 'a' tokens + 2 'b' tokens fill the window; ids start at 0.
     assert first["segment_ids"].tolist() == [0, 0, 0, 0, 1, 1], first["segment_ids"].tolist()
     assert first["input_ids"].shape == first["segment_ids"].shape
+    assert first["label_segment_ids"].tolist() == [0, 0, 0, 1, 1, 1]
 
     second = next(stream)
     # Next window leads with leftover 'b' tokens, then 'c'/'d'; ids are re-based to 0.
     assert second["segment_ids"].tolist() == [0, 0, 1, 1, 1, 1], second["segment_ids"].tolist()
     print("packed-stream document partition tests passed")
     return True
+
+
+def test_restartable_stream_rejects_pass_without_text() -> None:
+    stream = TextDatasetStream.__new__(TextDatasetStream)
+    stream.source = SimpleNamespace(path="broken", text_field="text")
+    stream.restart_on_eof = True
+    stream.restart_count = 0
+    stream.yielded_this_pass = False
+    stream.iterator = iter([{"wrong_field": 1}])
+    stream._build_iterator = lambda: iter([])
+
+    try:
+        next(stream)
+    except ValueError as exc:
+        assert "produced no non-empty text records" in str(exc)
+    else:
+        raise AssertionError("malformed dataset should not restart forever")
 
 
 if __name__ == "__main__":

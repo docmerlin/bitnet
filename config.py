@@ -1,6 +1,6 @@
 """Configuration for the deep ternary (1.58-bit) LLM based on BitNet b1.58."""
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -11,8 +11,9 @@ class TernaryConfig:
     - Hidden size 1024 (power of 2, friendly for Hadamard transform)
     - Looped depth: unique prelude + recurrent core × R + coda (default 8+48×R+8)
     - RMSNorm + SubLN (extra sub-layer norm for ternary weight stability)
-    - RoPE with YaRN/NTK scaling for long context
+    - PaTH-FoX data-dependent positions inside bounded local windows
     - EVERY layer uses BOTH Infini-Attention and sandwich RMSNorm AttnRes residuals
+    - Selected layers add DeepSeek Engram-style conditional N-gram memory
     - Hierarchical tokenizer targets a 128k-token byte-and-merge vocabulary
     - Always: tied embeddings, full-precision lm_head, per-head QK norm
 
@@ -32,14 +33,24 @@ class TernaryConfig:
     # vs the classic 2-mat FFN; power-of-two intermediate also enables Hadamard on mid.
     intermediate_size: int = 2048
     rms_norm_eps: float = 1e-5
-    rope_theta: float = 10000.0
-    rope_scaling: dict = None  # YaRN/NTK params set in __post_init__
     initializer_range: float = 0.02
 
     # Hybrid block parameters (every layer now uses both Infini-Attention + AttnRes)
     block_size: int = 8          # Number of local blocks for attention residual (supports progressive growth)
+    path_window_size: int = 64   # Hard cap for PaTH-FoX local attention work
     infini_memory_dim: int = 64  # Compressive memory dimension per head for Infini-Attention
     attn_res_init_scale: float = 0.1  # Initial scale for Attention Residual connections
+
+    # DeepSeek Engram conditional N-gram memory. Small defaults suit local hardware.
+    use_engram: bool = True
+    engram_layer_ids: Tuple[int, ...] = (1, 15)
+    engram_vocab_size: int = 4093       # Slots per hash table
+    engram_max_ngram_size: int = 3      # Bigram + trigram tables
+    engram_num_heads: int = 4
+    engram_head_dim: int = 16
+    engram_kernel_size: int = 4
+    engram_pad_id: int = 257
+    engram_seed: int = 0
 
     # Ternary training / inference
     use_hadamard: bool = True
@@ -65,16 +76,23 @@ class TernaryConfig:
     num_loops: Optional[int] = None
 
     def __post_init__(self):
-        if self.rope_scaling is None:
-            self.rope_scaling = {
-                "type": "yarn",
-                "factor": 4.0,
-                "original_max_position_embeddings": 4096,
-            }
         if self.head_dim * self.num_attention_heads != self.hidden_size:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for rotary embeddings")
+        if self.path_window_size < 1:
+            raise ValueError("path_window_size must be positive")
+        if self.engram_vocab_size < 1:
+            raise ValueError("engram_vocab_size must be positive")
+        if self.engram_max_ngram_size < 2:
+            raise ValueError("engram_max_ngram_size must be >= 2")
+        if self.engram_num_heads < 1 or self.engram_head_dim < 1:
+            raise ValueError("Engram head count and dimension must be positive")
+        if self.engram_kernel_size < 1:
+            raise ValueError("engram_kernel_size must be positive")
+        self.engram_layer_ids = tuple(int(layer_id) for layer_id in self.engram_layer_ids)
+        if len(set(self.engram_layer_ids)) != len(self.engram_layer_ids) or any(
+            layer_id < 0 for layer_id in self.engram_layer_ids
+        ):
+            raise ValueError("engram_layer_ids must contain unique non-negative IDs")
 
         self._resolve_layer_structure()
 

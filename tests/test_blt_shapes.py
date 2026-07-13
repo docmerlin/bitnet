@@ -73,5 +73,21 @@ def test_blt_forward_shapes() -> bool:
     return True
 
 
+def test_blt_logits_do_not_see_future_bytes_in_same_patch() -> None:
+    torch.manual_seed(0)
+    config = build_config()
+    model = TernaryBLTModel(config).eval()
+    first = torch.tensor([[config.bos_id, 10, 11, 12, 13, config.eos_id]])
+    changed = first.clone()
+    changed[0, 2] = 99
+    mask = torch.ones_like(first)
+    patch_lengths = torch.tensor([[3, 3]])
+
+    first_logits = model(first, attention_mask=mask, patch_lengths=patch_lengths).logits
+    changed_logits = model(changed, attention_mask=mask, patch_lengths=patch_lengths).logits
+
+    assert torch.equal(first_logits[:, :2], changed_logits[:, :2])
+
+
 if __name__ == "__main__":
     test_blt_forward_shapes()

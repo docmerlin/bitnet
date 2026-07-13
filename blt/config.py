@@ -79,6 +79,10 @@ class TernaryBLTConfig:
             raise ValueError("global_dim must be divisible by n_heads_cross")
         if (self.global_dim // self.n_heads_cross) % 2 != 0:
             raise ValueError("cross-attention head_dim must be even for rotary compatibility")
+        if self.decoder_dim % self.n_heads_cross != 0:
+            raise ValueError("decoder_dim must be divisible by n_heads_cross")
+        if (self.decoder_dim // self.n_heads_cross) % 2 != 0:
+            raise ValueError("decoder cross-attention head_dim must be even")
 
     @staticmethod
     def _validate_dim(dim: int, num_heads: int, name: str) -> None:

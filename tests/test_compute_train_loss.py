@@ -53,6 +53,32 @@ def test_compute_train_loss_adds_z_loss() -> bool:
     return True
 
 
+def test_compute_train_loss_ignores_cross_document_targets() -> None:
+    model = BitNetDeep(_tiny_config())
+    logits = torch.zeros(1, 3, 64)
+    labels = torch.tensor([[1, 2, 3]])
+    segment_ids = torch.tensor([[0, 0, 1]])
+    label_segment_ids = torch.tensor([[0, 1, 1]])
+
+    loss = compute_train_loss(
+        model,
+        logits,
+        labels,
+        segment_ids=segment_ids,
+        label_segment_ids=label_segment_ids,
+    )
+    expected = F.cross_entropy(logits[:, [0, 2]].reshape(-1, 64), labels[:, [0, 2]].reshape(-1))
+    assert torch.equal(loss, expected)
+
+
+def test_language_modeling_loss_handles_fully_masked_batch() -> None:
+    logits = torch.randn(1, 2, 64, requires_grad=True)
+    loss = language_modeling_loss(logits, torch.full((1, 2), -100))
+    assert loss.item() == 0.0
+    loss.backward()
+    assert torch.count_nonzero(logits.grad) == 0
+
+
 def test_rfmoe_aux_terms_are_independent() -> bool:
     """Locality/diversity apply when RFMoE is present even without density lam≠0."""
     torch.manual_seed(2)

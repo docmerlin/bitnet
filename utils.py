@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import random
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Tuple
@@ -199,8 +200,22 @@ def load_checkpoint_payload(
         load_kwargs["map_location"] = map_location
     try:
         return torch.load(path, weights_only=True, **load_kwargs)
-    except TypeError:
-        return torch.load(path, **load_kwargs)
+    except TypeError as exc:
+        raise RuntimeError("installed PyTorch does not support safe checkpoint loading") from exc
+
+
+def atomic_torch_save(payload: object, destination: str | Path) -> None:
+    """Write a torch payload without replacing a valid checkpoint on failure."""
+    path = Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as tmp:
+        temporary_path = Path(tmp.name)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def validate_suffix_padded_mask(mask: torch.Tensor, *, name: str = "attention_mask") -> None:

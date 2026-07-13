@@ -72,9 +72,13 @@ class TernaryBLTModel(nn.Module):
         )
         global_mask = patch_presence_mask(patch_lengths).long()
         global_hidden = self.global_transformer(encoder_patches, attention_mask=global_mask)
+        decoder_patches = torch.cat(
+            [torch.zeros_like(global_hidden[:, :1]), global_hidden[:, :-1]],
+            dim=1,
+        )
         decoder_hidden = self.local_decoder(
             encoder_hidden,
-            global_hidden,
+            decoder_patches,
             patch_ids,
             attention_mask=attention_mask,
         )

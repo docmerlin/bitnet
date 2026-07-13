@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import TernaryConfig
+from layers.engram import Engram
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
 from layers.rfmoe import RFMoE
@@ -51,7 +52,7 @@ class HybridTransformerBlock(nn.Module):
         x = post_norm(x + scale * y)   # AttentionResidual
     """
 
-    def __init__(self, config: TernaryConfig):
+    def __init__(self, config: TernaryConfig, layer_id: Optional[int] = None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -60,6 +61,12 @@ class HybridTransformerBlock(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.num_blocks = max(1, config.block_size)
         eps = config.rms_norm_eps
+
+        self.engram = (
+            Engram(config, layer_id)
+            if config.use_engram and layer_id in config.engram_layer_ids
+            else None
+        )
 
         # Pre-norms (sandwich front half).
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=eps)
@@ -84,6 +91,7 @@ class HybridTransformerBlock(nn.Module):
                 rank=config.rfmoe_rank,
                 theta=config.rfmoe_theta,
                 residual=False,
+                config=config,
             )
         else:
             # SwiGLU expand (fused gate+value) -> mid (silu) -> down. Three HBitLinears /
@@ -112,8 +120,20 @@ class HybridTransformerBlock(nn.Module):
         *,
         attn_bias: Optional[torch.Tensor] = None,
         query_valid: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
         update_memory: Optional[bool] = None,
     ) -> torch.Tensor:
+        if self.engram is not None:
+            if input_ids is None:
+                raise ValueError("input_ids are required by Engram layers")
+            x = x + self.engram(
+                x,
+                input_ids,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+            )
+
         # Attention sandwich: post(x + scale * gate * Attn(pre(x)))
         residual = x
         x_norm = self.attn_norm(x)
@@ -123,6 +143,7 @@ class HybridTransformerBlock(nn.Module):
             attention_mask,
             attn_bias=attn_bias,
             query_valid=query_valid,
+            segment_ids=segment_ids,
             update_memory=update_memory,
         )
         x = self.attn_res(residual, torch.sigmoid(self.gate) * infini_out)

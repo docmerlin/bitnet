@@ -32,14 +32,22 @@ def language_modeling_loss(
     """
     flat_logits = logits.reshape(-1, logits.size(-1))
     flat_labels = labels.reshape(-1)
-    loss = F.cross_entropy(flat_logits, flat_labels)
+    valid = flat_labels.ne(-100)
+    if not torch.any(valid):
+        return flat_logits.sum() * 0.0
+    loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
     if z_loss_coef > 0.0:
         log_z = torch.logsumexp(flat_logits.float(), dim=-1)
-        loss = loss + z_loss_coef * log_z.pow(2).mean()
+        loss = loss + z_loss_coef * log_z[valid].pow(2).mean()
     return loss
 
 
-def multi_token_loss(mtp_logits: List[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+def multi_token_loss(
+    mtp_logits: List[torch.Tensor],
+    labels: torch.Tensor,
+    segment_ids: Optional[torch.Tensor] = None,
+    label_segment_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Mean cross-entropy over the extra multi-token-prediction heads.
 
     ``mtp_logits[i]`` predicts the token at offset ``i+2`` from each position.
@@ -48,9 +56,7 @@ def multi_token_loss(mtp_logits: List[torch.Tensor], labels: torch.Tensor) -> to
     positions have no target and are dropped (no ignore_index needed). Averaged
     across depths so the coefficient's scale is independent of ``mtp_depth``.
 
-    Cross-document boundaries are NOT masked here — the main next-token loss
-    doesn't mask them either (packed windows only mask attention), so MTP stays
-    consistent with existing behavior.
+    Packed targets from another document are ignored.
     """
     total = None
     counted = 0
@@ -60,10 +66,19 @@ def multi_token_loss(mtp_logits: List[torch.Tensor], labels: torch.Tensor) -> to
             continue                               # else empty slice -> cross_entropy NaN
         pred = depth_logits[:, : depth_logits.size(1) - shift]   # (B, S-shift, V)
         target = labels[:, shift:]                               # (B, S-shift)
+        if segment_ids is not None and label_segment_ids is not None:
+            target = target.masked_fill(
+                segment_ids[:, : target.size(1)].ne(label_segment_ids[:, shift:]),
+                -100,
+            )
+        if not torch.any(target.ne(-100)):
+            continue
         depth_loss = language_modeling_loss(pred, target)
         total = depth_loss if total is None else total + depth_loss
         counted += 1
     if counted == 0:
+        if mtp_logits:
+            return sum((head.sum() for head in mtp_logits), mtp_logits[0].new_zeros(())) * 0.0
         return labels.new_zeros((), dtype=torch.float32)
     return total / counted
 
@@ -74,6 +89,8 @@ def compute_train_loss(
     labels: torch.Tensor,
     *,
     mtp_logits: Optional[Sequence[torch.Tensor]] = None,
+    segment_ids: Optional[torch.Tensor] = None,
+    label_segment_ids: Optional[torch.Tensor] = None,
     z_loss_coef: float = 0.0,
     mtp_loss_coef: float = 0.0,
     density_lam: float = 0.0,
@@ -88,9 +105,13 @@ def compute_train_loss(
     or diversity no longer depends on the density controller object existing.
     When the model has no RFMoE layers the aux terms are skipped entirely.
     """
+    if segment_ids is not None and label_segment_ids is not None:
+        labels = labels.masked_fill(segment_ids.ne(label_segment_ids), -100)
     loss = language_modeling_loss(logits, labels, z_loss_coef=z_loss_coef)
     if mtp_logits:
-        loss = loss + mtp_loss_coef * multi_token_loss(list(mtp_logits), labels)
+        loss = loss + mtp_loss_coef * multi_token_loss(
+            list(mtp_logits), labels, segment_ids, label_segment_ids
+        )
 
     if not any(iter_rfmoe(model)):
         return loss

@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import Optimizer
 
 from config import TernaryConfig
@@ -20,6 +19,7 @@ from data.presets import DatasetSource
 from data.streams import build_batch_stream
 from model import BitNetDeep
 from optim import build_cmud
+from training.losses import language_modeling_loss
 from training.memory import (
     capture_infini_memory_state,
     reset_infini_memory,
@@ -103,15 +103,13 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
         "head_dim": args.hidden_size // args.num_heads,
         "intermediate_size": args.intermediate_size,
         "rms_norm_eps": defaults.rms_norm_eps,
-        "rope_theta": defaults.rope_theta,
-        "rope_scaling": {
-            "type": "yarn",
-            "factor": args.rope_scaling_factor,
-            "original_max_position_embeddings": defaults.rope_scaling["original_max_position_embeddings"],
-        },
         "initializer_range": defaults.initializer_range,
         "block_size": args.final_blocks,
+        "path_window_size": args.path_window_size,
         "infini_memory_dim": defaults.infini_memory_dim,
+        "use_engram": args.engram,
+        "engram_layer_ids": args.engram_layer_ids,
+        "engram_vocab_size": args.engram_vocab_size,
         "use_hadamard": not args.disable_hadamard,
         "use_4bit_activations": True,
         "use_rfmoe": args.use_rfmoe,
@@ -192,10 +190,12 @@ def evaluate(
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             segment_ids = batch["segment_ids"].to(device)
+            label_segment_ids = batch["label_segment_ids"].to(device)
 
             with autocast_context(device, amp_enabled, amp_dtype):
                 logits = runner(input_ids, segment_ids=segment_ids)
-                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                labels = labels.masked_fill(segment_ids.ne(label_segment_ids), -100)
+                loss = language_modeling_loss(logits, labels)
             losses.append(float(loss.item()))
 
         mean_loss = sum(losses) / len(losses)

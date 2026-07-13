@@ -32,7 +32,11 @@ class ByteVocabulary:
         tokens: List[int] = []
         if add_bos:
             tokens.append(self.config.bos_id)
-        tokens.extend(self.config.byte_to_token_id(value) for value in text.encode("utf-8"))
+        bounded_text = text if max_length is None else text[:max_length]
+        encoded = bounded_text.encode("utf-8")
+        if max_length is not None:
+            encoded = encoded[:max_length]
+        tokens.extend(self.config.byte_to_token_id(value) for value in encoded)
         if add_eos:
             tokens.append(self.config.eos_id)
         if max_length is not None and len(tokens) > max_length:
@@ -68,7 +72,11 @@ class PackedByteSequenceStream:
     ) -> None:
         self.text_stream = text_stream
         self.vocabulary = vocabulary
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
         self.sequence_length = sequence_length
+        if max_document_bytes < 2:
+            raise ValueError("max_document_bytes must be >= 2")
         self.max_document_bytes = max_document_bytes
         self.buffer: List[int] = []
 

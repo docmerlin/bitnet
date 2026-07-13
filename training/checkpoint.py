@@ -18,7 +18,7 @@ from training.arch_upgrade import (
     is_ffn_mid_key,
 )
 from training.memory import reset_infini_memory
-from utils import load_checkpoint_payload
+from utils import atomic_torch_save, load_checkpoint_payload
 
 # Re-export for callers / BLT that shared the predicate.
 __all__ = [
@@ -62,7 +62,7 @@ def save_checkpoint(
         "model_config": asdict(model_config),
         "args": vars(args),
     }
-    torch.save(payload, checkpoint_path)
+    atomic_torch_save(payload, checkpoint_path)
     return checkpoint_path
 
 
@@ -77,7 +77,14 @@ def load_checkpoint(
     # Tolerate architecture evolution (e.g. qk-norm or FFN mid layers added after a
     # checkpoint was written): load non-strict and surface any mismatch.
     incompatible = model.load_state_dict(payload["model"], strict=False)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
+    mid_missing = filter_ffn_mid_keys(incompatible.missing_keys)
+    unsupported_missing = [key for key in incompatible.missing_keys if key not in mid_missing]
+    if unsupported_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "checkpoint model does not match current architecture: "
+            f"missing keys: {unsupported_missing}; unexpected keys: {incompatible.unexpected_keys}"
+        )
+    if incompatible.missing_keys:
         print(
             f"Warning: resumed checkpoint did not match the model exactly. "
             f"Missing keys: {incompatible.missing_keys}; "
@@ -85,7 +92,6 @@ def load_checkpoint(
             flush=True,
         )
 
-    mid_missing = filter_ffn_mid_keys(incompatible.missing_keys)
     architecture_bump = bool(mid_missing)
     if architecture_bump:
         upgraded = init_missing_ffn_mid_identity(model, incompatible.missing_keys)

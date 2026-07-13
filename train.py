@@ -4,7 +4,7 @@ Packages:
 - ``data/`` — presets, mixtures, packing
 - ``training/`` — losses, schedules, checkpoints, runtime
 - ``model.py`` — single forward path (checkpointing + MTP)
-- ``utils.py`` — RoPE / attention-mask helpers
+- ``utils.py`` — attention-mask and checkpoint helpers
 
 Example:
     python3 train.py --output-dir runs/bitnet --total-tokens 50000000
@@ -55,6 +55,16 @@ try:
 except ImportError as exc:  # pragma: no cover
     HierarchicalTokenizer = Any  # type: ignore[misc, assignment]
     _TOKENIZER_IMPORT_ERROR = exc
+
+
+def _sequence_length(value: str) -> int:
+    sequence_length = int(value)
+    memory_dim = TernaryConfig.infini_memory_dim
+    if sequence_length <= 0 or sequence_length % memory_dim:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive multiple of Infini-Attention memory dimension {memory_dim}"
+        )
+    return sequence_length
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -135,9 +145,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-heads", type=int, default=defaults.num_attention_heads)
     parser.add_argument("--intermediate-size", type=int, default=defaults.intermediate_size)
-    parser.add_argument("--sequence-length", type=int, default=1024)
-    parser.add_argument("--rope-scaling-factor", type=float, default=defaults.rope_scaling["factor"])
+    parser.add_argument("--sequence-length", type=_sequence_length, default=1024)
+    parser.add_argument("--path-window-size", type=int, default=defaults.path_window_size)
     parser.add_argument("--disable-hadamard", action="store_true")
+    parser.add_argument(
+        "--engram",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.use_engram,
+        help="Enable compact DeepSeek Engram conditional N-gram memory.",
+    )
+    parser.add_argument(
+        "--engram-layer-ids",
+        type=lambda value: tuple(int(item) for item in value.split(",") if item),
+        default=defaults.engram_layer_ids,
+    )
+    parser.add_argument("--engram-vocab-size", type=int, default=defaults.engram_vocab_size)
 
     parser.add_argument("--mtp-depth", type=int, default=0)
     parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
@@ -266,7 +288,9 @@ def main() -> None:
         saved_config = load_checkpoint_payload(Path(args.resume_from), map_location="cpu").get("model_config")
         if saved_config:
             valid_fields = {f.name for f in fields(TernaryConfig)}
-            model_config = TernaryConfig(**{k: v for k, v in saved_config.items() if k in valid_fields})
+            checkpoint_config = {k: v for k, v in saved_config.items() if k in valid_fields}
+            checkpoint_config.setdefault("use_engram", False)
+            model_config = TernaryConfig(**checkpoint_config)
     base_model = BitNetDeep(model_config)
     base_model.gradient_checkpointing = args.gradient_checkpointing
     base_model.checkpoint_granularity = args.checkpoint_granularity
@@ -424,6 +448,7 @@ def main() -> None:
                 input_ids = batch["input_ids"].to(device, non_blocking=non_blocking)
                 labels = batch["labels"].to(device, non_blocking=non_blocking)
                 segment_ids = batch["segment_ids"].to(device, non_blocking=non_blocking)
+                label_segment_ids = batch["label_segment_ids"].to(device, non_blocking=non_blocking)
 
                 with autocast_context(device, amp_enabled, amp_dtype):
                     if args.mtp_depth > 0:
@@ -444,6 +469,8 @@ def main() -> None:
                         logits,
                         labels,
                         mtp_logits=mtp_logits,
+                        segment_ids=segment_ids,
+                        label_segment_ids=label_segment_ids,
                         z_loss_coef=args.z_loss_coef,
                         mtp_loss_coef=args.mtp_loss_coef,
                         density_lam=density_controller.lam if density_controller is not None else 0.0,

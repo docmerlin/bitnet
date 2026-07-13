@@ -120,9 +120,9 @@ def test_hybrid_block():
 
     block.num_blocks = seq_len  # block size 1: each token only sees itself locally
     reset_memory(block)
-    isolated_output = block(baseline)
+    isolated_output = block(baseline, update_memory=False)
     reset_memory(block)
-    isolated_perturbed_output = block(perturbed)
+    isolated_perturbed_output = block(perturbed, update_memory=False)
     assert torch.allclose(
         isolated_output[:, probe_pos, :],
         isolated_perturbed_output[:, probe_pos, :],

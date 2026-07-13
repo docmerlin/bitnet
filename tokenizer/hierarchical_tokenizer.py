@@ -155,7 +155,11 @@ class HierarchicalTokenizer:
         add_special_tokens: bool = False,
     ) -> List[int]:
         """Encode text to a flat token stream for the main transformer."""
-        flat_ids = [token for patch in self.encode_patches(text, add_special_tokens=add_special_tokens) for token in patch]
+        flat_ids = [
+            token
+            for patch in self.encode_patches(text, add_special_tokens=add_special_tokens)
+            for token in patch
+        ]
         return flat_ids[:max_length]
 
     def encode_fixed_patches(self, text: str, add_special_tokens: bool = False) -> List[List[int]]:

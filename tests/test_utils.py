@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 import torch
 
 from utils import (
+    atomic_torch_save,
     build_rope_cache,
     clear_rope_cache,
     load_checkpoint_payload,
@@ -48,6 +49,23 @@ def test_load_checkpoint_payload_roundtrip() -> bool:
         assert torch.allclose(loaded["tensor"], torch.ones(2, 2))
     print("load_checkpoint_payload tests passed")
     return True
+
+
+def test_atomic_torch_save_preserves_destination_on_failure(monkeypatch, tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_bytes(b"valid")
+
+    def fail_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+    try:
+        atomic_torch_save({"step": 1}, checkpoint_path)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("failed checkpoint save should propagate")
+    assert checkpoint_path.read_bytes() == b"valid"
 
 
 def test_validate_suffix_padded_mask_rejects_interior_padding() -> bool:

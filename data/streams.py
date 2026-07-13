@@ -113,6 +113,7 @@ class TextDatasetStream:
         self.skip_examples = skip_examples
         self.restart_on_eof = restart_on_eof
         self.restart_count = 0
+        self.yielded_this_pass = False
         self.iterator = self._build_iterator()
 
     def _build_iterator(self) -> Iterator[Dict[str, Any]]:
@@ -157,7 +158,12 @@ class TextDatasetStream:
             except StopIteration:
                 if not self.restart_on_eof:
                     raise
+                if not self.yielded_this_pass:
+                    raise ValueError(
+                        f"dataset {self.source.path!r} produced no non-empty text records"
+                    )
                 self.restart_count += 1
+                self.yielded_this_pass = False
                 self.iterator = self._build_iterator()
                 continue
 
@@ -166,6 +172,7 @@ class TextDatasetStream:
                 continue
             text = text.strip()
             if text:
+                self.yielded_this_pass = True
                 return text
 
 
@@ -198,7 +205,11 @@ class PackedSequenceStream:
     ) -> None:
         self.text_stream = text_stream
         self.tokenizer = tokenizer
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
         self.sequence_length = sequence_length
+        if max_document_tokens < 2:
+            raise ValueError("max_document_tokens must be >= 2")
         self.max_document_tokens = max_document_tokens
         self.buffer: List[int] = []
         # Parallel per-token document ids so packed windows can mask cross-document
@@ -214,7 +225,7 @@ class PackedSequenceStream:
         while len(self.buffer) < self.sequence_length + 1:
             text = next(self.text_stream)
             token_ids = self.tokenizer.encode(
-                text,
+                text[: self.max_document_tokens],
                 max_length=self.max_document_tokens,
                 add_special_tokens=True,
             )
@@ -226,17 +237,19 @@ class PackedSequenceStream:
 
         window = self.buffer[: self.sequence_length + 1]
         del self.buffer[: self.sequence_length]
-        segment_window = self.segment_buffer[: self.sequence_length]
+        segment_window = self.segment_buffer[: self.sequence_length + 1]
         del self.segment_buffer[: self.sequence_length]
 
         base_id = segment_window[0]
         input_ids = torch.tensor(window[:-1], dtype=torch.long)
         labels = torch.tensor(window[1:], dtype=torch.long)
-        segment_ids = torch.tensor([s - base_id for s in segment_window], dtype=torch.long)
+        segment_ids = torch.tensor([s - base_id for s in segment_window[:-1]], dtype=torch.long)
+        label_segment_ids = torch.tensor([s - base_id for s in segment_window[1:]], dtype=torch.long)
         return {
             "input_ids": input_ids,
             "labels": labels,
             "segment_ids": segment_ids,
+            "label_segment_ids": label_segment_ids,
         }
 
 
@@ -254,7 +267,7 @@ class BatchStream:
         batch = [next(self.sequence_stream) for _ in range(self.micro_batch_size)]
         return {
             key: torch.stack([sample[key] for sample in batch], dim=0)
-            for key in ("input_ids", "labels", "segment_ids")
+            for key in ("input_ids", "labels", "segment_ids", "label_segment_ids")
         }
 
 

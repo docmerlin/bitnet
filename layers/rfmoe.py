@@ -4,18 +4,22 @@ Step 1 of the MoE roadmap in ``todo.md``. Each expert decides its OWN activation
 from an internal score, so there is no centralized router: adding or removing an
 expert never renormalizes the others (that is what makes the design extensible).
 
-Dense float experts, per-expert skip path, score-weighted residual combine,
-and a single global threshold ``theta`` as the compute/quality knob. Aux losses
-(density / locality / diversity) live as free functions. Deferred: ternary
-experts, grouped GEMM, extensible ``add_expert`` (see todo.md).
+Ternary experts, grouped sparse execution, score-weighted residual combine, and
+a single global threshold ``theta`` as the compute/quality knob. Aux losses
+(density / locality / diversity) and expert-append helpers live as free functions.
+Domain-specific append experiments remain deferred (see todo.md).
 
 Reference: RFMoE (arXiv 2604.00801), building on AoE (2501.13074) / ReMoE.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from layers.h_bitlinear import HBitLinear
 
 
 class RFMoEExpert(nn.Module):
@@ -31,13 +35,13 @@ class RFMoEExpert(nn.Module):
     projection and skips the expert body — that is the FLOP saving.
     """
 
-    def __init__(self, hidden_size: int, expert_dim: int, rank: int) -> None:
+    def __init__(self, hidden_size: int, expert_dim: int, rank: int, config) -> None:
         super().__init__()
-        self.a_gate = nn.Linear(hidden_size, rank, bias=False)        # D -> r  (score + gate, dual use)
-        self.b_gate = nn.Linear(rank, expert_dim, bias=False)         # r -> D_act
-        self.w_up = nn.Linear(hidden_size, expert_dim, bias=False)    # D -> D_act
-        self.w_mid = nn.Linear(expert_dim, expert_dim, bias=False)    # D_act -> D_act
-        self.w_down = nn.Linear(expert_dim, hidden_size, bias=False)  # D_act -> D
+        self.a_gate = HBitLinear(hidden_size, rank, bias=False, config=config)        # D -> r
+        self.b_gate = HBitLinear(rank, expert_dim, bias=False, config=config)         # r -> D_act
+        self.w_up = HBitLinear(hidden_size, expert_dim, bias=False, config=config)    # D -> D_act
+        self.w_mid = HBitLinear(expert_dim, expert_dim, bias=False, config=config)    # D_act -> D_act
+        self.w_down = HBitLinear(expert_dim, hidden_size, bias=False, config=config)  # D_act -> D
         # Per-expert fire bias. Warm-started ~0 so every expert fires early
         # (explore/specialize); a density loss ramps it up later to enforce
         # sparsity. This scalar is the only decision-dedicated parameter.
@@ -68,12 +72,17 @@ class RFMoE(nn.Module):
         rank: int | None = None,
         theta: float = 0.01,
         residual: bool = True,
+        config=None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.expert_dim = expert_dim
         rank = rank or max(1, hidden_size // 16)  # paper sizing: r ≈ D/16
+        config = config or SimpleNamespace(use_hadamard=True, use_4bit_activations=True)
+        self.rank = rank
+        self.config = config
         self.experts = nn.ModuleList(
-            RFMoEExpert(hidden_size, expert_dim, rank) for _ in range(num_experts)
+            RFMoEExpert(hidden_size, expert_dim, rank, config) for _ in range(num_experts)
         )
         self.theta = theta
         # Add x back inside forward (todo spec h = x + Σ G_i E_i). Set False when
@@ -89,37 +98,104 @@ class RFMoE(nn.Module):
         self.usage_decay = 0.99
         self.register_buffer("usage_ema", torch.full((num_experts,), 1.0 / num_experts), persistent=False)
 
+    @staticmethod
+    def _grouped_linear_input(x: torch.Tensor, layers: list[HBitLinear]) -> torch.Tensor:
+        return layers[0].prepare_input(x)
+
+    @staticmethod
+    def _grouped_weight(layers: list[HBitLinear], dtype: torch.dtype) -> torch.Tensor:
+        weights = torch.stack([layer.weight for layer in layers])
+        return layers[0].effective_weight(dtype, weights)
+
+    def add_expert(self, bias: float = 10.0) -> RFMoEExpert:
+        """Append a cold expert without changing existing expert parameters or keys."""
+        reference = self.experts[0]
+        parameter = next(reference.parameters())
+        expert = RFMoEExpert(self.hidden_size, self.expert_dim, self.rank, self.config).to(
+            device=parameter.device, dtype=parameter.dtype
+        )
+        expert.train(self.training)
+        with torch.no_grad():
+            expert.bias.fill_(bias)
+        for source, target in zip(reference.modules(), expert.modules()):
+            if isinstance(source, HBitLinear) and isinstance(target, HBitLinear):
+                target.set_quantization_state(
+                    weight_mix=source.weight_quantization_mix,
+                    activation_mix=source.activation_quantization_mix,
+                    activation_bits=source.activation_bits,
+                    enable_weight_quantization=source.enable_weight_quantization,
+                    enable_activation_quantization=source.enable_activation_quantization,
+                )
+        self.experts.append(expert)
+        device = parameter.device
+        self._last_usage = torch.cat((self._last_usage.to(device), torch.zeros(1, device=device)))
+        self._last_gate = torch.cat(
+            (self._last_gate.to(device), torch.zeros(1, self._last_gate.size(1), device=device))
+        )
+        self.usage_ema = torch.cat((self.usage_ema, self.usage_ema.new_zeros(1)))
+        return expert
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         flat = x.reshape(-1, self.hidden_size)   # (T, D)
         out = torch.zeros_like(flat)
-        fired = 0
-        gate_rows = []                           # per-expert (T,) firing pattern (differentiable)
-        # ponytail: per-expert Python loop with boolean-indexed skip path. Real
-        # per-token FLOP saving, but O(num_experts) launches — fine for step-1
-        # validation. Batch across experts (grouped GEMM / one padded matmul)
-        # when this moves to a real training run.
-        for expert in self.experts:
-            z, s = expert.score(flat)
-            gate_value = F.relu(s - expert.bias)      # (T,) 0 below the bias
-            if self.training:
-                gate_rows.append(gate_value)          # keep full pattern for diversity
-            fire = gate_value >= self.theta           # (T,) skip-path mask
-            if not bool(fire.any()):
-                continue
-            idx = fire.nonzero(as_tuple=True)[0]
-            contrib = expert.expert(flat[idx], z[idx])            # only fired tokens run the FFN
-            out.index_add_(0, idx, gate_value[idx, None] * contrib)  # score-weighted, NO divide-by-count
-            fired += idx.numel()
+
+        # Score every expert in one contraction, then pack only fired token/expert
+        # pairs for batched expert-body GEMMs. ModuleList storage keeps checkpoint
+        # keys stable while removing one launch sequence per expert.
+        a_gates = [expert.a_gate for expert in self.experts]
+        score_input = self._grouped_linear_input(flat, a_gates)
+        a_gate = self._grouped_weight(a_gates, score_input.dtype)
+        z = torch.einsum("td,nrd->ntr", score_input, a_gate)
+        scores = torch.linalg.vector_norm(z, dim=-1)
+        biases = torch.stack([expert.bias for expert in self.experts])
+        gate_stack = F.relu(scores - biases)
+        fire = gate_stack >= self.theta
+        active = fire.nonzero()                       # (K, 2): expert, token
+
+        if active.numel():
+            counts = fire.sum(dim=1)
+            max_count = int(counts.max())
+            expert_idx, token_idx = active.unbind(dim=1)
+            offsets = counts.cumsum(dim=0) - counts
+            positions = torch.arange(active.size(0), device=x.device) - torch.repeat_interleave(
+                offsets, counts, output_size=active.size(0)
+            )
+
+            padded_x = flat.new_zeros(len(self.experts), max_count, self.hidden_size)
+            padded_z = z.new_zeros(len(self.experts), max_count, z.size(-1))
+            padded_x[expert_idx, positions] = flat[token_idx]
+            padded_z[expert_idx, positions] = z[expert_idx, token_idx]
+
+            b_gates = [expert.b_gate for expert in self.experts]
+            w_ups = [expert.w_up for expert in self.experts]
+            w_mids = [expert.w_mid for expert in self.experts]
+            w_downs = [expert.w_down for expert in self.experts]
+            gate_input = self._grouped_linear_input(padded_z, b_gates)
+            up_input = self._grouped_linear_input(padded_x, w_ups)
+            b_gate = self._grouped_weight(b_gates, gate_input.dtype)
+            w_up = self._grouped_weight(w_ups, up_input.dtype)
+            gate = torch.sigmoid(torch.bmm(gate_input, b_gate.transpose(1, 2)))
+            hidden = gate * torch.bmm(up_input, w_up.transpose(1, 2))
+            mid_input = self._grouped_linear_input(hidden, w_mids)
+            w_mid = self._grouped_weight(w_mids, mid_input.dtype)
+            hidden = F.silu(torch.bmm(mid_input, w_mid.transpose(1, 2)))
+            down_input = self._grouped_linear_input(hidden, w_downs)
+            w_down = self._grouped_weight(w_downs, down_input.dtype)
+            contrib = torch.bmm(down_input, w_down.transpose(1, 2))
+            out.index_add_(
+                0,
+                token_idx,
+                gate_stack[expert_idx, token_idx, None] * contrib[expert_idx, positions],
+            )
         # Aux stats feed the density/locality/diversity losses — training only.
         # Inference (the theta compute knob) skips the (N, T) stack + EMA update.
         if self.training:
             num_experts = len(self.experts)
-            gate_stack = torch.stack(gate_rows)          # (N, T) firing patterns
             self._last_gate = gate_stack                 # for the diversity loss
             usage = gate_stack.mean(dim=1)               # (N,) mean gate activity per expert
             self._last_usage = usage
-            self._last_density = fired / max(flat.size(0) * num_experts, 1)
+            self._last_density = active.size(0) / max(flat.size(0) * num_experts, 1)
             # Detached EMA for stable ranking (rare experts are noisy per batch).
             with torch.no_grad():
                 self.usage_ema.mul_(self.usage_decay).add_(usage.detach(), alpha=1.0 - self.usage_decay)
@@ -132,6 +208,32 @@ def iter_rfmoe(model: nn.Module):
     for module in model.modules():
         if isinstance(module, RFMoE):
             yield module
+
+
+def add_rfmoe_experts(
+    model: nn.Module,
+    bias: float = 1e-6,
+    freeze_existing: bool = True,
+) -> list[RFMoEExpert]:
+    """Append one expert per RFMoE layer, optionally training only new experts.
+
+    Rebuild the optimizer after calling this function so it owns the appended
+    parameters. Existing diversity loss supplies the niche-finding objective.
+    """
+    moes = list(iter_rfmoe(model))
+    if not moes:
+        return []
+    if freeze_existing:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+    added = [moe.add_expert(bias=bias) for moe in moes]
+    if freeze_existing:
+        for expert in added:
+            expert.requires_grad_(True)
+    config = getattr(model, "config", None)
+    if config is not None:
+        config.rfmoe_num_experts = len(moes[0].experts)
+    return added
 
 
 def rfmoe_aux_activity(model: nn.Module) -> torch.Tensor:

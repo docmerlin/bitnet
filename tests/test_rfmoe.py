@@ -8,12 +8,14 @@ import torch.nn.functional as F
 from layers.rfmoe import (
     DensityController,
     RFMoE,
+    add_rfmoe_experts,
     rfmoe_aux_activity,
     rfmoe_density,
     rfmoe_diversity_loss,
     rfmoe_locality_loss,
     staircase_target,
 )
+from layers.h_bitlinear import HBitLinear
 
 
 def test_rfmoe_forward_and_grad() -> None:
@@ -22,6 +24,10 @@ def test_rfmoe_forward_and_grad() -> None:
     moe = RFMoE(hidden, expert_dim=32, num_experts=8, rank=4, theta=0.01)
     # Each expert body is 3-stage (up/mid/down).
     expert = moe.experts[0]
+    assert all(
+        isinstance(layer, HBitLinear)
+        for layer in (expert.a_gate, expert.b_gate, expert.w_up, expert.w_mid, expert.w_down)
+    )
     assert hasattr(expert, "w_mid")
     assert expert.w_mid.weight.shape == (32, 32)
     assert expert.w_up.weight.shape == (32, hidden)
@@ -40,6 +46,56 @@ def test_rfmoe_forward_and_grad() -> None:
     opt.step()
     loss1 = F.mse_loss(moe(x), target)
     assert loss1 < loss0
+
+
+def test_grouped_forward_matches_expert_loop() -> None:
+    torch.manual_seed(4)
+    moe = RFMoE(16, expert_dim=12, num_experts=4, rank=3, theta=0.2, residual=False)
+    with torch.no_grad():
+        for expert, bias in zip(moe.experts, (-0.5, 0.2, 0.6, 100.0)):
+            expert.bias.fill_(bias)
+    x = torch.randn(2, 5, 16)
+
+    expected = torch.zeros_like(x.reshape(-1, 16))
+    for expert in moe.experts:
+        z, score = expert.score(x.reshape(-1, 16))
+        gate = F.relu(score - expert.bias)
+        idx = (gate >= moe.theta).nonzero(as_tuple=True)[0]
+        if idx.numel():
+            expected.index_add_(0, idx, gate[idx, None] * expert.expert(x.reshape(-1, 16)[idx], z[idx]))
+
+    torch.testing.assert_close(moe(x), expected.reshape_as(x))
+
+
+def test_add_expert_preserves_output_and_can_train_new_only() -> None:
+    dense = torch.nn.Linear(2, 2)
+    assert add_rfmoe_experts(dense) == []
+    assert all(parameter.requires_grad for parameter in dense.parameters())
+
+    torch.manual_seed(5)
+    moe = RFMoE(16, expert_dim=12, num_experts=3, rank=3, theta=0.2, residual=False)
+    x = torch.randn(2, 5, 16)
+    before = moe(x).detach()
+
+    cold = moe.add_expert(bias=1e6)
+    torch.testing.assert_close(moe(x), before)
+    assert len(moe.experts) == 4
+    assert moe.usage_ema.shape == (4,)
+    assert cold.a_gate.weight.device == moe.experts[0].a_gate.weight.device
+
+    added = add_rfmoe_experts(moe, bias=1e-6, freeze_existing=True)
+    assert added == [moe.experts[-1]]
+    assert moe.config.rfmoe_num_experts == 5
+    assert all(not parameter.requires_grad for expert in moe.experts[:-1] for parameter in expert.parameters())
+    assert all(parameter.requires_grad for parameter in added[0].parameters())
+    moe(x).square().mean().backward()
+    assert any(parameter.grad is not None for parameter in added[0].parameters())
+
+    restored = RFMoE(
+        16, expert_dim=12, num_experts=moe.config.rfmoe_num_experts, rank=3, theta=moe.theta, residual=False
+    )
+    restored.load_state_dict(moe.state_dict())
+    torch.testing.assert_close(restored(x), moe(x))
 
 
 def test_theta_controls_density() -> None:

@@ -171,6 +171,14 @@ def test_byte_vocabulary_decode_skips_pad_id() -> bool:
     return True
 
 
+def test_byte_vocabulary_bounds_utf8_before_expansion() -> None:
+    config = build_config()
+    vocabulary = ByteVocabulary(config)
+    tokens = vocabulary.encode("😀" * 1_000, max_length=8)
+    assert len(tokens) == 8
+    assert tokens[-1] == config.eos_id
+
+
 if __name__ == "__main__":
     test_masked_hard_ce_ignores_masked_labels()
     test_local_encoder_ignores_padded_tokens_in_patch_states()

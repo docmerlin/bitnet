@@ -58,7 +58,7 @@ def ternary_quantize_ste(weight: torch.Tensor) -> torch.Tensor:
     A per-output-channel abs-mean scale preserves some dynamic range while the
     straight-through estimator lets gradients flow to the master weights.
     """
-    scale = weight.detach().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+    scale = weight.detach().abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
     normalized = weight / scale
     ternary = torch.where(
         normalized > 0.5,
@@ -134,12 +134,8 @@ class HBitLinear(nn.Module):
             bound = 1.0 / math.sqrt(fan_in)
             nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply Hadamard (on input), activation quantization, and ternary weight matmul.
-
-        Following BitNet b1.58 best practices, Hadamard is applied to the input
-        before the ternary weight multiplication for improved quantization stability.
-        """
+    def prepare_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply this layer's Hadamard and activation quantization settings."""
         if self.hadamard_size is not None:
             # Dense cached matmul, not a fast Walsh-Hadamard transform. At the
             # sizes this model uses (n = in_features = 1024, and 2048 for
@@ -164,17 +160,27 @@ class HBitLinear(nn.Module):
                 x = quantized_x
             elif self.activation_quantization_mix > 0.0:
                 x = torch.lerp(x, quantized_x, self.activation_quantization_mix)
+        return x
 
+    def effective_weight(self, dtype: torch.dtype, weight: torch.Tensor | None = None) -> torch.Tensor:
+        """Return mixed ternary weight, including grouped leading dimensions."""
+        weight = self.weight if weight is None else weight
         if self.enable_weight_quantization:
-            quantized_weight = ternary_quantize_ste(self.weight).to(dtype=x.dtype)
+            quantized_weight = ternary_quantize_ste(weight).to(dtype=dtype)
             if self.weight_quantization_mix >= 1.0:
-                weight = quantized_weight
+                return quantized_weight
             elif self.weight_quantization_mix > 0.0:
-                weight = torch.lerp(self.weight.to(dtype=x.dtype), quantized_weight, self.weight_quantization_mix)
-            else:
-                weight = self.weight.to(dtype=x.dtype)
-        else:
-            weight = self.weight.to(dtype=x.dtype)
+                return torch.lerp(weight.to(dtype=dtype), quantized_weight, self.weight_quantization_mix)
+        return weight.to(dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply Hadamard (on input), activation quantization, and ternary weight matmul.
+
+        Following BitNet b1.58 best practices, Hadamard is applied to the input
+        before the ternary weight multiplication for improved quantization stability.
+        """
+        x = self.prepare_input(x)
+        weight = self.effective_weight(x.dtype)
 
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.linear(x, weight, bias)
@@ -205,5 +211,3 @@ class HBitLinear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"ternary=True, hadamard={self.hadamard_size is not None}"
         )
-
-

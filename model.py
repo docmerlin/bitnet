@@ -15,11 +15,6 @@ from torch.utils.checkpoint import checkpoint
 from config import TernaryConfig
 from layers.hybrid_block import HybridTransformerBlock
 from layers.loop_mhc import LoopHyperConnection
-from utils import (
-    causal_block_attention_bias,
-    combine_attention_bias,
-    document_attention_keep_mask,
-)
 
 # Checkpoint granularity:
 #   layer — max VRAM save (recompute each block); slowest
@@ -40,6 +35,8 @@ class BitNetDeep(nn.Module):
               (Infini: read every pass; write only on last r)
         → mean streams → coda → norm → lm_head
 
+    Selected unique blocks inject Engram memory before attention.
+
     Knobs: ``gradient_checkpointing`` + ``checkpoint_granularity`` (loop|layer),
     ``num_loops`` override on forward, ``return_mtp``.
     """
@@ -59,8 +56,8 @@ class BitNetDeep(nn.Module):
         self.subln = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
         self.layers = nn.ModuleList(
-            HybridTransformerBlock(self.config)
-            for _ in range(self.config.num_hidden_layers)
+            HybridTransformerBlock(self.config, layer_id=layer_id)
+            for layer_id in range(self.config.num_hidden_layers)
         )
 
         # Hyperloop loop-boundary HC (hardcoded 4 streams, diagonal H_res).
@@ -101,32 +98,6 @@ class BitNetDeep(nn.Module):
             if module.bias is not None:
                 module.bias.data.zero_()
 
-    def _build_shared_attention_bias(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        batch_size, seq_len, _ = x.shape
-        device_type = x.device.type
-        compute_dtype = (
-            torch.get_autocast_dtype(device_type)
-            if torch.is_autocast_enabled(device_type)
-            else x.dtype
-        )
-        num_blocks = self.layers[0].num_blocks if len(self.layers) else 1
-        base_bias = causal_block_attention_bias(
-            seq_len, num_blocks, dtype=compute_dtype, device=x.device
-        )
-        return combine_attention_bias(
-            attention_mask,
-            base_bias=base_bias,
-            batch_size=batch_size,
-            q_len=seq_len,
-            k_len=seq_len,
-            dtype=compute_dtype,
-            device=x.device,
-        )
-
     @staticmethod
     def _snapshot_infini_states(
         layers: Sequence[HybridTransformerBlock],
@@ -135,15 +106,15 @@ class BitNetDeep(nn.Module):
 
     @staticmethod
     @contextlib.contextmanager
-    def _freeze_infini_states(
+    def _recompute_infini_states(
         layers: Sequence[HybridTransformerBlock],
         states: Sequence[dict[str, torch.Tensor]],
     ):
-        """On recompute: restore Infini banks and disable writes (no double-update)."""
+        """Recompute from original banks, then restore post-forward runtime state."""
         with contextlib.ExitStack() as stack:
             for layer, state in zip(layers, states):
                 stack.enter_context(
-                    layer.infini_attn.use_memory_state(state, update_memory_buffers=False)
+                    layer.infini_attn.use_memory_state(state, update_memory_buffers=True)
                 )
             yield
 
@@ -151,8 +122,9 @@ class BitNetDeep(nn.Module):
         self,
         layer: HybridTransformerBlock,
         x: torch.Tensor,
-        attn_bias: Optional[torch.Tensor],
-        query_valid: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        segment_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
         *,
         update_memory: Optional[bool] = None,
     ) -> torch.Tensor:
@@ -165,10 +137,11 @@ class BitNetDeep(nn.Module):
         if do_ckpt:
             layer_memory_state = layer.infini_attn.get_memory_state()
             return checkpoint(
-                lambda hidden_states, layer=layer, attn_bias=attn_bias, query_valid=query_valid, update_memory=update_memory: layer(
+                lambda hidden_states, layer=layer, attention_mask=attention_mask, segment_ids=segment_ids, input_ids=input_ids, update_memory=update_memory: layer(
                     hidden_states,
-                    attn_bias=attn_bias,
-                    query_valid=query_valid,
+                    attention_mask,
+                    segment_ids=segment_ids,
+                    input_ids=input_ids,
                     update_memory=update_memory,
                 ),
                 x,
@@ -176,14 +149,15 @@ class BitNetDeep(nn.Module):
                 context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: (
                     contextlib.nullcontext(),
                     layer.infini_attn.use_memory_state(
-                        layer_memory_state, update_memory_buffers=False
+                        layer_memory_state, update_memory_buffers=True
                     ),
                 ),
             )
         return layer(
             x,
-            attn_bias=attn_bias,
-            query_valid=query_valid,
+            attention_mask,
+            segment_ids=segment_ids,
+            input_ids=input_ids,
             update_memory=update_memory,
         )
 
@@ -191,8 +165,9 @@ class BitNetDeep(nn.Module):
         self,
         layers: Iterable[HybridTransformerBlock],
         x: torch.Tensor,
-        attn_bias: Optional[torch.Tensor],
-        query_valid: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        segment_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
         *,
         update_memory: Optional[bool] = None,
     ) -> torch.Tensor:
@@ -200,8 +175,9 @@ class BitNetDeep(nn.Module):
         for layer in layers:
             x = layer(
                 x,
-                attn_bias=attn_bias,
-                query_valid=query_valid,
+                attention_mask,
+                segment_ids=segment_ids,
+                input_ids=input_ids,
                 update_memory=update_memory,
             )
         return x
@@ -210,8 +186,9 @@ class BitNetDeep(nn.Module):
         self,
         recurrent: Sequence[HybridTransformerBlock],
         x: torch.Tensor,
-        attn_bias: Optional[torch.Tensor],
-        query_valid: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        segment_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
         *,
         update_memory: bool,
     ) -> torch.Tensor:
@@ -228,8 +205,9 @@ class BitNetDeep(nn.Module):
                 x = self._run_layer(
                     layer,
                     x,
-                    attn_bias,
-                    query_valid,
+                    attention_mask,
+                    segment_ids,
+                    input_ids,
                     update_memory=update_memory,
                 )
             return x
@@ -241,15 +219,17 @@ class BitNetDeep(nn.Module):
         def run_stack(
             hidden_states: torch.Tensor,
             layers_list=layers_list,
-            attn_bias=attn_bias,
-            query_valid=query_valid,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            input_ids=input_ids,
             update_memory=update_memory,
         ) -> torch.Tensor:
             return self._run_stack(
                 layers_list,
                 hidden_states,
-                attn_bias,
-                query_valid,
+                attention_mask,
+                segment_ids,
+                input_ids,
                 update_memory=update_memory,
             )
 
@@ -259,7 +239,7 @@ class BitNetDeep(nn.Module):
             use_reentrant=False,
             context_fn=lambda layers_list=layers_list, mem_states=mem_states: (
                 contextlib.nullcontext(),
-                self._freeze_infini_states(layers_list, mem_states),
+                self._recompute_infini_states(layers_list, mem_states),
             ),
         )
 
@@ -276,12 +256,8 @@ class BitNetDeep(nn.Module):
             for layer in self.layers:
                 layer.infini_attn.reset_memory()
 
-        if segment_ids is not None:
-            attention_mask = document_attention_keep_mask(segment_ids)
-
         x = self.embed_tokens(input_ids)
         x = self.subln(x)
-        attn_bias, query_valid = self._build_shared_attention_bias(x, attention_mask)
 
         p = self.num_prelude
         r = self.num_recurrent
@@ -291,7 +267,7 @@ class BitNetDeep(nn.Module):
 
         # Prelude once (may seed Infini memory; recurrent early loops can read it).
         for layer in self.layers[:p]:
-            x = self._run_layer(layer, x, attn_bias, query_valid)
+            x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
 
         # Recurrent × R + Hyperloop HC. Infini B: read all loops, write last only.
         recurrent = self.layers[p : p + r]
@@ -303,8 +279,9 @@ class BitNetDeep(nn.Module):
                 x_in = self._run_recurrent_iteration(
                     recurrent,
                     x_in,
-                    attn_bias,
-                    query_valid,
+                    attention_mask,
+                    segment_ids,
+                    input_ids,
                     update_memory=write_memory,
                 )
                 e_l = self.loop_hc.loop_embedding(
@@ -317,7 +294,7 @@ class BitNetDeep(nn.Module):
 
         # Coda once
         for layer in self.layers[p + r :]:
-            x = self._run_layer(layer, x, attn_bias, query_valid)
+            x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
 
         x = self.norm(x)
         logits = self.lm_head(x)

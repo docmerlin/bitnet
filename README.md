@@ -27,9 +27,15 @@ Original path, around:
 Key properties:
 
 - ternary linear layers via `HBitLinear`
+- compact DeepSeek Engram conditional memory at layers 1 and 15 by default:
+  deterministic hashed bigram/trigram lookup, hidden-state gating, causal short convolution
+  (`--no-engram` disables it; table capacity via `--engram-vocab-size`)
 - unified hybrid block every layer (`layers/hybrid_block.py`)
 - each block combines:
-  - Infini-Attention style local + memory attention
+  - PaTH-FoX data-dependent positional attention in bounded local windows
+  - Infini-Attention style fixed-size memory for context beyond each window
+  - local attention work scales linearly with sequence length at fixed
+    `--path-window-size` (default 64); no full-sequence attention matrix
   - **Sandwich RMSNorm** residual: `post(x + scale * sublayer(pre(x)))` on attn and FFN
     (pre-norm + residual-stream post-norm; stabilizes looped unrolls)
   - Attention Residuals (learned scale on each residual branch)
@@ -75,15 +81,15 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 - `train.py`: CLI + training loop
 - `data/`: dataset presets, mixture parsing, packing
 - `training/`: losses, schedules, checkpoints, runtime helpers
-- `utils.py`: RoPE / attention-mask helpers
+- `utils.py`: shared BLT RoPE, attention-mask, and checkpoint helpers
 - `data/streams.py`: packing + PrefetchStream
 - `training/runtime.py`: choose_device, AMP, logger, evaluate
 - `layers/hybrid_block.py`: main hybrid transformer block
-- `layers/infini_attention.py`: Infini-Attention-style module with memory handling
+- `layers/engram.py`: DeepSeek Engram-style hashed N-gram conditional memory
+- `layers/infini_attention.py`: local PaTH-FoX attention + Infini memory handling
 - `layers/h_bitlinear.py`: ternary / Hadamard linear layer
 - `layers/rfmoe.py`: routing-free MoE FFN
 - `tokenizer/`: hierarchical tokenizer
-- `utils.py`: rotary embedding and attention-mask helpers
 - `run_train.sh`: full BitNet training launcher
 - `run_local_train.sh`: smaller local BitNet launcher
 

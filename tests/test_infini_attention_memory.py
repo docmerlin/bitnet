@@ -49,11 +49,10 @@ def test_infini_attention_memory_updates() -> bool:
 
     block.train()
     block.infini_attn.reset_memory()
-    initial_state = block.infini_attn.get_memory_state()
     _ = block(x)
     updated_state = block.infini_attn.get_memory_state()
-    assert not torch.allclose(initial_state["memory_k"], updated_state["memory_k"]), "Training forward should update memory"
-    assert not torch.allclose(initial_state["memory_v"], updated_state["memory_v"]), "Training forward should update memory"
+    assert torch.count_nonzero(updated_state["memory_k"]), "Training forward should update memory"
+    assert torch.count_nonzero(updated_state["memory_v"]), "Training forward should update memory"
 
     # Eval may update when allowed (multi-segment). Freeze flag still blocks writes.
     block.eval()
@@ -71,6 +70,18 @@ def test_infini_attention_memory_updates() -> bool:
 
     print("InfiniAttention memory update gating tests passed")
     return True
+
+
+def test_empty_memory_does_not_attenuate_local_attention() -> None:
+    torch.manual_seed(0)
+    block = build_block().eval()
+    x = torch.randn(1, 8, block.hidden_size)
+    block.infini_attn.update_memory_buffers = False
+    block.infini_attn.gate.data.fill_(-100)
+    first = block(x)
+    block.infini_attn.gate.data.fill_(100)
+    second = block(x)
+    assert torch.equal(first, second)
 
 
 def test_checkpoint_recompute_does_not_double_update_memory() -> bool:
@@ -97,7 +108,7 @@ def test_checkpoint_recompute_does_not_double_update_memory() -> bool:
         use_reentrant=False,
         context_fn=lambda: (
             contextlib.nullcontext(),
-            checkpoint_block.infini_attn.use_memory_state(checkpoint_initial_state, update_memory_buffers=False),
+            checkpoint_block.infini_attn.use_memory_state(checkpoint_initial_state, update_memory_buffers=True),
         ),
     )
     checkpoint_output.mean().backward()

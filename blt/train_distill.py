@@ -29,7 +29,7 @@ from blt.patching.student_entropy import StudentEntropyModel
 from blt.patching.teacher_patcher import UniformPatcher, normalize_patch_lengths_to_targets, patch_start_mask_from_lengths
 from optim import build_cmud
 from training.runtime import choose_device
-from utils import load_checkpoint_payload, seed_everything
+from utils import atomic_torch_save, load_checkpoint_payload, seed_everything
 
 
 @dataclass(slots=True)
@@ -511,7 +511,7 @@ def save_checkpoint(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     # Unwrap torch.compile so checkpoint keys stay free of the _orig_mod prefix.
     model_to_save = getattr(student, "_orig_mod", student)
-    torch.save(
+    atomic_torch_save(
         {
             "step": step,
             "config": asdict(config),
@@ -598,14 +598,20 @@ def run_distillation(
 
         # Non-strict so architecture bumps (e.g. TernaryMLP mid_proj) soft-load.
         incompatible = student.load_state_dict(checkpoint["model"], strict=False)
-        if incompatible.missing_keys or incompatible.unexpected_keys:
+        mid_missing = filter_ffn_mid_keys(incompatible.missing_keys)
+        unsupported_missing = [key for key in incompatible.missing_keys if key not in mid_missing]
+        if unsupported_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "checkpoint model does not match current architecture: "
+                f"missing keys: {unsupported_missing}; unexpected keys: {incompatible.unexpected_keys}"
+            )
+        if incompatible.missing_keys:
             print(
                 f"Warning: resumed checkpoint did not match the student exactly. "
                 f"Missing keys: {incompatible.missing_keys}; "
                 f"unexpected keys: {incompatible.unexpected_keys}",
                 flush=True,
             )
-        mid_missing = filter_ffn_mid_keys(incompatible.missing_keys)
         architecture_bump = bool(mid_missing)
         if architecture_bump:
             upgraded = init_missing_ffn_mid_identity(student, incompatible.missing_keys)
@@ -640,11 +646,10 @@ def run_distillation(
                 raise ValueError("checkpoint includes a student patcher; resume with --student-patcher-mode enabled")
             patcher_incompatible = student_patcher.load_state_dict(saved_patcher_state, strict=False)
             if patcher_incompatible.missing_keys or patcher_incompatible.unexpected_keys:
-                print(
-                    f"Warning: student patcher checkpoint mismatch. "
+                raise RuntimeError(
+                    "student patcher checkpoint mismatch: "
                     f"Missing keys: {patcher_incompatible.missing_keys}; "
-                    f"unexpected keys: {patcher_incompatible.unexpected_keys}",
-                    flush=True,
+                    f"unexpected keys: {patcher_incompatible.unexpected_keys}"
                 )
             if (
                 not architecture_bump
