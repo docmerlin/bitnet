@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import io
+import sys
 from types import SimpleNamespace
 
+import pyarrow as pa
 import torch
 
+import data.streams as streams
 from utils import (
     causal_block_attention_bias,
     combine_attention_bias,
@@ -102,6 +106,49 @@ def test_restartable_stream_rejects_pass_without_text() -> None:
         assert "produced no non-empty text records" in str(exc)
     else:
         raise AssertionError("malformed dataset should not restart forever")
+
+
+def test_python314_parquet_streaming_disables_arrow_threads(monkeypatch) -> None:
+    if sys.version_info < (3, 14):
+        return
+
+    calls = []
+
+    class _Fragment:
+        row_groups = [SimpleNamespace(num_rows=1)]
+
+        def subset(self, row_group_ids):
+            calls.append({"row_group_ids": row_group_ids})
+            return self
+
+        def to_batches(self, **kwargs):
+            calls.append(kwargs)
+            yield pa.record_batch({"text": ["example"]})
+
+    monkeypatch.setattr(streams.parquet_module, "open", lambda *_args, **_kwargs: io.BytesIO(), raising=False)
+    monkeypatch.setattr(
+        streams.ds,
+        "ParquetFileFormat",
+        lambda **_kwargs: SimpleNamespace(make_fragment=lambda *_args: _Fragment()),
+    )
+    builder = SimpleNamespace(
+        config=SimpleNamespace(
+            batch_size=None,
+            columns=None,
+            features=None,
+            filters=[("text", "==", "example")],
+            fragment_scan_options=None,
+            on_bad_files="error",
+        ),
+        _cast_table=lambda table: table,
+    )
+
+    tables = list(streams._generate_tables_without_arrow_threads(builder, ["source"], [(0,)]))
+
+    assert len(tables) == 1
+    assert calls[0]["row_group_ids"] == (0,)
+    assert calls[1]["use_threads"] is False
+    assert calls[1]["filter"] is not None
 
 
 if __name__ == "__main__":

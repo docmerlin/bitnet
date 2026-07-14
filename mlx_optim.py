@@ -1,0 +1,211 @@
+"""MLX implementation of cautious MUD with 8-bit cautious Lion fallback."""
+
+from __future__ import annotations
+
+import math
+
+import mlx.core as mx
+import mlx.optimizers as optim
+
+
+QUANT_BLOCK_SIZE = 2048
+
+_RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
+    name="mud_rectangular_lower_solve",
+    input_names=["matrix", "rhs"],
+    output_names=["solution"],
+    source=r"""
+        uint column = thread_position_in_grid.x;
+        uint rows = matrix_shape[0];
+        uint columns = rhs_shape[1];
+        if (column >= columns) {
+            return;
+        }
+        for (uint row = 0; row < rows; ++row) {
+            float value = float(rhs[row * columns + column]);
+            for (uint inner = 0; inner < row; ++inner) {
+                value -= float(matrix[row * rows + inner])
+                    * float(solution[inner * columns + column]);
+            }
+            value /= float(matrix[row * rows + row]);
+            solution[row * columns + column] = T(value);
+        }
+    """,
+)
+
+
+def lower_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
+    columns = rhs.shape[1]
+    return _RECTANGULAR_LOWER_SOLVE(
+        inputs=[matrix.astype(mx.float32), rhs.astype(mx.float32)],
+        template=[("T", mx.float32)],
+        grid=(columns, 1, 1),
+        threadgroup=(min(columns, 256), 1, 1),
+        output_shapes=[rhs.shape],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def mud_decorrelate(update: mx.array, passes: int = 1, eps: float = 1e-8) -> mx.array:
+    if update.ndim != 2:
+        raise ValueError("mud_decorrelate expects a 2D matrix")
+    if passes < 1:
+        raise ValueError("passes must be positive")
+    original_dtype = update.dtype
+    q = update.astype(mx.float32)
+    transposed = q.shape[0] > q.shape[1]
+    if transposed:
+        q = q.T
+    for _ in range(passes):
+        q = q / (mx.linalg.norm(q, axis=1, keepdims=True) + eps)
+        triangle = mx.tril(q @ q.T) + eps * mx.eye(q.shape[0])
+        q = lower_solve(triangle, q)
+        q = q / (mx.linalg.norm(q, axis=1, keepdims=True) + eps)
+    return (q.T if transposed else q).astype(original_dtype)
+
+
+def cautious_mask(update: mx.array, gradient: mx.array) -> mx.array:
+    mask = (update * gradient > 0).astype(update.dtype)
+    scale = update.size / mx.maximum(mx.sum(mask), 1.0)
+    return update * mask * scale
+
+
+def quantize_blockwise(tensor: mx.array, block_size: int = QUANT_BLOCK_SIZE):
+    flat = tensor.astype(mx.float32).reshape(-1)
+    padding = (-flat.size) % block_size
+    if padding:
+        flat = mx.concatenate((flat, mx.zeros((padding,), dtype=flat.dtype)))
+    blocks = flat.reshape(-1, block_size)
+    scale = mx.maximum(mx.max(mx.abs(blocks), axis=1, keepdims=True), 1e-8) / 127.0
+    quantized = mx.clip(mx.round(blocks / scale), -127, 127).astype(mx.int8)
+    return quantized, mx.squeeze(scale, axis=1)
+
+
+def dequantize_blockwise(quantized: mx.array, scale: mx.array, shape: tuple[int, ...]):
+    size = math.prod(shape)
+    return (quantized.astype(mx.float32) * scale[:, None]).reshape(-1)[:size].reshape(shape)
+
+
+class MUD(optim.Optimizer):
+    def __init__(
+        self,
+        learning_rate: float,
+        momentum: float = 0.95,
+        passes: int = 1,
+        weight_decay: float = 0.0,
+    ):
+        super().__init__()
+        self._maybe_schedule("learning_rate", learning_rate)
+        self.momentum = momentum
+        self.passes = passes
+        self.weight_decay = weight_decay
+
+    def init_single(self, parameter: mx.array, state: dict):
+        state["momentum_buffer"] = mx.zeros(parameter.shape, dtype=mx.float32)
+        state["master_parameter"] = parameter.astype(mx.float32)
+
+    def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
+        parameter_dtype = parameter.dtype
+        gradient = gradient.astype(mx.float32)
+        momentum_buffer = self.momentum * state["momentum_buffer"] + gradient
+        direction = gradient + self.momentum * momentum_buffer
+        update = mud_decorrelate(direction, self.passes)
+        update = update * (0.2 * math.sqrt(max(parameter.shape)))
+        update = cautious_mask(update, gradient)
+        state["momentum_buffer"] = momentum_buffer
+        learning_rate = self.learning_rate.astype(mx.float32)
+        master_parameter = state.get("master_parameter", parameter.astype(mx.float32))
+        master_parameter = master_parameter * (1.0 - learning_rate * self.weight_decay) - learning_rate * update
+        state["master_parameter"] = master_parameter
+        return master_parameter.astype(parameter_dtype)
+
+
+class CLion(optim.Optimizer):
+    def __init__(
+        self,
+        learning_rate: float,
+        betas: tuple[float, float] = (0.95, 0.98),
+        eight_bit: bool = True,
+    ):
+        super().__init__()
+        self._maybe_schedule("learning_rate", learning_rate)
+        self.beta1, self.beta2 = betas
+        self.eight_bit = eight_bit
+
+    def init_single(self, parameter: mx.array, state: dict):
+        state["master_parameter"] = parameter.astype(mx.float32)
+        if self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE:
+            blocks = (parameter.size + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
+            state["exp_avg_q"] = mx.zeros((blocks, QUANT_BLOCK_SIZE), dtype=mx.int8)
+            state["exp_avg_scale"] = mx.zeros((blocks,), dtype=mx.float32)
+        else:
+            state["exp_avg"] = mx.zeros(parameter.shape, dtype=mx.float32)
+
+    def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
+        gradient = gradient.astype(mx.float32)
+        use_eight_bit = self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE
+        if "exp_avg_q" in state:
+            momentum = dequantize_blockwise(
+                state["exp_avg_q"],
+                state["exp_avg_scale"],
+                gradient.shape,
+            )
+        elif "exp_avg" in state:
+            momentum = state["exp_avg"]
+        else:
+            momentum = mx.zeros(parameter.shape, dtype=mx.float32)
+        update = mx.sign(self.beta1 * momentum + (1.0 - self.beta1) * gradient)
+        update = cautious_mask(update, gradient)
+        momentum = self.beta2 * momentum + (1.0 - self.beta2) * gradient
+        if use_eight_bit:
+            state["exp_avg_q"], state["exp_avg_scale"] = quantize_blockwise(momentum)
+            state.pop("exp_avg", None)
+        else:
+            state["exp_avg"] = momentum
+            state.pop("exp_avg_q", None)
+            state.pop("exp_avg_scale", None)
+        master_parameter = state.get("master_parameter", parameter.astype(mx.float32))
+        master_parameter = master_parameter - self.learning_rate.astype(mx.float32) * update
+        state["master_parameter"] = master_parameter
+        return master_parameter.astype(parameter.dtype)
+
+
+class CMUD(optim.MultiOptimizer):
+    def __init__(
+        self,
+        *,
+        mud_learning_rate: float,
+        fallback_learning_rate: float,
+        weight_decay: float,
+        momentum: float = 0.95,
+        passes: int = 1,
+        betas: tuple[float, float] = (0.95, 0.98),
+        eight_bit: bool = True,
+    ):
+        self.mud_learning_rate = mud_learning_rate
+        self.fallback_learning_rate = fallback_learning_rate
+        mud = MUD(mud_learning_rate, momentum, passes, weight_decay)
+        clion = CLion(fallback_learning_rate, betas, eight_bit)
+        super().__init__([mud, clion], [self._is_mud_parameter])
+
+    @staticmethod
+    def _is_mud_parameter(path: str, parameter: mx.array) -> bool:
+        embedding = path.endswith("embedding.weight") or path.endswith("loop_embed.weight")
+        depthwise_conv = path.endswith("short_conv_weight")
+        return parameter.ndim == 2 and not embedding and not depthwise_conv
+
+    def set_lr_multiplier(self, multiplier: float) -> None:
+        self.optimizers[0].learning_rate = self.mud_learning_rate * multiplier
+        self.optimizers[1].learning_rate = self.fallback_learning_rate * multiplier
+
+    def checkpoint_config(self) -> dict:
+        mud, clion = self.optimizers
+        return {
+            "mud_learning_rate": self.mud_learning_rate,
+            "fallback_learning_rate": self.fallback_learning_rate,
+            "weight_decay": mud.weight_decay,
+            "momentum": mud.momentum,
+            "passes": mud.passes,
+            "betas": [clion.beta1, clion.beta2],
+            "eight_bit": clion.eight_bit,
+        }

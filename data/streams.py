@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import random
+import sys
 import threading
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -15,6 +16,61 @@ try:
     from datasets import load_dataset
 except ImportError:  # pragma: no cover - optional dependency for training only.
     load_dataset = None
+
+
+if load_dataset is not None and sys.version_info >= (3, 14):
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    from datasets.builder import Key
+    from datasets.packaged_modules.parquet import parquet as parquet_module
+    from datasets.packaged_modules.parquet.parquet import Parquet
+    from datasets.utils.file_utils import xopen
+
+    def _generate_tables_without_arrow_threads(self, files, row_groups_list):
+        # Arrow workers calling Python-backed HTTP files can deadlock during
+        # CPython 3.14 finalization. Synchronous reads leave no worker behind.
+        if self.config.features is not None and self.config.columns is not None:
+            if sorted(field.name for field in self.info.features.arrow_schema) != sorted(self.config.columns):
+                raise ValueError(
+                    f"Tried to load parquet data with columns '{self.config.columns}' "
+                    f"with mismatching features '{self.info.features}'"
+                )
+        filter_expr = (
+            parquet_module.pq.filters_to_expression(self.config.filters)
+            if isinstance(self.config.filters, list)
+            else self.config.filters
+        )
+        file_format = ds.ParquetFileFormat(default_fragment_scan_options=self.config.fragment_scan_options)
+        for file_index, (file, row_groups) in enumerate(zip(files, row_groups_list)):
+            open_file = getattr(parquet_module, "open", xopen)
+            try:
+                with open_file(file, "rb") as handle:
+                    fragment = file_format.make_fragment(handle)
+                    if row_groups is not None:
+                        fragment = fragment.subset(row_group_ids=row_groups)
+                    if fragment.row_groups:
+                        batch_size = self.config.batch_size or fragment.row_groups[0].num_rows
+                        for batch_index, batch in enumerate(
+                            fragment.to_batches(
+                                batch_size=batch_size,
+                                columns=self.config.columns,
+                                filter=filter_expr,
+                                batch_readahead=0,
+                                fragment_readahead=0,
+                                use_threads=False,
+                            )
+                        ):
+                            yield Key(file_index, batch_index), self._cast_table(pa.Table.from_batches([batch]))
+            except (pa.ArrowInvalid, ValueError) as error:
+                message = f"Skipping bad file '{file}'. {type(error).__name__}: {error}"
+                if self.config.on_bad_files == "error":
+                    raise
+                if self.config.on_bad_files == "warn":
+                    parquet_module.logger.warning(message)
+                else:
+                    parquet_module.logger.debug(message)
+
+    Parquet._generate_tables = _generate_tables_without_arrow_threads
 
 try:
     from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer

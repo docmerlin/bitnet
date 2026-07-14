@@ -1,6 +1,7 @@
 torch
 datasets
 tiktoken
+mlx; sys_platform == "darwin" and platform_machine == "arm64"
 
 # Optional test runner.
 pytest

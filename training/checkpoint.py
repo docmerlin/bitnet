@@ -53,9 +53,14 @@ def save_checkpoint(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / checkpoint_name
 
+    optimizer_state = optimizer.state_dict()
+    parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
+    for saved_group, live_group in zip(optimizer_state["param_groups"], optimizer.param_groups):
+        saved_group["param_names"] = [parameter_names[id(parameter)] for parameter in live_group["params"]]
+
     payload = {
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "optimizer": optimizer_state,
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
         "trainer_state": asdict(state),
