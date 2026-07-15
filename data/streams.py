@@ -77,6 +77,12 @@ try:
 except ImportError:  # pragma: no cover
     HierarchicalTokenizer = Any  # type: ignore[misc, assignment]
 
+
+def _nested_tuple(value):
+    if isinstance(value, list):
+        return tuple(_nested_tuple(item) for item in value)
+    return value
+
 __all__ = [
     "BatchStream",
     "PackedSequenceStream",
@@ -166,10 +172,16 @@ class TextDatasetStream:
         self.seed = seed
         self.shuffle = shuffle
         self.shuffle_buffer_size = shuffle_buffer_size
+        if shuffle and shuffle_buffer_size < 1:
+            raise ValueError("shuffle_buffer_size must be positive when shuffle is enabled")
         self.skip_examples = skip_examples
         self.restart_on_eof = restart_on_eof
         self.restart_count = 0
         self.yielded_this_pass = False
+        self.shuffle_rng = random.Random(seed)
+        self.shuffle_buffer: List[str] = []
+        self.source_exhausted = False
+        self.dataset = None
         self.iterator = self._build_iterator()
 
     def _build_iterator(self) -> Iterator[Dict[str, Any]]:
@@ -179,20 +191,15 @@ class TextDatasetStream:
                 "`python3 -m pip install -r requirements.txt`."
             )
 
-        dataset = load_dataset(
+        self.dataset = load_dataset(
             self.source.path,
             name=self.source.config_name,
             split=self.source.split,
             streaming=True,
         )
         if self.skip_examples > 0:
-            dataset = dataset.skip(self.skip_examples)
-        if self.shuffle:
-            dataset = dataset.shuffle(
-                seed=self.seed + self.restart_count,
-                buffer_size=self.shuffle_buffer_size,
-            )
-        return iter(dataset)
+            self.dataset = self.dataset.skip(self.skip_examples)
+        return iter(self.dataset)
 
     def _extract_text(self, example: Dict[str, Any]) -> Optional[str]:
         if self.source.text_field in example and isinstance(example[self.source.text_field], str):
@@ -207,22 +214,9 @@ class TextDatasetStream:
     def __iter__(self) -> "TextDatasetStream":
         return self
 
-    def __next__(self) -> str:
+    def _next_source_text(self) -> str:
         while True:
-            try:
-                example = next(self.iterator)
-            except StopIteration:
-                if not self.restart_on_eof:
-                    raise
-                if not self.yielded_this_pass:
-                    raise ValueError(
-                        f"dataset {self.source.path!r} produced no non-empty text records"
-                    )
-                self.restart_count += 1
-                self.yielded_this_pass = False
-                self.iterator = self._build_iterator()
-                continue
-
+            example = next(self.iterator)
             text = self._extract_text(example)
             if text is None:
                 continue
@@ -230,6 +224,71 @@ class TextDatasetStream:
             if text:
                 self.yielded_this_pass = True
                 return text
+
+    def _restart(self) -> None:
+        if not self.restart_on_eof:
+            raise StopIteration
+        if not self.yielded_this_pass:
+            raise ValueError(f"dataset {self.source.path!r} produced no non-empty text records")
+        self.restart_count += 1
+        self.yielded_this_pass = False
+        if getattr(self, "shuffle", False):
+            self.source_exhausted = False
+            self.shuffle_buffer.clear()
+            self.shuffle_rng.seed(self.seed + self.restart_count)
+        self.iterator = self._build_iterator()
+
+    def __next__(self) -> str:
+        if not getattr(self, "shuffle", False):
+            while True:
+                try:
+                    return self._next_source_text()
+                except StopIteration:
+                    self._restart()
+
+        while True:
+            while len(self.shuffle_buffer) < self.shuffle_buffer_size and not self.source_exhausted:
+                try:
+                    self.shuffle_buffer.append(self._next_source_text())
+                except StopIteration:
+                    self.source_exhausted = True
+            if self.shuffle_buffer:
+                index = self.shuffle_rng.randrange(len(self.shuffle_buffer))
+                value = self.shuffle_buffer[index]
+                if self.source_exhausted:
+                    self.shuffle_buffer.pop(index)
+                else:
+                    try:
+                        self.shuffle_buffer[index] = self._next_source_text()
+                    except StopIteration:
+                        self.source_exhausted = True
+                        self.shuffle_buffer.pop(index)
+                return value
+            self._restart()
+
+    def state_dict(self) -> Dict[str, Any]:
+        if self.dataset is None or not hasattr(self.dataset, "state_dict"):
+            raise RuntimeError("dataset does not support resumable streaming state")
+        return {
+            "restart_count": self.restart_count,
+            "yielded_this_pass": self.yielded_this_pass,
+            "source_exhausted": self.source_exhausted,
+            "shuffle_rng": self.shuffle_rng.getstate(),
+            "shuffle_buffer": self.shuffle_buffer,
+            "dataset": self.dataset.state_dict(),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.restart_count = int(state["restart_count"])
+        self.yielded_this_pass = bool(state["yielded_this_pass"])
+        self.source_exhausted = bool(state["source_exhausted"])
+        self.shuffle_buffer = list(state["shuffle_buffer"])
+        self.shuffle_rng.setstate(_nested_tuple(state["shuffle_rng"]))
+        self.iterator = self._build_iterator()
+        if self.dataset is None or not hasattr(self.dataset, "load_state_dict"):
+            raise RuntimeError("dataset does not support resumable streaming state")
+        self.dataset.load_state_dict(state["dataset"])
+        self.iterator = iter(self.dataset)
 
 
 class WeightedMixtureStream:
@@ -246,6 +305,19 @@ class WeightedMixtureStream:
     def __next__(self) -> str:
         index = self.rng.choices(range(len(self.streams)), weights=self.weights, k=1)[0]
         return next(self.streams[index])
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "rng": self.rng.getstate(),
+            "streams": [stream.state_dict() for stream in self.streams],
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if len(state["streams"]) != len(self.streams):
+            raise ValueError("checkpoint dataset mixture does not match current mixture")
+        self.rng.setstate(_nested_tuple(state["rng"]))
+        for stream, stream_state in zip(self.streams, state["streams"]):
+            stream.load_state_dict(stream_state)
 
 
 class PackedSequenceStream:
@@ -308,6 +380,20 @@ class PackedSequenceStream:
             "label_segment_ids": label_segment_ids,
         }
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "text_stream": self.text_stream.state_dict(),
+            "buffer": self.buffer,
+            "segment_buffer": self.segment_buffer,
+            "next_segment_id": self.next_segment_id,
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.text_stream.load_state_dict(state["text_stream"])
+        self.buffer = list(state["buffer"])
+        self.segment_buffer = list(state["segment_buffer"])
+        self.next_segment_id = int(state["next_segment_id"])
+
 
 class BatchStream:
     """Batch fixed-length packed sequences without a DataLoader."""
@@ -325,6 +411,12 @@ class BatchStream:
             key: torch.stack([sample[key] for sample in batch], dim=0)
             for key in ("input_ids", "labels", "segment_ids", "label_segment_ids")
         }
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"sequence_stream": self.sequence_stream.state_dict()}
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.sequence_stream.load_state_dict(state["sequence_stream"])
 
 
 def build_text_stream(

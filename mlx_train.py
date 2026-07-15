@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rfmoe-expert-dim", type=int, default=None)
     parser.add_argument("--rfmoe-rank", type=int, default=None)
     parser.add_argument("--rfmoe-theta", type=float, default=0.01)
+    parser.add_argument("--rfmoe-backend", choices=("auto", "metal", "hybrid", "host"), default="auto")
     parser.add_argument("--rfmoe-density-target", type=float, default=0.25)
     parser.add_argument("--rfmoe-density-eta", type=float, default=0.01)
     parser.add_argument("--rfmoe-locality-coef", type=float, default=0.0)
@@ -96,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-activation-bits", type=int, default=4)
     parser.add_argument("--precision", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--path-kernel", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=200)
@@ -132,10 +134,17 @@ def create_gradient_step(
     mtp_loss_coef: float = 0.0,
     locality_coef: float = 0.0,
     diversity_coef: float = 0.0,
+    gradient_checkpointing: bool = False,
 ):
     def loss_fn(inputs, targets, segment_ids, label_segment_ids, density_lam, rfmoe_s, rfmoe_alpha):
         return_mtp = model.config.mtp_depth > 0
-        output = model(inputs, segment_ids, num_loops=num_loops, return_mtp=return_mtp)
+        output = model(
+            inputs,
+            segment_ids,
+            num_loops=num_loops,
+            return_mtp=return_mtp,
+            checkpoint_activations=gradient_checkpointing,
+        )
         logits, mtp_logits = output if return_mtp else (output, [])
         valid = segment_ids == label_segment_ids
         loss = _masked_ce(logits, targets, valid)
@@ -158,12 +167,13 @@ def create_gradient_step(
         return loss
 
     gradient_step = nn.value_and_grad(model, loss_fn)
-    if compile_step:
+    if compile_step and (not model.config.use_rfmoe or model.config.rfmoe_backend == "metal"):
         gradient_step = partial(mx.compile, inputs=model.state, outputs=model.state)(gradient_step)
     return gradient_step
 
 
 def create_train_step(model: MLXBitNet, optimizer: optim.Optimizer, *, compile_step: bool = True):
+    compile_step = compile_step and (not model.config.use_rfmoe or model.config.rfmoe_backend == "metal")
     optimizer.init(model.trainable_parameters())
     gradient_step = create_gradient_step(
         model,
@@ -205,6 +215,7 @@ def save_checkpoint(
     trainer_state: dict,
     name: str,
     training_args: dict | None = None,
+    stream_state: dict | None = None,
 ) -> Path:
     checkpoint_dir = output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -222,6 +233,8 @@ def save_checkpoint(
         "model_config": asdict(config),
         "optimizer_config": optimizer.checkpoint_config() if isinstance(optimizer, CMUD) else None,
         "training_args": training_args,
+        "stream_state": stream_state,
+        "mlx_random_state": [value.tolist() for value in mx.random.state],
     }
     path.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return path
@@ -265,6 +278,8 @@ def load_checkpoint(path: Path, model: MLXBitNet, optimizer: optim.Optimizer) ->
         raise ValueError(f"Optimizer checkpoint tensor mismatch: {sorted(invalid_optimizer)}")
     optimizer.state = tree_unflatten(list(optimizer_state.items()))
     metadata = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+    if metadata.get("mlx_random_state") is not None:
+        mx.random.state[:] = [mx.array(value, dtype=mx.uint32) for value in metadata["mlx_random_state"]]
     return metadata["trainer_state"]
 
 
@@ -361,8 +376,12 @@ def main() -> None:
             rfmoe_expert_dim=args.rfmoe_expert_dim,
             rfmoe_rank=args.rfmoe_rank,
             rfmoe_theta=args.rfmoe_theta,
+            rfmoe_backend=args.rfmoe_backend,
             mtp_depth=args.mtp_depth,
         )
+    if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
+        print("RFMoE uses exact dynamic threshold compaction; disabling whole-step MLX compilation.", flush=True)
+        args.compile = False
     model = MLXBitNet(config)
     dtype = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}[args.precision]
     model.set_dtype(dtype)
@@ -415,6 +434,20 @@ def main() -> None:
             max_document_tokens=args.max_document_tokens,
             micro_batch_size=args.micro_batch_size,
         )
+    if args.resume_from:
+        stream_state = saved.get("stream_state")
+        if stream_state is None:
+            print("Warning: checkpoint has no dataset stream state; training data restarts.", flush=True)
+        else:
+            early_stream.load_state_dict(stream_state["early"])
+            if late_stream is not None and stream_state.get("late") is not None:
+                late_stream.load_state_dict(stream_state["late"])
+
+    def current_stream_state() -> dict:
+        return {
+            "early": early_stream.state_dict(),
+            "late": late_stream.state_dict() if late_stream is not None else None,
+        }
 
     tokens_per_microbatch = args.micro_batch_size * args.sequence_length
     tokens_per_step = tokens_per_microbatch * args.grad_accumulation_steps
@@ -469,6 +502,7 @@ def main() -> None:
                 mtp_loss_coef=args.mtp_loss_coef,
                 locality_coef=args.rfmoe_locality_coef,
                 diversity_coef=args.rfmoe_diversity_coef,
+                gradient_checkpointing=args.gradient_checkpointing,
             )
         gradient_step = gradient_steps[key]
         active_stream = late_stream if late_stream is not None and progress >= args.mixture_switch_ratio else early_stream
@@ -538,15 +572,50 @@ def main() -> None:
             print(" | ".join(f"{key}={value}" for key, value in validation.items()))
             if validation and validation["val_loss"] < trainer_state["best_val_loss"]:
                 trainer_state["best_val_loss"] = validation["val_loss"]
-                save_checkpoint(output_dir, model, optimizer, config, trainer_state, "best", vars(args))
+                save_checkpoint(
+                    output_dir,
+                    model,
+                    optimizer,
+                    config,
+                    trainer_state,
+                    "best",
+                    vars(args),
+                    current_stream_state(),
+                )
         if args.save_interval > 0 and step % args.save_interval == 0:
+            stream_state = current_stream_state()
             path = save_checkpoint(
-                output_dir, model, optimizer, config, trainer_state, f"step_{step:07d}", vars(args)
+                output_dir,
+                model,
+                optimizer,
+                config,
+                trainer_state,
+                f"step_{step:07d}",
+                vars(args),
+                stream_state,
             )
-            save_checkpoint(output_dir, model, optimizer, config, trainer_state, "last", vars(args))
+            save_checkpoint(
+                output_dir,
+                model,
+                optimizer,
+                config,
+                trainer_state,
+                "last",
+                vars(args),
+                stream_state,
+            )
             print(f"Saved checkpoint to {path}")
 
-    final_path = save_checkpoint(output_dir, model, optimizer, config, trainer_state, "final", vars(args))
+    final_path = save_checkpoint(
+        output_dir,
+        model,
+        optimizer,
+        config,
+        trainer_state,
+        "final",
+        vars(args),
+        current_stream_state(),
+    )
     wall_time = time.perf_counter() - started
     print(f"Training complete in {wall_time:.1f}s. Final checkpoint: {final_path}")
 

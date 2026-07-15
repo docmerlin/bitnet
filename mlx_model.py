@@ -9,8 +9,10 @@ import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.utils import checkpoint as activation_checkpoint
 
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
+from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class MLXBitNetConfig:
     rfmoe_expert_dim: int | None = None
     rfmoe_rank: int | None = None
     rfmoe_theta: float = 0.01
+    rfmoe_backend: str = "auto"
     mtp_depth: int = 0
 
     def __post_init__(self) -> None:
@@ -64,6 +67,8 @@ class MLXBitNetConfig:
             raise ValueError("invalid Engram table or N-gram size")
         if self.rfmoe_num_experts < 1:
             raise ValueError("rfmoe_num_experts must be positive")
+        if self.rfmoe_backend not in {"auto", "metal", "hybrid", "host"}:
+            raise ValueError("rfmoe_backend must be auto, metal, hybrid, or host")
 
     @property
     def num_hidden_layers(self) -> int:
@@ -89,7 +94,7 @@ class MLXHBitLinear(nn.Module):
         self.activation_levels = mx.array(float((2 ** (config.activation_bits - 1)) - 1))
         self.freeze(keys=["weight_mix", "activation_mix", "activation_levels"], recurse=False)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def prepare_input(self, x: mx.array) -> mx.array:
         if self.config.use_hadamard and self.input_dims & (self.input_dims - 1) == 0:
             x = mx.hadamard_transform(x)
         if self.config.use_4bit_activations:
@@ -98,13 +103,19 @@ class MLXHBitLinear(nn.Module):
             activation_scale = mx.maximum(mx.max(mx.abs(x), axis=-1, keepdims=True), 1e-5) / levels
             quantized_x = mx.clip(mx.round(x / activation_scale), -negative_levels, levels) * activation_scale
             x = x + self.activation_mix * mx.stop_gradient(quantized_x - x)
+        return x
 
-        weight_scale = mx.maximum(mx.mean(mx.abs(self.weight), axis=-1, keepdims=True), 1e-5)
-        normalized = self.weight / weight_scale
+    def effective_weight(self, dtype, weight: mx.array | None = None) -> mx.array:
+        weight = self.weight if weight is None else weight
+        weight_scale = mx.maximum(mx.mean(mx.abs(weight), axis=-1, keepdims=True), 1e-5)
+        normalized = weight / weight_scale
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
         quantized_weight = ternary * weight_scale
-        weight = self.weight + self.weight_mix * mx.stop_gradient(quantized_weight - self.weight)
-        return x @ weight.astype(x.dtype).T
+        return (weight + self.weight_mix * mx.stop_gradient(quantized_weight - weight)).astype(dtype)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.prepare_input(x)
+        return x @ self.effective_weight(x.dtype).T
 
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
         self.weight_mix = mx.array(weight_mix)
@@ -209,6 +220,13 @@ class MLXRFMoE(nn.Module):
         expert_dim = config.rfmoe_expert_dim or config.intermediate_size // 4
         rank = config.rfmoe_rank or max(1, config.hidden_size // 16)
         self.theta = config.rfmoe_theta
+        self.backend = (
+            "hybrid"
+            if config.rfmoe_backend == "auto" and mx.metal.is_available()
+            else "host"
+            if config.rfmoe_backend == "auto"
+            else config.rfmoe_backend
+        )
         self.experts = [MLXRFMoEExpert(config, expert_dim, rank) for _ in range(config.rfmoe_num_experts)]
         self.usage_ema = mx.full((config.rfmoe_num_experts,), 1.0 / config.rfmoe_num_experts)
         self.last_usage = mx.zeros((config.rfmoe_num_experts,))
@@ -216,25 +234,138 @@ class MLXRFMoE(nn.Module):
         self.last_density = mx.array(0.0)
         self.freeze(keys=["usage_ema", "last_usage", "last_gate", "last_density"], recurse=False)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    @staticmethod
+    def _grouped_linear(x: mx.array, layers: list[MLXHBitLinear], expert_indices: mx.array) -> mx.array:
+        prepared = layers[0].prepare_input(x)
+        weights = mx.stack([layer.weight for layer in layers])
+        weights = layers[0].effective_weight(prepared.dtype, weights).swapaxes(-1, -2)
+        return mx.squeeze(
+            mx.gather_mm(
+                prepared[:, None, :],
+                weights,
+                rhs_indices=expert_indices,
+            ),
+            axis=1,
+        )
+
+    @staticmethod
+    def _metal_grouped_linear(x: mx.array, layers: list[MLXHBitLinear], active: mx.array) -> mx.array:
+        shape = x.shape
+        prepared = layers[0].prepare_input(x.reshape(-1, shape[-1])).reshape(shape)
+        weights = layers[0].effective_weight(
+            prepared.dtype,
+            mx.stack([layer.weight for layer in layers]),
+        )
+        return masked_grouped_linear(prepared, weights, active)
+
+    @staticmethod
+    def _hybrid_grouped_linear(
+        x: mx.array,
+        layers: list[MLXHBitLinear],
+        active: mx.array,
+        expert_indices: mx.array,
+        token_indices: mx.array,
+    ) -> mx.array:
+        shape = x.shape
+        prepared = layers[0].prepare_input(x.reshape(-1, shape[-1])).reshape(shape)
+        weights = layers[0].effective_weight(
+            prepared.dtype,
+            mx.stack([layer.weight for layer in layers]),
+        )
+        return compacted_grouped_linear(prepared, weights, active, expert_indices, token_indices)
+
+    def _scores(self, flat: mx.array):
+        a_gates = [expert.a_gate for expert in self.experts]
+        score_input = a_gates[0].prepare_input(flat)
+        a_gate = a_gates[0].effective_weight(
+            score_input.dtype,
+            mx.stack([layer.weight for layer in a_gates]),
+        )
+        z = mx.einsum("td,erd->etr", score_input, a_gate)
+        biases = mx.stack([expert.bias for expert in self.experts])
+        gate_stack = mx.maximum(mx.linalg.norm(z, axis=-1) - biases, 0.0)
+        return z, gate_stack
+
+    def _metal_forward_arrays(self, x: mx.array):
         flat = x.reshape(-1, x.shape[-1])
+        z, gate_stack = self._scores(flat)
+        active = gate_stack >= self.theta
+        b_gates = [expert.b_gate for expert in self.experts]
+        w_ups = [expert.w_up for expert in self.experts]
+        w_mids = [expert.w_mid for expert in self.experts]
+        w_downs = [expert.w_down for expert in self.experts]
+        gate = mx.sigmoid(self._metal_grouped_linear(z, b_gates, active))
+        hidden = gate * self._metal_grouped_linear(flat[None, :, :], w_ups, active)
+        hidden = nn.silu(self._metal_grouped_linear(hidden, w_mids, active))
+        contribution = self._metal_grouped_linear(hidden, w_downs, active)
+        output = mx.sum(gate_stack[..., None] * contribution, axis=0)
+        return output.reshape(x.shape), gate_stack, mx.mean(active)
+
+    def _host_forward_arrays(self, x: mx.array):
+        flat = x.reshape(-1, x.shape[-1])
+        z, gate_stack = self._scores(flat)
+
+        active = np.argwhere(np.array(gate_stack >= self.theta))
         output = mx.zeros_like(flat)
-        gates = []
-        fires = []
-        for expert in self.experts:
-            gate, contribution = expert(flat)
-            fire = gate >= self.theta
-            output = output + mx.where(fire[:, None], gate[:, None] * contribution, 0.0)
-            gates.append(gate)
-            fires.append(fire)
-        gate_stack = mx.stack(gates)
-        fire_stack = mx.stack(fires)
+        if active.size:
+            expert_indices = mx.array(active[:, 0], dtype=mx.uint32)
+            token_indices = mx.array(active[:, 1], dtype=mx.uint32)
+            selected_z = z[expert_indices, token_indices]
+            selected_gates = gate_stack[expert_indices, token_indices]
+            b_gates = [expert.b_gate for expert in self.experts]
+            w_ups = [expert.w_up for expert in self.experts]
+            w_mids = [expert.w_mid for expert in self.experts]
+            w_downs = [expert.w_down for expert in self.experts]
+            gate = mx.sigmoid(self._grouped_linear(selected_z, b_gates, expert_indices))
+            hidden = gate * self._grouped_linear(flat[token_indices], w_ups, expert_indices)
+            hidden = nn.silu(self._grouped_linear(hidden, w_mids, expert_indices))
+            contribution = self._grouped_linear(hidden, w_downs, expert_indices)
+            output = output.at[token_indices].add(selected_gates[:, None] * contribution)
+        hard_density = mx.array(active.shape[0] / max(gate_stack.size, 1))
+        return output.reshape(x.shape), gate_stack, hard_density
+
+    def _hybrid_forward_arrays(self, x: mx.array):
+        flat = x.reshape(-1, x.shape[-1])
+        z, gate_stack = self._scores(flat)
+        active = gate_stack >= self.theta
+        active_pairs = np.argwhere(np.array(active))
+        expert_indices = mx.array(active_pairs[:, 0], dtype=mx.uint32)
+        token_indices = mx.array(active_pairs[:, 1], dtype=mx.uint32)
+        b_gates = [expert.b_gate for expert in self.experts]
+        w_ups = [expert.w_up for expert in self.experts]
+        w_mids = [expert.w_mid for expert in self.experts]
+        w_downs = [expert.w_down for expert in self.experts]
+        gate = mx.sigmoid(self._hybrid_grouped_linear(z, b_gates, active, expert_indices, token_indices))
+        hidden = gate * self._hybrid_grouped_linear(
+            flat[None, :, :], w_ups, active, expert_indices, token_indices
+        )
+        hidden = nn.silu(self._hybrid_grouped_linear(
+            hidden, w_mids, active, expert_indices, token_indices
+        ))
+        contribution = self._hybrid_grouped_linear(
+            hidden, w_downs, active, expert_indices, token_indices
+        )
+        output = mx.sum(gate_stack[..., None] * contribution, axis=0)
+        return output.reshape(x.shape), gate_stack, mx.mean(active)
+
+    def forward_arrays(self, x: mx.array):
+        if self.backend == "metal":
+            return self._metal_forward_arrays(x)
+        if self.backend == "hybrid":
+            return self._hybrid_forward_arrays(x)
+        return self._host_forward_arrays(x)
+
+    def update_stats(self, gate_stack: mx.array, hard_density: mx.array) -> None:
         if self.training:
             self.last_gate = gate_stack
             self.last_usage = mx.mean(gate_stack, axis=1)
-            self.last_density = mx.mean(fire_stack)
+            self.last_density = hard_density
             self.usage_ema = 0.99 * self.usage_ema + 0.01 * mx.stop_gradient(self.last_usage)
-        return output.reshape(x.shape)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        output, gate_stack, hard_density = self.forward_arrays(x)
+        self.update_stats(gate_stack, hard_density)
+        return output
 
     def aux_losses(self, s: float, alpha: float):
         density = mx.mean(self.last_usage)
@@ -332,7 +463,15 @@ class MLXPaTHAttention(nn.Module):
         self.memory_v = mx.zeros(shape, dtype=mx.float32)
         self.memory_initialized = mx.zeros((batch_size,), dtype=mx.bool_)
 
-    def _update_memory(self, keys: mx.array, values: mx.array, rows: mx.array) -> None:
+    def _next_memory(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        rows: mx.array,
+        memory_k: mx.array,
+        memory_v: mx.array,
+        memory_initialized: mx.array,
+    ):
         length = keys.shape[2]
         pooled_keys = []
         pooled_values = []
@@ -344,11 +483,9 @@ class MLXPaTHAttention(nn.Module):
         key_update = mx.stack(pooled_keys, axis=2).astype(mx.float32)
         value_update = mx.stack(pooled_values, axis=2).astype(mx.float32)
         rows = rows[:, None, None, None]
-        next_k = 0.99 * self.memory_k + 0.01 * mx.stop_gradient(key_update)
-        next_v = 0.99 * self.memory_v + 0.01 * mx.stop_gradient(value_update)
-        self.memory_k = mx.where(rows, next_k, self.memory_k)
-        self.memory_v = mx.where(rows, next_v, self.memory_v)
-        self.memory_initialized = self.memory_initialized | rows[:, 0, 0, 0]
+        next_k = mx.where(rows, 0.99 * memory_k + 0.01 * mx.stop_gradient(key_update), memory_k)
+        next_v = mx.where(rows, 0.99 * memory_v + 0.01 * mx.stop_gradient(value_update), memory_v)
+        return next_k, next_v, memory_initialized | rows[:, 0, 0, 0]
 
     @staticmethod
     def _shift(projected: mx.array, segment_ids: mx.array | None, offset: int) -> mx.array:
@@ -405,12 +542,15 @@ class MLXPaTHAttention(nn.Module):
         logits = mx.where(keep, logits, -1e9)
         return mx.softmax(logits, axis=-1).astype(v.dtype) @ v
 
-    def __call__(
+    def forward_arrays(
         self,
         x: mx.array,
-        segment_ids: mx.array | None = None,
-        update_memory: bool = True,
-    ) -> mx.array:
+        segment_ids: mx.array | None,
+        memory_k: mx.array,
+        memory_v: mx.array,
+        memory_initialized: mx.array,
+        update_memory: bool,
+    ):
         batch, length, hidden = x.shape
         qkv = self.qkv(x).reshape(
             batch,
@@ -447,18 +587,49 @@ class MLXPaTHAttention(nn.Module):
                     log_forget[:, start:end],
                     chunk_segments,
                 )
-                scores = q[:, :, start:end].astype(mx.float32) @ self.memory_k.swapaxes(-1, -2)
+                scores = q[:, :, start:end].astype(mx.float32) @ memory_k.swapaxes(-1, -2)
                 scores = scores * self.head_dim**-0.5
-                memory_context = mx.softmax(scores, axis=-1).astype(v.dtype) @ self.memory_v.astype(v.dtype)
+                memory_context = mx.softmax(scores, axis=-1).astype(v.dtype) @ memory_v.astype(v.dtype)
                 gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
                 mixed = (1.0 - gate) * local + gate * memory_context
-                use_memory = self.memory_initialized & memory_safe
+                use_memory = memory_initialized & memory_safe
                 local = mx.where(use_memory[:, None, None, None], mixed, local)
                 if update_memory:
-                    self._update_memory(k[:, :, start:end], v[:, :, start:end], memory_safe)
+                    memory_k, memory_v, memory_initialized = self._next_memory(
+                        k[:, :, start:end],
+                        v[:, :, start:end],
+                        memory_safe,
+                        memory_k,
+                        memory_v,
+                        memory_initialized,
+                    )
                 chunks.append(local)
         context = mx.concatenate(chunks, axis=2).transpose(0, 2, 1, 3).reshape(batch, length, hidden)
-        return self.out(context)
+        return self.out(context), memory_k, memory_v, memory_initialized
+
+    def __call__(
+        self,
+        x: mx.array,
+        segment_ids: mx.array | None = None,
+        update_memory: bool = True,
+        checkpoint_activations: bool = False,
+    ) -> mx.array:
+        memory = (self.memory_k, self.memory_v, self.memory_initialized)
+        if checkpoint_activations:
+            run = activation_checkpoint(self, self.forward_arrays)
+        else:
+            run = self.forward_arrays
+        output, memory_k, memory_v, memory_initialized = run(
+            x,
+            segment_ids,
+            *memory,
+            update_memory,
+        )
+        if update_memory:
+            self.memory_k = memory_k
+            self.memory_v = memory_v
+            self.memory_initialized = memory_initialized
+        return output
 
 
 class MLXHybridBlock(nn.Module):
@@ -481,25 +652,41 @@ class MLXHybridBlock(nn.Module):
         self.mlp_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.mlp_scale = mx.array([0.1])
 
+    def _dense_mlp(self, x: mx.array) -> mx.array:
+        gate, value = mx.split(self.up(x), 2, axis=-1)
+        return self.down(nn.silu(self.mid(nn.silu(gate) * value)))
+
     def __call__(
         self,
         x: mx.array,
         input_ids: mx.array,
         segment_ids: mx.array | None = None,
         update_memory: bool = True,
+        checkpoint_activations: bool = False,
     ) -> mx.array:
         if self.engram is not None:
-            x = x + self.engram(x, input_ids, segment_ids)
-        attention = self.attn(self.attn_norm(x), segment_ids, update_memory)
+            run_engram = activation_checkpoint(self.engram) if checkpoint_activations else self.engram
+            x = x + run_engram(x, input_ids, segment_ids)
+        attention = self.attn(
+            self.attn_norm(x),
+            segment_ids,
+            update_memory,
+            checkpoint_activations,
+        )
         x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         normalized = self.mlp_norm(x)
         if self.moe is not None:
-            output = self.moe(normalized)
+            if checkpoint_activations and self.moe.backend != "hybrid":
+                output, gate_stack, hard_density = activation_checkpoint(
+                    self.moe,
+                    self.moe.forward_arrays,
+                )(normalized)
+                self.moe.update_stats(gate_stack, hard_density)
+            else:
+                output = self.moe(normalized)
         else:
-            gate, value = mx.split(self.up(normalized), 2, axis=-1)
-            hidden = nn.silu(gate) * value
-            hidden = nn.silu(self.mid(hidden))
-            output = self.down(hidden)
+            run_mlp = activation_checkpoint(self, self._dense_mlp) if checkpoint_activations else self._dense_mlp
+            output = run_mlp(normalized)
         return self.mlp_post(x + self.mlp_scale * output)
 
 
@@ -559,6 +746,7 @@ class MLXBitNet(nn.Module):
         num_loops: int | None = None,
         return_mtp: bool = False,
         reset_memory: bool = True,
+        checkpoint_activations: bool = False,
     ):
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
@@ -569,19 +757,25 @@ class MLXBitNet(nn.Module):
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
         for block in self.blocks[:prelude_end]:
-            x = block(x, tokens, segment_ids, True)
+            x = block(x, tokens, segment_ids, True, checkpoint_activations)
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
             for loop_index in range(loops):
                 x, post, residual = self.loop_hc.project_in(streams)
                 for block in self.blocks[prelude_end:recurrent_end]:
-                    x = block(x, tokens, segment_ids, loop_index == loops - 1)
+                    x = block(
+                        x,
+                        tokens,
+                        segment_ids,
+                        loop_index == loops - 1,
+                        checkpoint_activations,
+                    )
                 embedding_index = min(loop_index, 63)
                 output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
                 streams = self.loop_hc.write_back(streams, output, post, residual)
             x = self.loop_hc.fold(streams)
         for block in self.blocks[recurrent_end:]:
-            x = block(x, tokens, segment_ids, True)
+            x = block(x, tokens, segment_ids, True, checkpoint_activations)
         hidden = self.norm(x)
         logits = hidden @ self.embedding.weight.T
         if return_mtp:

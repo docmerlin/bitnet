@@ -289,12 +289,18 @@ python3 mlx_benchmark.py --backend torch --steps 100 --warmup-steps 5 \
 Implemented:
 
 - `mlx_model.py`: ternary blocks, native Hadamard transform, custom Metal PaTH solve,
-  packed-document masking, Engram, Infini memory, RFMoE, four-stream Hyperloop HC,
-  prelude/recurrent/coda execution, and MTP heads.
+  packed-document masking, Engram, Infini memory, grouped sparse RFMoE dispatch through
+  conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda execution,
+  and MTP heads.
+- `mlx_rfmoe_kernel.py`: conditional grouped expert projections plus sparse custom
+  input/weight VJPs. The default hybrid path uses one host compaction and compact
+  `gather_mm` forwards while retaining static intermediates for Metal backward.
 - `mlx_train.py`: streaming Hugging Face mixtures through the existing tokenizer and
-  packer, compiled BF16 gradients, gradient accumulation, CE/z/MTP/RF auxiliary losses,
-  quantization/loop/block/RF/data/LR curricula, validation, JSONL metrics, and resumable
-  safetensor model/optimizer checkpoints.
+  packer, compiled BF16 gradients, activation checkpointing, gradient accumulation,
+  CE/z/MTP/RF auxiliary losses, quantization/loop/block/RF/data/LR curricula, validation,
+  JSONL metrics, and resumable safetensor model/optimizer checkpoints. Resume restores
+  MLX RNG, mixture RNG, Hugging Face iterator positions, shuffle buffers, and partial
+  packed sequences.
 - `mlx_optim.py`: C-MUD for non-embedding matrices and blockwise-int8 C-Lion for
   embeddings, norms, biases, and gates, including cautious masking, Metal triangular
   whitening, independent learning rates, and resumable optimizer state.
@@ -305,11 +311,30 @@ Implemented:
 Remaining differences are implementation and training-trajectory parity, not missing
 model features:
 
-- MLX RFMoE currently evaluates every expert then masks inactive contributions; grouped
-  sparse Metal execution is still needed for RFMoE compute savings.
-- Multi-host distributed training and activation checkpointing are not implemented.
-- Resume restores model, optimizer, counters, best loss, and RF density lambda; like the
-  PyTorch trainer, dataset streams restart rather than restoring iterator/RNG position.
+- RFMoE preserves independent self-gating: every expert scores every token and every pair
+  above `theta` executes. Default `--rfmoe-backend auto` selects `hybrid` when Metal is
+  available and `host` otherwise. Hybrid was fastest in local RFMoE and one/two-block
+  measurements, `metal` keeps static shapes and activation recomputation for lower-memory
+  compiled runs, and `host` retains native `gather_mm` backward for parity checks and
+  inference.
+- Multi-host distributed training is not implemented.
+- Converted PyTorch and older MLX checkpoints have no dataset stream state, so their first
+  MLX resume warns and restarts data. Checkpoints subsequently written by `mlx_train.py`
+  resume exactly.
+
+At hidden size 512, 8 experts, expert width 256, 512 tokens, BF16, and 25% active
+density, RFMoE layer measurements were:
+
+| Backend | Forward | Forward + backward |
+| --- | ---: | ---: |
+| Host | 3.3 ms | 244.7 ms |
+| Static Metal | 18.6 ms | 31.9 ms |
+| Hybrid host-forward/Metal-backward | 3.8 ms | 18.1 ms |
+
+Hybrid training beat static Metal by 1.34x at 12.5% density, 2.36x at 50%, and 3.10x
+at 100%. Including one full attention/RFMoE block, hybrid measured 63.0 ms versus
+75.7 ms; two blocks measured 121.2 ms versus 152.9 ms. Hybrid retains RFMoE
+intermediates instead of activation-checkpointing that sublayer, trading memory for speed.
 
 Use `mlx_train.py` for native MLX experiments; do not expect identical step-by-step loss
 to `train.py` because backend kernels and RFMoE execution order differ.

@@ -84,6 +84,7 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 - `mlx_model.py` / `mlx_train.py`: native MLX model and curriculum trainer
 - `mlx_convert.py`: warm-convert PyTorch C-MUD checkpoints to MLX
 - `mlx_path_kernel.py`: trainable custom Metal solve for PaTH-FoX
+- `mlx_rfmoe_kernel.py`: differentiable conditional Metal expert projections
 - `mlx_optim.py`: native C-MUD and blockwise-int8 C-Lion optimizer
 - `utils.py`: shared BLT RoPE, attention-mask, and checkpoint helpers
 - `data/streams.py`: packing + PrefetchStream

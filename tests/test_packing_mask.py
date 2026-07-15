@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 from types import SimpleNamespace
 
 import pyarrow as pa
 import torch
+from datasets import IterableDataset
 
 import data.streams as streams
+from data.presets import DatasetSource
+from data.streams import build_batch_stream
 from utils import (
     causal_block_attention_bias,
     combine_attention_bias,
@@ -149,6 +153,51 @@ def test_python314_parquet_streaming_disables_arrow_threads(monkeypatch) -> None
     assert calls[0]["row_group_ids"] == (0,)
     assert calls[1]["use_threads"] is False
     assert calls[1]["filter"] is not None
+
+
+def test_batch_stream_state_restores_exact_next_batch(monkeypatch) -> None:
+    documents = [{"text": f"document-{index}"} for index in range(30)]
+    monkeypatch.setattr(
+        streams,
+        "load_dataset",
+        lambda *_args, **_kwargs: IterableDataset.from_generator(lambda: iter(documents)),
+    )
+
+    class _Tokenizer:
+        def encode(self, text, **_kwargs):
+            return [258, *(text.encode()[:8]), 259]
+
+    mixture = [(DatasetSource("test", "test", None, "train", "text"), 1.0)]
+
+    def make_stream():
+        return build_batch_stream(
+            mixture,
+            _Tokenizer(),
+            seed=17,
+            shuffle=True,
+            shuffle_buffer_size=5,
+            skip_examples=0,
+            restart_on_eof=True,
+            sequence_length=7,
+            max_document_tokens=32,
+            micro_batch_size=2,
+        )
+
+    original = make_stream()
+    for _ in range(3):
+        next(original)
+    state = json.loads(json.dumps(original.state_dict()))
+    expected = [next(original) for _ in range(4)]
+
+    restored = make_stream()
+    restored.load_state_dict(state)
+    actual = [next(restored) for _ in range(4)]
+
+    assert all(
+        torch.equal(expected_batch[key], actual_batch[key])
+        for expected_batch, actual_batch in zip(expected, actual)
+        for key in expected_batch
+    )
 
 
 if __name__ == "__main__":

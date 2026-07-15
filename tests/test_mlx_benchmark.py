@@ -1,16 +1,19 @@
 """Minimal checks for the representative MLX benchmark."""
 
 from argparse import Namespace
+from dataclasses import replace
 
 import pytest
 
 mx = pytest.importorskip("mlx.core")
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from mlx_benchmark import run_mlx, validate_args
-from mlx_model import MLXBitNet, MLXBitNetConfig, MLXPaTHAttention
+from mlx_model import MLXBitNet, MLXBitNetConfig, MLXPaTHAttention, MLXRFMoE
 from mlx_optim import CMUD
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
+from mlx_rfmoe_kernel import masked_grouped_linear
 from mlx_train import create_train_step, load_checkpoint, save_checkpoint
 
 
@@ -35,6 +38,36 @@ def test_path_metal_kernel_matches_forward_and_gradients() -> None:
     mx.eval(reference_grads, metal_grads)
     assert mx.allclose(metal_grads[0], reference_grads[0], rtol=1e-4, atol=1e-4).item()
     assert mx.allclose(metal_grads[1], reference_grads[1], rtol=1e-4, atol=1e-4).item()
+
+
+def test_rfmoe_masked_grouped_metal_matches_forward_and_gradients() -> None:
+    x = mx.random.normal((3, 5, 8))
+    weight = mx.random.normal((3, 4, 8))
+    active = mx.array(
+        [
+            [True, False, True, False, True],
+            [False, True, True, False, False],
+            [True, True, False, False, True],
+        ]
+    )
+
+    def reference(values, weights):
+        return (values @ weights.swapaxes(-1, -2)) * active[..., None]
+
+    expected = reference(x, weight)
+    actual = masked_grouped_linear(x, weight, active)
+    expected_gradients = mx.grad(lambda values, weights: mx.square(reference(values, weights)).sum(), argnums=(0, 1))(
+        x, weight
+    )
+    actual_gradients = mx.grad(
+        lambda values, weights: mx.square(masked_grouped_linear(values, weights, active)).sum(),
+        argnums=(0, 1),
+    )(x, weight)
+    mx.eval(expected, actual, expected_gradients, actual_gradients)
+
+    assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
+    assert mx.allclose(actual_gradients[0], expected_gradients[0], rtol=1e-4, atol=1e-4).item()
+    assert mx.allclose(actual_gradients[1], expected_gradients[1], rtol=1e-4, atol=1e-4).item()
 
 
 def test_mlx_training_step_is_finite() -> None:
@@ -161,6 +194,168 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
     assert attention.memory_initialized.tolist() == [True, False]
 
 
+def test_mlx_rfmoe_dispatches_only_fired_rows(monkeypatch) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        use_hadamard=False,
+        use_rfmoe=True,
+        rfmoe_num_experts=4,
+        rfmoe_expert_dim=4,
+        rfmoe_rank=2,
+        rfmoe_backend="host",
+    )
+    moe = MLXRFMoE(config)
+    moe.experts[0].bias = mx.array([100.0])
+    for expert in moe.experts[1:]:
+        expert.bias = mx.array([-1.0])
+    dispatched = []
+    gather_mm = mx.gather_mm
+
+    def record_dispatch(*args, **kwargs):
+        dispatched.append(kwargs["rhs_indices"].size)
+        return gather_mm(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "gather_mm", record_dispatch)
+    inputs = mx.random.normal((2, 3, 8))
+    loss, gradients = nn.value_and_grad(
+        moe,
+        lambda values: mx.sum(moe(values)),
+    )(inputs)
+    mx.eval(loss, gradients)
+
+    assert dispatched == [18, 18, 18, 18]
+    assert mx.isfinite(loss).item()
+    assert moe.last_density.item() == 0.75
+
+
+def test_mlx_rfmoe_auto_backend_prefers_hybrid_with_metal() -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        use_rfmoe=True,
+        rfmoe_num_experts=2,
+        rfmoe_expert_dim=4,
+        rfmoe_rank=2,
+    )
+    assert MLXRFMoE(config).backend == ("hybrid" if mx.metal.is_available() else "host")
+
+
+@pytest.mark.parametrize("backend", ["metal", "hybrid"])
+def test_mlx_rfmoe_accelerated_backends_match_host_compaction(backend) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        use_hadamard=False,
+        use_rfmoe=True,
+        rfmoe_num_experts=4,
+        rfmoe_expert_dim=4,
+        rfmoe_rank=2,
+    )
+    accelerated = MLXRFMoE(replace(config, rfmoe_backend=backend))
+    host = MLXRFMoE(replace(config, rfmoe_backend="host"))
+    host.load_weights(list(tree_flatten(accelerated.parameters())))
+    for index, (accelerated_expert, host_expert) in enumerate(zip(accelerated.experts, host.experts)):
+        bias = mx.array([100.0 if index == 0 else -1.0])
+        accelerated_expert.bias = bias
+        host_expert.bias = bias
+    inputs = mx.random.normal((2, 3, 8))
+
+    accelerated_loss, accelerated_gradients = nn.value_and_grad(
+        accelerated,
+        lambda values: mx.square(accelerated(values)).sum(),
+    )(inputs)
+    host_loss, host_gradients = nn.value_and_grad(
+        host,
+        lambda values: mx.square(host(values)).sum(),
+    )(inputs)
+    mx.eval(accelerated_loss, accelerated_gradients, host_loss, host_gradients)
+
+    assert mx.allclose(accelerated_loss, host_loss, rtol=1e-4, atol=1e-5).item()
+    expected = dict(tree_flatten(host_gradients))
+    actual = dict(tree_flatten(accelerated_gradients))
+    assert actual.keys() == expected.keys()
+    assert all(mx.allclose(actual[key], value, rtol=1e-4, atol=1e-5).item() for key, value in expected.items())
+    assert accelerated.last_density.item() == host.last_density.item() == 0.75
+
+
+def test_mlx_activation_checkpointing_preserves_gradients_and_state() -> None:
+    config = MLXBitNetConfig(
+        vocab_size=32,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        block_size=1,
+        path_window_size=4,
+        infini_memory_dim=4,
+        use_engram=True,
+        engram_layer_ids=(0,),
+        engram_vocab_size=17,
+        engram_num_heads=2,
+        engram_head_dim=2,
+        use_rfmoe=True,
+        rfmoe_num_experts=2,
+        rfmoe_expert_dim=4,
+        rfmoe_rank=2,
+    )
+    reference = MLXBitNet(config)
+    checkpointed = MLXBitNet(config)
+    checkpointed.load_weights(list(tree_flatten(reference.parameters())))
+    tokens = mx.array([[1, 2, 3, 4]])
+    segments = mx.zeros_like(tokens)
+
+    reference_loss, reference_gradients = nn.value_and_grad(
+        reference,
+        lambda ids, segment_ids: mx.mean(mx.square(reference(ids, segment_ids))),
+    )(tokens, segments)
+    checkpointed_loss, checkpointed_gradients = nn.value_and_grad(
+        checkpointed,
+        lambda ids, segment_ids: mx.mean(
+            mx.square(checkpointed(ids, segment_ids, checkpoint_activations=True))
+        ),
+    )(tokens, segments)
+    mx.eval(reference_loss, reference_gradients, checkpointed_loss, checkpointed_gradients)
+
+    assert mx.allclose(checkpointed_loss, reference_loss, rtol=1e-5, atol=1e-5).item()
+    expected = dict(tree_flatten(reference_gradients))
+    actual = dict(tree_flatten(checkpointed_gradients))
+    assert actual.keys() == expected.keys()
+    assert all(mx.allclose(actual[key], value, rtol=1e-4, atol=1e-5).item() for key, value in expected.items())
+    assert mx.allclose(
+        checkpointed.blocks[0].attn.memory_k,
+        reference.blocks[0].attn.memory_k,
+        rtol=1e-5,
+        atol=1e-6,
+    ).item()
+    assert mx.allclose(
+        checkpointed.blocks[0].moe.usage_ema,
+        reference.blocks[0].moe.usage_ema,
+        rtol=1e-5,
+        atol=1e-6,
+    ).item()
+
+
 def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> None:
     config = MLXBitNetConfig(
         vocab_size=16,
@@ -198,6 +393,8 @@ def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> Non
     )
     assert not any(key.endswith((".memory_k", ".memory_v", ".memory_initialized")) for key in mx.load(str(checkpoint)))
     expected_optimizer = dict(tree_flatten(optimizer.state))
+    expected_random = mx.random.uniform(shape=(4,))
+    mx.eval(expected_random)
 
     restored = MLXBitNet(config)
     restored_optimizer = CMUD(
@@ -208,6 +405,7 @@ def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> Non
     )
     restored_optimizer.init(restored.trainable_parameters())
     trainer_state = load_checkpoint(checkpoint, restored, restored_optimizer)
+    actual_random = mx.random.uniform(shape=(4,))
     actual = dict(restored.parameters())["embedding"]["weight"]
     actual_optimizer = dict(tree_flatten(restored_optimizer.state))
     mx.eval(expected, actual, restored_optimizer.state)
@@ -215,6 +413,7 @@ def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> Non
     assert actual_optimizer.keys() == expected_optimizer.keys()
     assert all(mx.array_equal(actual_optimizer[key], value).item() for key, value in expected_optimizer.items())
     assert trainer_state["step"] == 3
+    assert mx.array_equal(actual_random, expected_random).item()
 
     checkpoint.with_name(f"{checkpoint.stem}.optimizer.safetensors").unlink()
     with pytest.raises(FileNotFoundError, match="Missing optimizer checkpoint"):
