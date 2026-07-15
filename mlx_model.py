@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 
 import numpy as np
@@ -13,6 +14,16 @@ from mlx.nn.utils import checkpoint as activation_checkpoint
 
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
+
+
+@lru_cache(maxsize=32)
+def _memory_pool_weights(length: int, memory_dim: int) -> mx.array:
+    weights = np.zeros((memory_dim, length), dtype=np.float32)
+    for index in range(memory_dim):
+        start = index * length // memory_dim
+        end = max(start + 1, ((index + 1) * length + memory_dim - 1) // memory_dim)
+        weights[index, start:end] = 1.0 / (end - start)
+    return mx.array(weights)
 
 
 @dataclass(frozen=True)
@@ -521,15 +532,9 @@ class MLXPaTHAttention(nn.Module):
             key_update = mx.repeat(keys, repeats, axis=2)
             value_update = mx.repeat(values, repeats, axis=2)
         else:
-            pooled_keys = []
-            pooled_values = []
-            for index in range(memory_dim):
-                start = index * length // memory_dim
-                end = max(start + 1, ((index + 1) * length + memory_dim - 1) // memory_dim)
-                pooled_keys.append(mx.mean(keys[:, :, start:end], axis=2))
-                pooled_values.append(mx.mean(values[:, :, start:end], axis=2))
-            key_update = mx.stack(pooled_keys, axis=2)
-            value_update = mx.stack(pooled_values, axis=2)
+            weights = _memory_pool_weights(length, memory_dim)
+            key_update = mx.einsum("ml,bhld->bhmd", weights, keys.astype(mx.float32))
+            value_update = mx.einsum("ml,bhld->bhmd", weights, values.astype(mx.float32))
         key_update = key_update.astype(mx.float32)
         value_update = value_update.astype(mx.float32)
         rows = rows[:, None, None, None]

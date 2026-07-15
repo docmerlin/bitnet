@@ -14,7 +14,16 @@ from mlx_model import MLXBitNet, MLXBitNetConfig, MLXPaTHAttention, MLXRFMoE
 from mlx_optim import CMUD
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import masked_grouped_linear
-from mlx_train import build_parser, create_apply_step, create_train_step, load_checkpoint, save_checkpoint
+from mlx_train import (
+    _gradient_compile_safe,
+    build_parser,
+    create_apply_step,
+    create_gradient_step,
+    create_train_step,
+    load_checkpoint,
+    save_checkpoint,
+    validate_args as validate_training_args,
+)
 
 
 def test_path_metal_kernel_matches_forward_and_gradients() -> None:
@@ -97,6 +106,19 @@ def test_mlx_training_defaults_amortize_cmud() -> None:
     args = build_parser().parse_args([])
     assert args.grad_accumulation_steps == 16
     assert args.mud_block_size == 256
+
+
+def test_mlx_gradient_compile_avoids_irregular_blocks_and_hybrid_rfmoe() -> None:
+    dense = MLXBitNetConfig()
+    hybrid = replace(dense, use_rfmoe=True, rfmoe_backend="hybrid")
+    assert _gradient_compile_safe(dense, True, 512, 8)
+    assert _gradient_compile_safe(dense, True, 512, 16)
+    assert not _gradient_compile_safe(dense, True, 512, 9)
+    assert not _gradient_compile_safe(hybrid, True, 512, 8)
+
+    args = build_parser().parse_args(["--final-blocks", "0"])
+    with pytest.raises(ValueError, match="blocks must be positive"):
+        validate_training_args(args)
 
 
 def test_mlx_model_preserves_packed_document_boundaries_and_loops() -> None:
@@ -225,6 +247,45 @@ def test_mlx_infini_pooling_fast_paths_match_reference(length, memory_dim) -> No
     assert mx.array_equal(actual_keys, expected_keys).item()
     assert mx.array_equal(actual_values, expected_values).item()
     assert initialized.item()
+
+
+def test_mlx_compiled_irregular_infini_pooling_fits_metal_argument_buffer() -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=2,
+        num_recurrent_layers=4,
+        num_coda_layers=2,
+        num_loops=2,
+        block_size=9,
+        path_window_size=64,
+        infini_memory_dim=64,
+        use_engram=False,
+    )
+    model = MLXBitNet(config)
+    gradient_step = create_gradient_step(
+        model,
+        compile_step=True,
+        num_loops=2,
+        gradient_checkpointing=True,
+    )
+    tokens = mx.zeros((1, 512), dtype=mx.int32)
+    segments = mx.zeros_like(tokens)
+
+    loss, gradients = gradient_step(
+        tokens,
+        tokens,
+        segments,
+        segments,
+        mx.array(0.0),
+        mx.array(1.0),
+        mx.array(0.1),
+    )
+    mx.eval(loss, gradients, model.state)
+
+    assert mx.isfinite(loss).item()
 
 
 def test_mlx_full_feature_model_states_and_heads() -> None:

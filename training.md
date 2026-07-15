@@ -307,6 +307,9 @@ Implemented:
 - MLX defaults to 16 gradient-accumulation microbatches per optimizer update. Override
   blockwise whitening with `--mud-block-size`; converted and legacy checkpoints preserve
   their original full-matrix C-MUD behavior.
+- Whole-gradient compilation is limited to block counts that divide sequence length;
+  irregular curriculum layouts run eagerly to avoid Metal argument-buffer exhaustion.
+  Any remaining MLX argument-buffer failure automatically retries that layout eagerly.
 - All-feature FineWeb-Edu smoke exercised Engram, Infini safety, RFMoE, Hyperloop, MTP,
   two-microbatch accumulation, validation, best/numbered/last/final saves, and resumed at
   the next optimizer step with finite loss.
@@ -342,6 +345,12 @@ With 256-row C-MUD blocks and 16 accumulated 512-token microbatches, the full de
 trainer measured 2,760 tokens/second at curriculum depth 8 and 1,304 tokens/second at
 maximum depth 20. These synthetic-step figures include activation recomputation, gradient
 clipping, and optimizer updates, but exclude data loading, validation, and checkpoints.
+
+A 100-update real-data A/B with identical seed, stream, curriculum, and five validation
+batches every 20 updates compared 256-row blocks against full-matrix whitening. Blockwise
+C-MUD finished with validation loss 2.7053 versus 2.7601, sustained 1,306 versus 1,118
+tokens/second at maximum depth, and completed in 1,078 versus 1,181 seconds. This single
+seed supports the faster default but is not a statistical convergence study.
 
 Use `mlx_train.py` for native MLX experiments; do not expect identical step-by-step loss
 to `train.py` because backend kernels and RFMoE execution order differ.

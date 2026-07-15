@@ -114,12 +114,27 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("sequence-length must be divisible by path-window-size")
     if min(args.micro_batch_size, args.grad_accumulation_steps, args.total_tokens) < 1:
         raise ValueError("batch, accumulation, and token counts must be positive")
+    if min(args.initial_blocks, args.final_blocks) < 1:
+        raise ValueError("initial-blocks and final-blocks must be positive")
     if args.mud_block_size is not None and args.mud_block_size < 1:
         raise ValueError("mud-block-size must be positive")
     if min(args.stage1_activation_bits, args.final_activation_bits) < 2:
         raise ValueError("activation bits must be at least 2")
     if not 0 <= args.mixture_switch_ratio <= 1:
         raise ValueError("mixture-switch-ratio must be between zero and one")
+
+
+def _gradient_compile_safe(
+    config: MLXBitNetConfig,
+    requested: bool,
+    sequence_length: int,
+    active_blocks: int,
+) -> bool:
+    return (
+        requested
+        and sequence_length % active_blocks == 0
+        and (not config.use_rfmoe or config.rfmoe_backend == "metal")
+    )
 
 
 def _masked_ce(logits, targets, valid):
@@ -526,9 +541,15 @@ def main() -> None:
         rf_alpha = 1.0 + rf_fraction * (args.rfmoe_uniform_alpha - 1.0)
         key = (active_loops, active_blocks)
         if key not in gradient_steps:
-            gradient_steps[key] = create_gradient_step(
+            compile_gradient = _gradient_compile_safe(
+                config,
+                args.compile,
+                args.sequence_length,
+                active_blocks,
+            )
+            gradient_step = create_gradient_step(
                 model,
-                compile_step=args.compile,
+                compile_step=compile_gradient,
                 num_loops=active_loops,
                 z_loss_coef=args.z_loss_coef,
                 mtp_loss_coef=args.mtp_loss_coef,
@@ -536,7 +557,8 @@ def main() -> None:
                 diversity_coef=args.rfmoe_diversity_coef,
                 gradient_checkpointing=args.gradient_checkpointing,
             )
-        gradient_step = gradient_steps[key]
+            gradient_steps[key] = (gradient_step, compile_gradient)
+        gradient_step, gradient_is_compiled = gradient_steps[key]
         active_stream = late_stream if late_stream is not None and progress >= args.mixture_switch_ratio else early_stream
         step_started = time.perf_counter()
         accumulated_gradients = None
@@ -551,7 +573,36 @@ def main() -> None:
                 mx.array(rf_alpha),
             )
             hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
-            mx.eval(loss, gradients, hard_density, model.state)
+            try:
+                mx.eval(loss, gradients, hard_density, model.state)
+            except RuntimeError as error:
+                if not gradient_is_compiled or "exhausted the available argument buffers" not in str(error):
+                    raise
+                print(
+                    f"MLX compiler limit at loops={active_loops}, blocks={active_blocks}; "
+                    "retrying gradients eagerly.",
+                    flush=True,
+                )
+                gradient_step = create_gradient_step(
+                    model,
+                    compile_step=False,
+                    num_loops=active_loops,
+                    z_loss_coef=args.z_loss_coef,
+                    mtp_loss_coef=args.mtp_loss_coef,
+                    locality_coef=args.rfmoe_locality_coef,
+                    diversity_coef=args.rfmoe_diversity_coef,
+                    gradient_checkpointing=args.gradient_checkpointing,
+                )
+                gradient_steps[key] = (gradient_step, False)
+                gradient_is_compiled = False
+                loss, gradients = gradient_step(
+                    *batch,
+                    mx.array(trainer_state["density_lambda"]),
+                    mx.array(rf_s),
+                    mx.array(rf_alpha),
+                )
+                hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
+                mx.eval(loss, gradients, hard_density, model.state)
             losses.append(float(loss.item()))
             hard_densities.append(float(hard_density.item()))
             accumulated_gradients = gradients if accumulated_gradients is None else tree_map(
