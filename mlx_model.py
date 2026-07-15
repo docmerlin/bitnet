@@ -265,6 +265,7 @@ class MLXRFMoE(nn.Module):
         active: mx.array,
         expert_indices: mx.array,
         token_indices: mx.array,
+        expert_offsets: mx.array,
     ) -> mx.array:
         shape = x.shape
         prepared = layers[0].prepare_input(x.reshape(-1, shape[-1])).reshape(shape)
@@ -272,7 +273,14 @@ class MLXRFMoE(nn.Module):
             prepared.dtype,
             mx.stack([layer.weight for layer in layers]),
         )
-        return compacted_grouped_linear(prepared, weights, active, expert_indices, token_indices)
+        return compacted_grouped_linear(
+            prepared,
+            weights,
+            active,
+            expert_indices,
+            token_indices,
+            expert_offsets,
+        )
 
     def _scores(self, flat: mx.array):
         a_gates = [expert.a_gate for expert in self.experts]
@@ -331,19 +339,47 @@ class MLXRFMoE(nn.Module):
         active_pairs = np.argwhere(np.array(active))
         expert_indices = mx.array(active_pairs[:, 0], dtype=mx.uint32)
         token_indices = mx.array(active_pairs[:, 1], dtype=mx.uint32)
+        expert_offsets = mx.array(
+            np.searchsorted(active_pairs[:, 0], np.arange(len(self.experts) + 1)),
+            dtype=mx.uint32,
+        )
         b_gates = [expert.b_gate for expert in self.experts]
         w_ups = [expert.w_up for expert in self.experts]
         w_mids = [expert.w_mid for expert in self.experts]
         w_downs = [expert.w_down for expert in self.experts]
-        gate = mx.sigmoid(self._hybrid_grouped_linear(z, b_gates, active, expert_indices, token_indices))
+        gate = mx.sigmoid(
+            self._hybrid_grouped_linear(
+                z,
+                b_gates,
+                active,
+                expert_indices,
+                token_indices,
+                expert_offsets,
+            )
+        )
         hidden = gate * self._hybrid_grouped_linear(
-            flat[None, :, :], w_ups, active, expert_indices, token_indices
+            flat[None, :, :],
+            w_ups,
+            active,
+            expert_indices,
+            token_indices,
+            expert_offsets,
         )
         hidden = nn.silu(self._hybrid_grouped_linear(
-            hidden, w_mids, active, expert_indices, token_indices
+            hidden,
+            w_mids,
+            active,
+            expert_indices,
+            token_indices,
+            expert_offsets,
         ))
         contribution = self._hybrid_grouped_linear(
-            hidden, w_downs, active, expert_indices, token_indices
+            hidden,
+            w_downs,
+            active,
+            expert_indices,
+            token_indices,
+            expert_offsets,
         )
         output = mx.sum(gate_stack[..., None] * contribution, axis=0)
         return output.reshape(x.shape), gate_stack, mx.mean(active)
@@ -473,15 +509,29 @@ class MLXPaTHAttention(nn.Module):
         memory_initialized: mx.array,
     ):
         length = keys.shape[2]
-        pooled_keys = []
-        pooled_values = []
-        for index in range(self.config.infini_memory_dim):
-            start = index * length // self.config.infini_memory_dim
-            end = max(start + 1, ((index + 1) * length + self.config.infini_memory_dim - 1) // self.config.infini_memory_dim)
-            pooled_keys.append(mx.mean(keys[:, :, start:end], axis=2))
-            pooled_values.append(mx.mean(values[:, :, start:end], axis=2))
-        key_update = mx.stack(pooled_keys, axis=2).astype(mx.float32)
-        value_update = mx.stack(pooled_values, axis=2).astype(mx.float32)
+        memory_dim = self.config.infini_memory_dim
+        if length == memory_dim:
+            key_update, value_update = keys, values
+        elif length % memory_dim == 0:
+            pooled_shape = (*keys.shape[:2], memory_dim, length // memory_dim, keys.shape[-1])
+            key_update = mx.mean(keys.reshape(pooled_shape), axis=3)
+            value_update = mx.mean(values.reshape(pooled_shape), axis=3)
+        elif memory_dim % length == 0:
+            repeats = memory_dim // length
+            key_update = mx.repeat(keys, repeats, axis=2)
+            value_update = mx.repeat(values, repeats, axis=2)
+        else:
+            pooled_keys = []
+            pooled_values = []
+            for index in range(memory_dim):
+                start = index * length // memory_dim
+                end = max(start + 1, ((index + 1) * length + memory_dim - 1) // memory_dim)
+                pooled_keys.append(mx.mean(keys[:, :, start:end], axis=2))
+                pooled_values.append(mx.mean(values[:, :, start:end], axis=2))
+            key_update = mx.stack(pooled_keys, axis=2)
+            value_update = mx.stack(pooled_values, axis=2)
+        key_update = key_update.astype(mx.float32)
+        value_update = value_update.astype(mx.float32)
         rows = rows[:, None, None, None]
         next_k = mx.where(rows, 0.99 * memory_k + 0.01 * mx.stop_gradient(key_update), memory_k)
         next_v = mx.where(rows, 0.99 * memory_v + 0.01 * mx.stop_gradient(value_update), memory_v)

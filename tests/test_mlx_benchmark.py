@@ -7,14 +7,14 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 from mlx_benchmark import run_mlx, validate_args
 from mlx_model import MLXBitNet, MLXBitNetConfig, MLXPaTHAttention, MLXRFMoE
 from mlx_optim import CMUD
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import masked_grouped_linear
-from mlx_train import create_train_step, load_checkpoint, save_checkpoint
+from mlx_train import build_parser, create_apply_step, create_train_step, load_checkpoint, save_checkpoint
 
 
 def test_path_metal_kernel_matches_forward_and_gradients() -> None:
@@ -93,6 +93,12 @@ def test_mlx_training_step_is_finite() -> None:
     assert metrics["tokens_per_second"] > 0
 
 
+def test_mlx_training_defaults_amortize_cmud() -> None:
+    args = build_parser().parse_args([])
+    assert args.grad_accumulation_steps == 16
+    assert args.mud_block_size == 256
+
+
 def test_mlx_model_preserves_packed_document_boundaries_and_loops() -> None:
     config = MLXBitNetConfig(
         vocab_size=32,
@@ -143,6 +149,82 @@ def test_mlx_packed_train_step_is_finite() -> None:
     loss = train_step(inputs, labels, segments, label_segments)
     mx.eval(loss, state)
     assert mx.isfinite(loss).item()
+
+
+def test_mlx_compiled_apply_step_updates_model() -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+    )
+    model = MLXBitNet(config)
+    optimizer = CMUD(
+        mud_learning_rate=1e-3,
+        fallback_learning_rate=3e-4,
+        weight_decay=0.0,
+        eight_bit=False,
+    )
+    optimizer.init(model.trainable_parameters())
+    apply_step, state = create_apply_step(model, optimizer, grad_clip=1.0, compile_step=True)
+    before = mx.array(model.embedding.weight)
+    gradients = tree_map(mx.ones_like, model.trainable_parameters())
+
+    grad_norm = apply_step(gradients, mx.array(0.5))
+    mx.eval(grad_norm, state)
+    after_update = mx.array(model.embedding.weight)
+    apply_step(gradients, mx.array(0.0))
+    mx.eval(state)
+
+    assert mx.isfinite(grad_norm).item()
+    assert not mx.array_equal(after_update, before).item()
+    assert mx.array_equal(model.embedding.weight, after_update).item()
+
+
+@pytest.mark.parametrize(("length", "memory_dim"), [(4, 2), (2, 4), (3, 2)])
+def test_mlx_infini_pooling_fast_paths_match_reference(length, memory_dim) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        infini_memory_dim=memory_dim,
+        use_engram=False,
+    )
+    attention = MLXPaTHAttention(config)
+    keys = mx.arange(2 * length * 4, dtype=mx.float32).reshape(1, 2, length, 4)
+    values = keys + 1
+    expected_keys = []
+    expected_values = []
+    for index in range(memory_dim):
+        start = index * length // memory_dim
+        end = max(start + 1, ((index + 1) * length + memory_dim - 1) // memory_dim)
+        expected_keys.append(mx.mean(keys[:, :, start:end], axis=2))
+        expected_values.append(mx.mean(values[:, :, start:end], axis=2))
+    expected_keys = 0.01 * mx.stack(expected_keys, axis=2)
+    expected_values = 0.01 * mx.stack(expected_values, axis=2)
+    shape = (1, 2, memory_dim, 4)
+
+    actual_keys, actual_values, initialized = attention._next_memory(
+        keys,
+        values,
+        mx.array([True]),
+        mx.zeros(shape),
+        mx.zeros(shape),
+        mx.array([False]),
+    )
+    mx.eval(actual_keys, actual_values, initialized)
+
+    assert mx.array_equal(actual_keys, expected_keys).item()
+    assert mx.array_equal(actual_values, expected_values).item()
+    assert initialized.item()
 
 
 def test_mlx_full_feature_model_states_and_heads() -> None:
@@ -251,6 +333,35 @@ def test_mlx_rfmoe_auto_backend_prefers_hybrid_with_metal() -> None:
         rfmoe_rank=2,
     )
     assert MLXRFMoE(config).backend == ("hybrid" if mx.metal.is_available() else "host")
+
+
+def test_mlx_rfmoe_hybrid_handles_empty_dispatch() -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        use_hadamard=False,
+        use_rfmoe=True,
+        rfmoe_num_experts=2,
+        rfmoe_expert_dim=4,
+        rfmoe_rank=2,
+        rfmoe_backend="hybrid",
+    )
+    moe = MLXRFMoE(config)
+    for expert in moe.experts:
+        expert.bias = mx.array([100.0])
+    inputs = mx.random.normal((2, 3, 8))
+
+    loss, gradients = nn.value_and_grad(moe, lambda values: mx.square(moe(values)).sum())(inputs)
+    mx.eval(loss, gradients)
+
+    assert loss.item() == 0.0
+    assert all(mx.all(mx.isfinite(value)).item() for _, value in tree_flatten(gradients))
 
 
 @pytest.mark.parametrize("backend", ["metal", "hybrid"])

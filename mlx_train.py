@@ -55,12 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--path-window-size", type=int, default=64)
     parser.add_argument("--micro-batch-size", type=int, default=1)
-    parser.add_argument("--grad-accumulation-steps", type=int, default=1)
+    parser.add_argument("--grad-accumulation-steps", type=int, default=16)
     parser.add_argument("--total-tokens", type=int, default=10_000_000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3)
     parser.add_argument("--mud-momentum", type=float, default=0.95)
     parser.add_argument("--mud-passes", type=int, default=1)
+    parser.add_argument("--mud-block-size", type=int, default=256)
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
     parser.add_argument("--no-optimizer-8bit", action="store_true")
@@ -113,6 +114,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("sequence-length must be divisible by path-window-size")
     if min(args.micro_batch_size, args.grad_accumulation_steps, args.total_tokens) < 1:
         raise ValueError("batch, accumulation, and token counts must be positive")
+    if args.mud_block_size is not None and args.mud_block_size < 1:
+        raise ValueError("mud-block-size must be positive")
     if min(args.stage1_activation_bits, args.final_activation_bits) < 2:
         raise ValueError("activation bits must be at least 2")
     if not 0 <= args.mixture_switch_ratio <= 1:
@@ -198,6 +201,26 @@ def create_train_step(model: MLXBitNet, optimizer: optim.Optimizer, *, compile_s
     if compile_step:
         train_step = partial(mx.compile, inputs=state, outputs=state)(train_step)
     return train_step, state
+
+
+def create_apply_step(
+    model: MLXBitNet,
+    optimizer: CMUD,
+    *,
+    grad_clip: float,
+    compile_step: bool = True,
+):
+    state = [model.state, optimizer.state]
+
+    def apply_step(gradients, lr_scale):
+        gradients, grad_norm = optim.clip_grad_norm(gradients, grad_clip)
+        optimizer.set_lr_multiplier(lr_scale)
+        optimizer.update(model, gradients)
+        return grad_norm
+
+    if compile_step:
+        apply_step = partial(mx.compile, inputs=state, outputs=state)(apply_step)
+    return apply_step, state
 
 
 def convert_batch(batch) -> tuple[mx.array, mx.array, mx.array, mx.array]:
@@ -380,13 +403,16 @@ def main() -> None:
             mtp_depth=args.mtp_depth,
         )
     if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
-        print("RFMoE uses exact dynamic threshold compaction; disabling whole-step MLX compilation.", flush=True)
-        args.compile = False
+        print(
+            "RFMoE uses dynamic compaction; compiling optimizer updates but not gradients.",
+            flush=True,
+        )
     model = MLXBitNet(config)
     dtype = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}[args.precision]
     model.set_dtype(dtype)
     if args.resume_from and saved.get("optimizer_config"):
         optimizer = CMUD(**saved["optimizer_config"])
+        args.mud_block_size = optimizer.optimizers[0].block_size
     else:
         optimizer = CMUD(
             mud_learning_rate=args.mud_learning_rate,
@@ -394,6 +420,7 @@ def main() -> None:
             weight_decay=args.weight_decay,
             momentum=args.mud_momentum,
             passes=args.mud_passes,
+            block_size=args.mud_block_size,
             betas=(args.lion_beta1, args.lion_beta2),
             eight_bit=not args.no_optimizer_8bit,
         )
@@ -465,7 +492,12 @@ def main() -> None:
     metrics_path = output_dir / "metrics.jsonl"
     started = time.perf_counter()
     gradient_steps = {}
-    state = [model.state, optimizer.state]
+    apply_step, state = create_apply_step(
+        model,
+        optimizer,
+        grad_clip=args.grad_clip,
+        compile_step=args.compile,
+    )
     for step in range(trainer_state["step"] + 1, total_steps + 1):
         progress = trainer_state["tokens_processed"] / max(args.total_tokens, 1)
         loop_fraction = min(progress / max(args.loop_curriculum_ratio, 1e-8), 1.0)
@@ -531,10 +563,8 @@ def main() -> None:
             lambda gradient: gradient / args.grad_accumulation_steps,
             accumulated_gradients,
         )
-        accumulated_gradients, grad_norm = optim.clip_grad_norm(accumulated_gradients, args.grad_clip)
         multiplier = lr_multiplier(step - 1, total_steps, warmup_steps, cooldown_steps, args.min_lr_ratio)
-        optimizer.set_lr_multiplier(multiplier)
-        optimizer.update(model, accumulated_gradients)
+        grad_norm = apply_step(accumulated_gradients, mx.array(multiplier))
         mx.eval(model.state, optimizer.state, grad_norm)
         elapsed = time.perf_counter() - step_started
         trainer_state["step"] = step

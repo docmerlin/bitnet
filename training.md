@@ -293,17 +293,20 @@ Implemented:
   conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda execution,
   and MTP heads.
 - `mlx_rfmoe_kernel.py`: conditional grouped expert projections plus sparse custom
-  input/weight VJPs. The default hybrid path uses one host compaction and compact
-  `gather_mm` forwards while retaining static intermediates for Metal backward.
+  input/weight VJPs. The default hybrid path uses one host compaction, compact
+  `gather_mm` forwards, and compact route-wise backward kernels.
 - `mlx_train.py`: streaming Hugging Face mixtures through the existing tokenizer and
-  packer, compiled BF16 gradients, activation checkpointing, gradient accumulation,
-  CE/z/MTP/RF auxiliary losses, quantization/loop/block/RF/data/LR curricula, validation,
-  JSONL metrics, and resumable safetensor model/optimizer checkpoints. Resume restores
-  MLX RNG, mixture RNG, Hugging Face iterator positions, shuffle buffers, and partial
-  packed sequences.
-- `mlx_optim.py`: C-MUD for non-embedding matrices and blockwise-int8 C-Lion for
-  embeddings, norms, biases, and gates, including cautious masking, Metal triangular
-  whitening, independent learning rates, and resumable optimizer state.
+  packer, compiled BF16 gradients and optimizer updates, activation checkpointing,
+  gradient accumulation, CE/z/MTP/RF auxiliary losses, quantization/loop/block/RF/data/LR
+  curricula, validation, JSONL metrics, and resumable safetensor model/optimizer
+  checkpoints. Resume restores MLX RNG, mixture RNG, Hugging Face iterator positions,
+  shuffle buffers, and partial packed sequences.
+- `mlx_optim.py`: 256-row blockwise C-MUD for non-embedding matrices and blockwise-int8
+  C-Lion for embeddings, norms, biases, and gates, including cautious masking, Metal
+  triangular whitening, independent learning rates, and resumable optimizer state.
+- MLX defaults to 16 gradient-accumulation microbatches per optimizer update. Override
+  blockwise whitening with `--mud-block-size`; converted and legacy checkpoints preserve
+  their original full-matrix C-MUD behavior.
 - All-feature FineWeb-Edu smoke exercised Engram, Infini safety, RFMoE, Hyperloop, MTP,
   two-microbatch accumulation, validation, best/numbered/last/final saves, and resumed at
   the next optimizer step with finite loss.
@@ -328,13 +331,17 @@ density, RFMoE layer measurements were:
 | Backend | Forward | Forward + backward |
 | --- | ---: | ---: |
 | Host | 3.3 ms | 244.7 ms |
-| Static Metal | 18.6 ms | 31.9 ms |
-| Hybrid host-forward/Metal-backward | 3.8 ms | 18.1 ms |
+| Static Metal | 18.6 ms | 33.5 ms |
+| Hybrid host-forward/Metal-backward | 3.9 ms | 9.1 ms |
 
-Hybrid training beat static Metal by 1.34x at 12.5% density, 2.36x at 50%, and 3.10x
-at 100%. Including one full attention/RFMoE block, hybrid measured 63.0 ms versus
-75.7 ms; two blocks measured 121.2 ms versus 152.9 ms. Hybrid retains RFMoE
-intermediates instead of activation-checkpointing that sublayer, trading memory for speed.
+Hybrid training beat static Metal by 2.99x at 12.5% density, 3.86x at 50%, and 4.05x
+at 100%. Hybrid retains RFMoE intermediates instead of activation-checkpointing that
+sublayer, trading memory for speed.
+
+With 256-row C-MUD blocks and 16 accumulated 512-token microbatches, the full dense MLX
+trainer measured 2,760 tokens/second at curriculum depth 8 and 1,304 tokens/second at
+maximum depth 20. These synthetic-step figures include activation recomputation, gradient
+clipping, and optimizer updates, but exclude data loading, validation, and checkpoints.
 
 Use `mlx_train.py` for native MLX experiments; do not expect identical step-by-step loss
 to `train.py` because backend kernels and RFMoE execution order differ.

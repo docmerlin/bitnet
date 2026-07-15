@@ -85,6 +85,30 @@ _MASKED_GROUPED_WEIGHT_GRAD = mx.fast.metal_kernel(
     """,
 )
 
+_COMPACTED_GROUPED_WEIGHT_GRAD = mx.fast.metal_kernel(
+    name="rfmoe_compacted_grouped_weight_grad",
+    input_names=["x", "cotangent", "expert_offsets", "token_indices"],
+    output_names=["grad_weight"],
+    source=r"""
+        uint input_index = thread_position_in_grid.x;
+        uint output_index = thread_position_in_grid.y;
+        uint expert = thread_position_in_grid.z;
+        uint tokens = cotangent_shape[1];
+        uint output_size = cotangent_shape[2];
+        uint input_size = x_shape[2];
+        float value = 0.0f;
+        for (uint route = expert_offsets[expert]; route < expert_offsets[expert + 1]; ++route) {
+            uint token = token_indices[route];
+            ulong input_row = x_shape[0] == 1 ? token : ulong(expert) * tokens + token;
+            ulong cotangent_offset = (ulong(expert) * tokens + token) * output_size + output_index;
+            value += float(cotangent[cotangent_offset])
+                * float(x[input_row * input_size + input_index]);
+        }
+        ulong offset = (ulong(expert) * output_size + output_index) * input_size + input_index;
+        grad_weight[offset] = T(value);
+    """,
+)
+
 
 def _run_masked_grouped_linear(x: mx.array, weight: mx.array, active: mx.array) -> mx.array:
     if x.ndim != 3 or weight.ndim != 3 or active.ndim != 2:
@@ -125,6 +149,24 @@ def _run_weight_grad(x: mx.array, cotangent: mx.array, active: mx.array) -> mx.a
     inputs = x.shape[2]
     return _MASKED_GROUPED_WEIGHT_GRAD(
         inputs=[x, cotangent, active],
+        template=[("T", x.dtype)],
+        grid=(inputs, outputs, experts),
+        threadgroup=(min(inputs, 256), 1, 1),
+        output_shapes=[(experts, outputs, inputs)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def _run_compacted_weight_grad(
+    x: mx.array,
+    cotangent: mx.array,
+    expert_offsets: mx.array,
+    token_indices: mx.array,
+) -> mx.array:
+    experts, _, outputs = cotangent.shape
+    inputs = x.shape[2]
+    return _COMPACTED_GROUPED_WEIGHT_GRAD(
+        inputs=[x, cotangent, expert_offsets, token_indices],
         template=[("T", x.dtype)],
         grid=(inputs, outputs, experts),
         threadgroup=(min(inputs, 256), 1, 1),
@@ -179,6 +221,7 @@ def compacted_grouped_linear(
     active: mx.array,
     expert_indices: mx.array,
     token_indices: mx.array,
+    expert_offsets: mx.array,
 ) -> mx.array:
     """Compact host-selected rows forward; use sparse Metal kernels backward."""
     return _run_compacted_grouped_linear(x, weight, active, expert_indices, token_indices)
@@ -186,16 +229,29 @@ def compacted_grouped_linear(
 
 @compacted_grouped_linear.vjp
 def _compacted_grouped_linear_vjp(primals, cotangent, _output):
-    x, weight, active, expert_indices, token_indices = primals
+    x, weight, active, expert_indices, token_indices, expert_offsets = primals
+    if expert_indices.size == 0:
+        return tuple(mx.zeros_like(value) for value in primals)
     cotangent = cotangent.astype(x.dtype)
-    grad_x = _run_input_grad(cotangent, weight, active)
+    selected_cotangent = cotangent[expert_indices, token_indices]
+    selected_grad_x = mx.squeeze(
+        mx.gather_mm(
+            selected_cotangent[:, None, :],
+            weight,
+            rhs_indices=expert_indices,
+        ),
+        axis=1,
+    )
     if x.shape[0] == 1:
-        grad_x = mx.sum(grad_x, axis=0, keepdims=True)
-    grad_weight = _run_weight_grad(x, cotangent, active)
+        grad_x = mx.zeros_like(x[0]).at[token_indices].add(selected_grad_x)[None]
+    else:
+        grad_x = mx.zeros_like(x).at[expert_indices, token_indices].add(selected_grad_x)
+    grad_weight = _run_compacted_weight_grad(x, cotangent, expert_offsets, token_indices)
     return (
         grad_x,
         grad_weight,
         mx.zeros_like(active),
         mx.zeros_like(expert_indices),
         mx.zeros_like(token_indices),
+        mx.zeros_like(expert_offsets),
     )

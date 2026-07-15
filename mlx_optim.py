@@ -46,21 +46,34 @@ def lower_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
     )[0]
 
 
-def mud_decorrelate(update: mx.array, passes: int = 1, eps: float = 1e-8) -> mx.array:
+def mud_decorrelate(
+    update: mx.array,
+    passes: int = 1,
+    eps: float = 1e-8,
+    block_size: int | None = None,
+) -> mx.array:
     if update.ndim != 2:
         raise ValueError("mud_decorrelate expects a 2D matrix")
     if passes < 1:
         raise ValueError("passes must be positive")
+    if block_size is not None and block_size < 1:
+        raise ValueError("block_size must be positive")
     original_dtype = update.dtype
     q = update.astype(mx.float32)
     transposed = q.shape[0] > q.shape[1]
     if transposed:
         q = q.T
-    for _ in range(passes):
-        q = q / (mx.linalg.norm(q, axis=1, keepdims=True) + eps)
-        triangle = mx.tril(q @ q.T) + eps * mx.eye(q.shape[0])
-        q = lower_solve(triangle, q)
-        q = q / (mx.linalg.norm(q, axis=1, keepdims=True) + eps)
+    block_size = q.shape[0] if block_size is None else block_size
+    blocks = []
+    for start in range(0, q.shape[0], block_size):
+        block = q[start : start + block_size]
+        for _ in range(passes):
+            block = block / (mx.linalg.norm(block, axis=1, keepdims=True) + eps)
+            triangle = mx.tril(block @ block.T) + eps * mx.eye(block.shape[0])
+            block = lower_solve(triangle, block)
+            block = block / (mx.linalg.norm(block, axis=1, keepdims=True) + eps)
+        blocks.append(block)
+    q = mx.concatenate(blocks, axis=0) if len(blocks) > 1 else blocks[0]
     return (q.T if transposed else q).astype(original_dtype)
 
 
@@ -93,12 +106,14 @@ class MUD(optim.Optimizer):
         momentum: float = 0.95,
         passes: int = 1,
         weight_decay: float = 0.0,
+        block_size: int | None = None,
     ):
         super().__init__()
         self._maybe_schedule("learning_rate", learning_rate)
         self.momentum = momentum
         self.passes = passes
         self.weight_decay = weight_decay
+        self.block_size = block_size
 
     def init_single(self, parameter: mx.array, state: dict):
         state["momentum_buffer"] = mx.zeros(parameter.shape, dtype=mx.float32)
@@ -109,7 +124,7 @@ class MUD(optim.Optimizer):
         gradient = gradient.astype(mx.float32)
         momentum_buffer = self.momentum * state["momentum_buffer"] + gradient
         direction = gradient + self.momentum * momentum_buffer
-        update = mud_decorrelate(direction, self.passes)
+        update = mud_decorrelate(direction, self.passes, block_size=self.block_size)
         update = update * (0.2 * math.sqrt(max(parameter.shape)))
         update = cautious_mask(update, gradient)
         state["momentum_buffer"] = momentum_buffer
@@ -181,10 +196,11 @@ class CMUD(optim.MultiOptimizer):
         passes: int = 1,
         betas: tuple[float, float] = (0.95, 0.98),
         eight_bit: bool = True,
+        block_size: int | None = None,
     ):
         self.mud_learning_rate = mud_learning_rate
         self.fallback_learning_rate = fallback_learning_rate
-        mud = MUD(mud_learning_rate, momentum, passes, weight_decay)
+        mud = MUD(mud_learning_rate, momentum, passes, weight_decay, block_size)
         clion = CLion(fallback_learning_rate, betas, eight_bit)
         super().__init__([mud, clion], [self._is_mud_parameter])
 
@@ -206,6 +222,7 @@ class CMUD(optim.MultiOptimizer):
             "weight_decay": mud.weight_decay,
             "momentum": mud.momentum,
             "passes": mud.passes,
+            "block_size": mud.block_size,
             "betas": [clion.beta1, clion.beta2],
             "eight_bit": clion.eight_bit,
         }

@@ -28,6 +28,17 @@ def test_mlx_mud_and_cautious_mask_match_pytorch() -> None:
     assert np.allclose(np.array(mlx_masked), torch_masked.numpy(), rtol=1e-6, atol=1e-6)
 
 
+def test_mlx_mud_blocking_matches_independent_blocks() -> None:
+    update = mx.random.normal((8, 12))
+    expected = mx.concatenate(
+        [mud_decorrelate(update[start : start + 4], passes=2) for start in range(0, 8, 4)]
+    )
+    actual = mud_decorrelate(update, passes=2, block_size=4)
+    mx.eval(expected, actual)
+
+    assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
+
+
 def test_mlx_clion_block_quantization_and_routing() -> None:
     values = mx.random.normal((5000,))
     quantized, scale = quantize_blockwise(values)
@@ -50,6 +61,7 @@ def test_mlx_clion_block_quantization_and_routing() -> None:
         mud_learning_rate=0.05,
         fallback_learning_rate=0.02,
         weight_decay=0.0,
+        block_size=4,
     )
     optimizer.init(model.trainable_parameters())
     mud_keys = {key for key, _ in tree_flatten(optimizer.state["states"][0])}
@@ -57,6 +69,7 @@ def test_mlx_clion_block_quantization_and_routing() -> None:
     assert "projection.weight.momentum_buffer" in mud_keys
     assert "embedding.weight.exp_avg_q" in lion_state
     assert lion_state["embedding.weight.exp_avg_q"].dtype == mx.int8
+    assert optimizer.checkpoint_config()["block_size"] == 4
 
 
 def test_mlx_cmud_reduces_loss() -> None:
