@@ -102,9 +102,12 @@ def test_mlx_training_step_is_finite() -> None:
     assert metrics["tokens_per_second"] > 0
 
 
-def test_mlx_training_defaults_amortize_cmud() -> None:
+def test_mlx_training_defaults_use_fast_local_batch() -> None:
     args = build_parser().parse_args([])
-    assert args.grad_accumulation_steps == 16
+    assert args.micro_batch_size == 4
+    assert args.grad_accumulation_steps == 4
+    assert not args.gradient_checkpointing
+    assert args.validation_batches == 5
     assert args.mud_block_size == 256
 
 

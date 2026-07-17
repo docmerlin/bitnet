@@ -304,12 +304,16 @@ Implemented:
 - `mlx_optim.py`: 256-row blockwise C-MUD for non-embedding matrices and blockwise-int8
   C-Lion for embeddings, norms, biases, and gates, including cautious masking, Metal
   triangular whitening, independent learning rates, and resumable optimizer state.
-- MLX defaults to 16 gradient-accumulation microbatches per optimizer update. Override
-  blockwise whitening with `--mud-block-size`; converted and legacy checkpoints preserve
-  their original full-matrix C-MUD behavior.
-- Whole-gradient compilation is limited to block counts that divide sequence length;
-  irregular curriculum layouts run eagerly to avoid Metal argument-buffer exhaustion.
-  Any remaining MLX argument-buffer failure automatically retries that layout eagerly.
+- MLX defaults to four 4-sequence microbatches per optimizer update and leaves activation
+  checkpointing off. Use smaller microbatches with `--gradient-checkpointing` on
+  memory-constrained machines. Override blockwise whitening with `--mud-block-size`;
+  converted and legacy checkpoints preserve their original full-matrix C-MUD behavior.
+- Five 4-sequence validation batches preserve the previous default sample count while
+  avoiding the 4x validation expansion caused by larger microbatches.
+- Whole-gradient compilation remains limited to block counts that divide sequence length.
+  Irregular layouts run eagerly because retaining each compiled curriculum graph eventually
+  exhausts unified-memory headroom. Any remaining MLX argument-buffer failure automatically
+  retries that layout eagerly.
 - All-feature FineWeb-Edu smoke exercised Engram, Infini safety, RFMoE, Hyperloop, MTP,
   two-microbatch accumulation, validation, best/numbered/last/final saves, and resumed at
   the next optimizer step with finite loss.
@@ -345,6 +349,20 @@ With 256-row C-MUD blocks and 16 accumulated 512-token microbatches, the full de
 trainer measured 2,760 tokens/second at curriculum depth 8 and 1,304 tokens/second at
 maximum depth 20. These synthetic-step figures include activation recomputation, gradient
 clipping, and optimizer updates, but exclude data loading, validation, and checkpoints.
+
+On the same M1 Max, fixed maximum-depth real-data steps measured 1,297 tokens/second with
+the original one-sequence, 16-accumulation checkpointed defaults. Disabling activation
+checkpointing reached 1,711; four-sequence microbatches with four accumulations reached
+2,594 tokens/second with matching short-run losses and gradient norms. Eight-sequence
+microbatches added only about 4% with less memory headroom, while 16 sequences exceeded
+practical unified-memory capacity. The four-by-four configuration is the new default.
+Compiling irregular curriculum layouts added 17-30% in short probes but regressed sustained
+training through retained-graph memory pressure, so they remain eager. FP16 added only
+about 2% and changed the loss trajectory immediately, so BF16 remains the default.
+A 100-update run with the new defaults finished at training loss 2.7600 and averaged 2,999
+tokens/second over maximum-depth checkpoints, versus 2.7644 and 1,306 tokens/second for
+the previous defaults. Validation loss is not directly comparable because the new run
+evaluated 20 sequences instead of the earlier five-sequence A/B sample.
 
 A 100-update real-data A/B with identical seed, stream, curriculum, and five validation
 batches every 20 updates compared 256-row blocks against full-matrix whitening. Blockwise
