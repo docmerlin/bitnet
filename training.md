@@ -301,15 +301,21 @@ Implemented:
   curricula, validation, JSONL metrics, and resumable safetensor model/optimizer
   checkpoints. Resume restores MLX RNG, mixture RNG, Hugging Face iterator positions,
   shuffle buffers, and partial packed sequences.
+- `mlx_generate.py`: vanilla and MTP speculative greedy generation. MTP proposals use only
+  the final hidden position, verification accepts only target-model argmax matches, and
+  generated tokens are therefore identical to vanilla greedy decoding.
 - `mlx_optim.py`: 256-row blockwise C-MUD for non-embedding matrices and blockwise-int8
   C-Lion for embeddings, norms, biases, and gates, including cautious masking, Metal
-  triangular whitening, independent learning rates, and resumable optimizer state.
+  triangular whitening, independent learning rates, optional int8 CMUD matrix momentum,
+  and resumable optimizer state.
 - MLX defaults to four 4-sequence microbatches per optimizer update and leaves activation
-  checkpointing off. Use smaller microbatches with `--gradient-checkpointing` on
-  memory-constrained machines. Override blockwise whitening with `--mud-block-size`;
-  converted and legacy checkpoints preserve their original full-matrix C-MUD behavior.
+  checkpointing off. Sampled MTP defaults to depth 4; pass `--mtp-depth 0` to disable it.
+  Use smaller microbatches with `--gradient-checkpointing` on memory-constrained machines.
+  Override blockwise whitening with `--mud-block-size`; converted and legacy checkpoints
+  preserve their original full-matrix C-MUD behavior.
 - Five 4-sequence validation batches preserve the previous default sample count while
-  avoiding the 4x validation expansion caused by larger microbatches.
+  avoiding the 4x validation expansion caused by larger microbatches. Validation batches
+  are materialized once so repeated evaluations do not rescan the held-out data offset.
 - Whole-gradient compilation remains limited to block counts that divide sequence length.
   Irregular layouts run eagerly because retaining each compiled curriculum graph eventually
   exhausts unified-memory headroom. Any remaining MLX argument-buffer failure automatically
@@ -363,6 +369,91 @@ A 100-update run with the new defaults finished at training loss 2.7600 and aver
 tokens/second over maximum-depth checkpoints, versus 2.7644 and 1,306 tokens/second for
 the previous defaults. Validation loss is not directly comparable because the new run
 evaluated 20 sequences instead of the earlier five-sequence A/B sample.
+
+Effective ternary-weight reuse must be measured at production parameter scale. A 32M-
+parameter proxy was inconclusive, while the full 1.089B-parameter physical model at hidden
+1024, `8 + 48×4 + 8` layers, sequence 64, and BF16 showed a repeatable gain. Two 20-step
+runs per mode measured median throughput of 69.35 tokens/second normally and 73.38 with
+forward-scoped recurrent weight reuse, a 5.8% speedup with identical loss. Reuse is enabled
+by default and recomputed each forward so optimizer updates remain visible. Reproduce the
+A/B with `mlx_benchmark.py` using `--num-prelude-layers 8 --num-layers 48
+--num-coda-layers 8 --num-loops 4`; add `--reuse-recurrent-weights` for the cached run.
+
+Recurrent dense projections also use a packed 2-bit Metal path once the ternary curriculum
+reaches full weight quantization. `mlx_ternary_kernel.py` fuses row-scale reduction and
+ternary packing; MLX's native `quantized_matmul` handles forward and input-gradient while a
+custom VJP keeps the STE weight gradient. On the full 1.089B physical model at sequence 256,
+two 10-step BF16 measurements reached 55.38 versus 44.19 tokens/second, a 25.3% speedup.
+At sequence 64 packing overhead instead caused a 4.6% regression, so `mlx_train.py` enables
+the path only for sequence lengths at least 128. An equal-token 48.33M sampled-MTP run
+finished in 247.3 versus 285 seconds (1.15x) with validation perplexity 18.67 versus 18.58.
+New MLX runs enable it by default; use `--no-recurrent-quantized-matmul` for strict old
+arithmetic. Checkpoints written before the flag existed resume with the old path.
+
+CMUD matrix momentum is stored blockwise-int8 by default; this does not introduce a
+standalone MUD training path. On the full 1.089B model, optimizer state
+fell from 7.68 to 5.03 GiB and initialization peak memory from 9.98 to 7.28 GiB. Three
+compiled CMUD-only apply steps improved from 0.123 to 0.234 steps/second. A seeded
+48.33M-parameter equal-token run showed no end-to-end speed gain and moved validation
+perplexity from 18.67 to 18.91. Use `--no-cmud-momentum-8bit` to restore FP32 momentum.
+Legacy optimizer configs omit `mud_eight_bit` and retain FP32 momentum when resumed.
+At full 1.089B scale with sequence 256, three measured end-to-end CMUD steps improved from
+5.11 to 18.24 tokens/second (3.57x) with matching loss; FP32 state pushed the 32 GiB M1 Max
+into severe unified-memory pressure.
+
+The delayed loop-depth curriculum is available through
+`--loop-curriculum-start-ratio`; the existing `--loop-curriculum-ratio` remains the point
+where maximum depth is reached. On the full 1.089B physical model, BF16 sequence-64 phase
+measurements at active loop depths 1 through 4 were 184.08, 122.93, 92.81, and 72.77
+tokens/second. Weighting those costs by a 70–90% delayed ramp projects 141.31 effective
+tokens/second versus 77.56 for the default 0–20% ramp, a 1.82x compute-throughput gain.
+
+Equal-token quality did not support making any delayed schedule the default. Seeded
+48.33M-parameter, 655,360-token sampled-MTP sweeps measured:
+
+| Loop ramp | Time | Speedup | Final validation PPL | PPL change |
+| --- | ---: | ---: | ---: | ---: |
+| 0–20% (default) | 285.0s | 1.00x | 18.58 | baseline |
+| 30–70% | 243.8s | 1.17x | 20.51 | +10.4% |
+| 50–80% | 218.6s | 1.30x | 22.13 | +19.1% |
+| 70–90% | 191.4s | 1.49x | 23.14 | +24.5% |
+
+The 30–70% ramp is the least harmful measured speed/quality tradeoff, but remains opt-in:
+
+```bash
+python3 mlx_train.py \
+  --loop-curriculum-start-ratio 0.3 \
+  --loop-curriculum-ratio 0.7
+```
+
+Equal wall-clock comparison favored that 30–70% ramp. The 0–20% baseline processed
+655,360 tokens in 285 seconds and reached validation perplexity 18.58. A 30–70% run
+processed 770,048 tokens in 265.8 seconds and reached best measured perplexity 17.73;
+a second bracketing run processed 819,200 tokens in 303.2 seconds and reached 16.64.
+Thus the delayed ramp lost quality per token but improved quality per local training time
+in this single-seed 48.33M experiment. It remains opt-in until this result survives larger
+models and multiple seeds. Later sequential sweeps thermally throttled the M1 Max and were
+excluded from wall-clock comparison.
+
+An 80-update MTP sweep used identical data, seed, curriculum, and a fixed four-sequence
+validation sample every 10 updates. Depths 0 through 4 reached perplexity 25 in 173, 189,
+221, 247, and 264 training seconds. Depth 2 reached perplexity 23.5 ten updates earlier
+than depth 0, but still took 221 versus 204 seconds. At 80 updates, validation perplexities
+were 18.97, 19.23, 18.76, 19.06, and 18.70 while training times were 267, 294, 345, 381,
+and 396 seconds. Exact all-head MTP improved some equal-token results but not
+time-to-perplexity in this single-seed short run, so the sampled policy below replaces it.
+
+The cheaper MTP trainer rotates one future head through each accumulation microbatch. At
+depth 4 this reduces auxiliary vocabulary projections from 16 to 4 per optimizer update
+without changing the expected depth-mean loss or checkpoint tensors. A maximum-depth probe
+reached 2,293 tokens/second with a 13.2 GiB peak footprint, versus 1,718 tokens/second and
+16.5 GiB for exact depth 4. An 80-update sampled run finished in 285 seconds at validation
+perplexity 18.58, compared with 271 seconds and 18.97 without MTP and 401 seconds and 18.70
+for exact depth 4. Generation fixes PaTH chunk width to the final training layout so logits
+remain prefix-invariant during verification. On that sampled checkpoint, exact greedy
+speculation generated the same 128 tokens as vanilla decoding at 22.27 versus 16.95
+tokens/second, a 1.31x speedup, while reducing target-model calls from 128 to 96. This
+full-prefix reference has no incremental PaTH/Infini cache yet.
 
 A 100-update real-data A/B with identical seed, stream, curriculum, and five validation
 batches every 20 updates compared 256-row blocks against full-matrix whitening. Blockwise

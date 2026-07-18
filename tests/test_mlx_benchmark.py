@@ -10,17 +10,22 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_benchmark import run_mlx, validate_args
-from mlx_model import MLXBitNet, MLXBitNetConfig, MLXPaTHAttention, MLXRFMoE
+from mlx_model import MLXBitNet, MLXBitNetConfig, MLXHBitLinear, MLXPaTHAttention, MLXRFMoE
 from mlx_optim import CMUD
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import masked_grouped_linear
+from mlx_ternary_kernel import pack_ternary_weight, ternary_quantized_linear
 from mlx_train import (
     _gradient_compile_safe,
+    build_validation_batches,
     build_parser,
     create_apply_step,
     create_gradient_step,
     create_train_step,
+    evaluate,
     load_checkpoint,
+    mtp_head_index,
+    prepare_mtp_batch,
     save_checkpoint,
     validate_args as validate_training_args,
 )
@@ -82,6 +87,7 @@ def test_rfmoe_masked_grouped_metal_matches_forward_and_gradients() -> None:
 def test_mlx_training_step_is_finite() -> None:
     args = Namespace(
         backend="mlx",
+        optimizer="adamw",
         steps=1,
         warmup_steps=0,
         batch_size=1,
@@ -91,15 +97,25 @@ def test_mlx_training_step_is_finite() -> None:
         num_heads=2,
         intermediate_size=16,
         num_layers=1,
+        num_prelude_layers=0,
+        num_coda_layers=0,
+        num_loops=1,
+        active_loops=None,
         path_window_size=4,
         learning_rate=1e-3,
         mlx_dtype="float32",
         mlx_path_kernel=True,
+        reuse_recurrent_weights=False,
+        recurrent_quantized_matmul=False,
+        cmud_momentum_8bit=False,
     )
     validate_args(args)
     metrics = run_mlx(args)
     assert metrics["loss"] > 0
     assert metrics["tokens_per_second"] > 0
+    args.num_loops = 0
+    with pytest.raises(ValueError, match="num-loops must be positive"):
+        validate_args(args)
 
 
 def test_mlx_training_defaults_use_fast_local_batch() -> None:
@@ -109,6 +125,30 @@ def test_mlx_training_defaults_use_fast_local_batch() -> None:
     assert not args.gradient_checkpointing
     assert args.validation_batches == 5
     assert args.mud_block_size == 256
+    assert args.mtp_depth == 4
+    assert args.recurrent_quantized_matmul
+    assert args.cmud_momentum_8bit
+    assert args.loop_curriculum_start_ratio == 0.0
+    assert args.loop_curriculum_ratio == 0.2
+    args.loop_curriculum_start_ratio = 0.3
+    with pytest.raises(ValueError, match="0 <= start <= end <= 1"):
+        validate_training_args(args)
+
+
+def test_mlx_validation_batches_are_materialized_once(monkeypatch) -> None:
+    calls = 0
+
+    def fake_stream(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return iter((0, 1))
+
+    monkeypatch.setattr("mlx_train.build_batch_stream", fake_stream)
+    monkeypatch.setattr("mlx_train.convert_batch", lambda batch: batch)
+    args = build_parser().parse_args(["--validation-batches", "2"])
+
+    assert build_validation_batches(None, args) == [0, 1]
+    assert calls == 1
 
 
 def test_mlx_gradient_compile_avoids_irregular_blocks_and_hybrid_rfmoe() -> None:
@@ -145,6 +185,86 @@ def test_mlx_model_preserves_packed_document_boundaries_and_loops() -> None:
 
     assert mx.allclose(first[:, 2:], changed_previous_document[:, 2:], rtol=1e-5, atol=1e-5).item()
     assert not mx.allclose(first, recurrent).item()
+
+
+def test_mlx_recurrent_loops_reuse_effective_weights(monkeypatch) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=32,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=0,
+        num_recurrent_layers=1,
+        num_coda_layers=0,
+        num_loops=3,
+        path_window_size=4,
+        use_engram=False,
+    )
+    reference = MLXBitNet(config, reuse_recurrent_weights=False)
+    model = MLXBitNet(config, reuse_recurrent_weights=True)
+    model.load_weights(list(tree_flatten(reference.parameters())))
+    tokens = mx.array([[1, 2, 3, 4]])
+    segments = mx.zeros((1, 4), dtype=mx.int32)
+    reference_loss, reference_gradients = nn.value_and_grad(
+        reference,
+        lambda ids, segment_ids: mx.mean(mx.square(reference(ids, segment_ids))),
+    )(tokens, segments)
+    cached_loss, cached_gradients = nn.value_and_grad(
+        model,
+        lambda ids, segment_ids: mx.mean(mx.square(model(ids, segment_ids))),
+    )(tokens, segments)
+    mx.eval(reference_loss, reference_gradients, cached_loss, cached_gradients)
+    assert mx.array_equal(cached_loss, reference_loss).item()
+    for (_, expected), (_, actual) in zip(tree_flatten(reference_gradients), tree_flatten(cached_gradients)):
+        assert mx.array_equal(actual, expected).item()
+
+    original = MLXHBitLinear.effective_weight
+    seen = {}
+    reuses = 0
+
+    def counted(self, dtype, weight=None, cache_key=None):
+        nonlocal reuses
+        result = original(self, dtype, weight, cache_key)
+        key = (id(self) if weight is None else cache_key, str(dtype))
+        if key in seen and result is seen[key]:
+            reuses += 1
+        seen[key] = result
+        return result
+
+    monkeypatch.setattr(MLXHBitLinear, "effective_weight", counted)
+    output = model(tokens, segments)
+    mx.eval(output)
+
+    assert len(seen) == 7
+    assert reuses == 14
+
+
+def test_mlx_packed_ternary_linear_matches_forward_and_vjp() -> None:
+    x = mx.random.normal((2, 3, 64)).astype(mx.float32)
+    weight = mx.random.normal((32, 64)).astype(mx.float32)
+    packed, scales, _ = pack_ternary_weight(weight)
+    scale = mx.maximum(mx.mean(mx.abs(weight), axis=-1, keepdims=True), 1e-5)
+    normalized = weight / scale
+    effective = mx.where(normalized > 0.5, scale, mx.where(normalized < -0.5, -scale, 0.0))
+    expected = x @ effective.T
+    actual = ternary_quantized_linear(x, weight, packed, scales)
+    cotangent = mx.random.normal(actual.shape)
+    gradients = mx.vjp(
+        lambda values, weights: ternary_quantized_linear(
+            values,
+            weights,
+            *pack_ternary_weight(weights)[:2],
+        ),
+        [x, weight],
+        [cotangent],
+    )[1]
+    expected_x = cotangent @ effective
+    expected_weight = cotangent.reshape(-1, weight.shape[0]).T @ x.reshape(-1, weight.shape[1])
+    mx.eval(expected, actual, gradients, expected_x, expected_weight)
+
+    assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
+    assert mx.allclose(gradients[0], expected_x, rtol=1e-5, atol=1e-5).item()
+    assert mx.array_equal(gradients[1], expected_weight).item()
 
 
 def test_mlx_packed_train_step_is_finite() -> None:
@@ -326,6 +446,13 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
     assert 0.0 <= hard_density.item() <= 1.0
     assert mx.isfinite(locality).item() and mx.isfinite(diversity).item()
 
+    hidden = model.hidden_states(tokens, segments)
+    drafts = model.draft_logits(hidden)
+    mx.eval(drafts)
+    assert drafts.shape == (1, 2, 32)
+    assert mx.allclose(drafts[:, 0], mtp[0][:, -1], rtol=1e-5, atol=1e-5).item()
+    assert mx.allclose(drafts[:, 1], mtp[1][:, -1], rtol=1e-5, atol=1e-5).item()
+
     attention = MLXPaTHAttention(config)
     attention.reset_memory(1)
     attention(mx.random.normal((1, 4, 8)), segment_ids=mx.zeros((1, 4), dtype=mx.int32), update_memory=True)
@@ -338,6 +465,73 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
     attention(mx.random.normal((2, 4, 8)), segment_ids=mixed_segments, update_memory=True)
     mx.eval(attention.memory_initialized)
     assert attention.memory_initialized.tolist() == [True, False]
+
+
+def test_mlx_sampled_mtp_matches_exact_depth_mean() -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=0,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        mtp_depth=2,
+    )
+    model = MLXBitNet(config)
+    gradient_step = create_gradient_step(model, compile_step=False, num_loops=1, mtp_loss_coef=0.3)
+    inputs = mx.array([[1, 2, 3, 4]])
+    targets = mx.array([[2, 3, 4, 5]])
+    segments = mx.zeros_like(inputs)
+    args = (inputs, targets, segments, segments, mx.array(0.0), mx.array(1.0), mx.array(0.1))
+
+    exact_loss, exact_gradients = gradient_step(*args)
+    sampled = []
+    sampled_gradients = []
+    for index in range(config.mtp_depth):
+        mtp_batch = prepare_mtp_batch(targets, segments, segments, index, config.mtp_depth)
+        loss, gradients = gradient_step(*args, *mtp_batch)
+        sampled.append(loss)
+        sampled_gradients.append(gradients)
+    mean_loss = mx.mean(mx.stack(sampled))
+    mean_gradients = tree_map(lambda *values: mx.mean(mx.stack(values), axis=0), *sampled_gradients)
+    mx.eval(exact_loss, exact_gradients, mean_loss, mean_gradients)
+
+    assert mx.allclose(mean_loss, exact_loss, rtol=1e-5, atol=1e-5).item()
+    for (_, exact), (_, sampled_mean) in zip(tree_flatten(exact_gradients), tree_flatten(mean_gradients)):
+        assert mx.allclose(sampled_mean, exact, rtol=1e-4, atol=1e-5).item()
+
+
+def test_mlx_mtp_head_schedule_is_resume_stable() -> None:
+    assert [mtp_head_index(1, index, 4, 3) for index in range(4)] == [0, 1, 2, 0]
+    assert [mtp_head_index(2, index, 4, 3) for index in range(4)] == [1, 2, 0, 1]
+    assert [mtp_head_index(8, index, 4, 4) for index in range(4)] == [0, 1, 2, 3]
+
+
+def test_mlx_evaluation_reports_mtp_quality() -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=0,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        mtp_depth=1,
+    )
+    model = MLXBitNet(config)
+    inputs = mx.array([[1, 2, 3, 4]])
+    targets = mx.array([[2, 3, 4, 5]])
+    segments = mx.zeros_like(inputs)
+
+    metrics = evaluate(model, [(inputs, targets, segments, segments)])
+
+    assert metrics["val_perplexity"] > 0
+    assert metrics["mtp_loss_depth_2"] > 0
+    assert 0 <= metrics["mtp_accuracy_depth_2"] <= 1
+    assert 0 <= metrics["mtp_agreement_depth_2"] <= 1
 
 
 def test_mlx_rfmoe_dispatches_only_fired_rows(monkeypatch) -> None:

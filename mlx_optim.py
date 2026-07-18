@@ -107,6 +107,7 @@ class MUD(optim.Optimizer):
         passes: int = 1,
         weight_decay: float = 0.0,
         block_size: int | None = None,
+        eight_bit: bool = False,
     ):
         super().__init__()
         self._maybe_schedule("learning_rate", learning_rate)
@@ -114,20 +115,43 @@ class MUD(optim.Optimizer):
         self.passes = passes
         self.weight_decay = weight_decay
         self.block_size = block_size
+        self.eight_bit = eight_bit
 
     def init_single(self, parameter: mx.array, state: dict):
-        state["momentum_buffer"] = mx.zeros(parameter.shape, dtype=mx.float32)
+        if self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE:
+            blocks = (parameter.size + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
+            state["momentum_buffer_q"] = mx.zeros((blocks, QUANT_BLOCK_SIZE), dtype=mx.int8)
+            state["momentum_buffer_scale"] = mx.zeros((blocks,), dtype=mx.float32)
+        else:
+            state["momentum_buffer"] = mx.zeros(parameter.shape, dtype=mx.float32)
         state["master_parameter"] = parameter.astype(mx.float32)
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
         parameter_dtype = parameter.dtype
         gradient = gradient.astype(mx.float32)
-        momentum_buffer = self.momentum * state["momentum_buffer"] + gradient
+        use_eight_bit = self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE
+        if "momentum_buffer_q" in state:
+            previous = dequantize_blockwise(
+                state["momentum_buffer_q"],
+                state["momentum_buffer_scale"],
+                gradient.shape,
+            )
+        elif "momentum_buffer" in state:
+            previous = state["momentum_buffer"]
+        else:
+            previous = mx.zeros(parameter.shape, dtype=mx.float32)
+        momentum_buffer = self.momentum * previous + gradient
         direction = gradient + self.momentum * momentum_buffer
         update = mud_decorrelate(direction, self.passes, block_size=self.block_size)
         update = update * (0.2 * math.sqrt(max(parameter.shape)))
         update = cautious_mask(update, gradient)
-        state["momentum_buffer"] = momentum_buffer
+        if use_eight_bit:
+            state["momentum_buffer_q"], state["momentum_buffer_scale"] = quantize_blockwise(momentum_buffer)
+            state.pop("momentum_buffer", None)
+        else:
+            state["momentum_buffer"] = momentum_buffer
+            state.pop("momentum_buffer_q", None)
+            state.pop("momentum_buffer_scale", None)
         learning_rate = self.learning_rate.astype(mx.float32)
         master_parameter = state.get("master_parameter", parameter.astype(mx.float32))
         master_parameter = master_parameter * (1.0 - learning_rate * self.weight_decay) - learning_rate * update
@@ -196,11 +220,12 @@ class CMUD(optim.MultiOptimizer):
         passes: int = 1,
         betas: tuple[float, float] = (0.95, 0.98),
         eight_bit: bool = True,
+        mud_eight_bit: bool = False,
         block_size: int | None = None,
     ):
         self.mud_learning_rate = mud_learning_rate
         self.fallback_learning_rate = fallback_learning_rate
-        mud = MUD(mud_learning_rate, momentum, passes, weight_decay, block_size)
+        mud = MUD(mud_learning_rate, momentum, passes, weight_decay, block_size, mud_eight_bit)
         clion = CLion(fallback_learning_rate, betas, eight_bit)
         super().__init__([mud, clion], [self._is_mud_parameter])
 
@@ -225,4 +250,5 @@ class CMUD(optim.MultiOptimizer):
             "block_size": mud.block_size,
             "betas": [clion.beta1, clion.beta2],
             "eight_bit": clion.eight_bit,
+            "mud_eight_bit": mud.eight_bit,
         }

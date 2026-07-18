@@ -22,6 +22,21 @@ def test_loop_curriculum_disabled() -> bool:
     return True
 
 
+def test_loop_curriculum_delayed() -> bool:
+    kwargs = {
+        "min_loops": 1,
+        "max_loops": 4,
+        "curriculum_start_ratio": 0.7,
+        "curriculum_ratio": 0.9,
+    }
+    assert loop_count_for_progress(0.0, **kwargs) == 1
+    assert loop_count_for_progress(0.7, **kwargs) == 1
+    assert loop_count_for_progress(0.8, **kwargs) == 3
+    assert loop_count_for_progress(0.9, **kwargs) == 4
+    assert loop_count_for_progress(1.0, **kwargs) == 4
+    return True
+
+
 def test_small_sublayer_output_init() -> bool:
     import torch
 
@@ -58,4 +73,5 @@ def test_small_sublayer_output_init() -> bool:
 if __name__ == "__main__":
     test_loop_curriculum_ramp()
     test_loop_curriculum_disabled()
+    test_loop_curriculum_delayed()
     test_small_sublayer_output_init()

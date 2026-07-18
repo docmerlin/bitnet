@@ -86,6 +86,45 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
 Note: linear R curriculum is the default train path; full always-max R via
 `--loop-curriculum-ratio 0`.
 
+### MLX training performance
+
+Priority order after current cache/MTP inference work:
+
+- [x] **Reuse effective ternary weights across recurrent loops.** Small 32M-parameter tests
+  were inconclusive, so the decision benchmark used the full 1.089B-parameter physical
+  model at hidden 1024, `8 + 48×4 + 8` layers, sequence 64, and BF16. Two 20-step runs per
+  mode measured median throughput of 69.35 tok/s normally and 73.38 tok/s with reuse
+  (+5.8%). Loss and gradients match exactly; reuse is enabled by default.
+- [x] **Benchmark a delayed loop-depth curriculum.** Full-1B phase measurements project
+  141.31 effective tok/s for a 70–90% ramp versus 77.56 for the current 0–20% schedule
+  (1.82x). Equal-token 48.33M sweeps measured 30–70% at 243.8s/PPL 20.51, 50–80% at
+  218.6s/PPL 22.13, and 70–90% at 191.4s/PPL 23.14, versus the 0–20% baseline at
+  285s/PPL 18.58. An equal-wall-clock 30–70% follow-up processed 770,048 tokens in
+  265.8s and reached best PPL 17.73; 819,200 tokens in 303.2s reached PPL 16.64.
+  Delayed start remains opt-in pending larger-scale/multi-seed confirmation.
+- [x] **Quantize CMUD matrix momentum state to 8-bit.** At 1.089B scale, optimizer state
+  dropped 7.68→5.03 GiB (-2.64 GiB), peak initialization memory dropped 9.98→7.28 GiB,
+  and CMUD apply throughput improved 0.123→0.234 steps/s (1.91x). An equal-token 48.33M
+  run measured 246.8s/PPL 18.91 versus FP32 momentum at 247.3s/PPL 18.67. Enabled by
+  default for new MLX runs; full-1B sequence-256 CMUD training measured 5.11→18.24 tok/s
+  (3.57x) with matching loss. `--no-cmud-momentum-8bit` restores FP32 momentum. Production
+  still uses CMUD only.
+- [ ] **Add selective MLX activation checkpointing.** Checkpoint only memory-heavy recurrent
+  regions needed to fit the target batch instead of recomputing every sublayer. Measure
+  memory and tokens/second for each granularity.
+- [x] **Build fused recurrent ternary Metal training kernel.** Packed 2-bit affine codes
+  preserve ternary values; custom Metal packs weights and MLX `quantized_matmul` handles
+  forward/input-gradient with STE weight gradients. Full-1B sequence-256 throughput improved
+  44.19→55.38 tok/s (+25.3%). Equal-token 48.33M training improved 285→247.3s (1.15x)
+  while validation PPL moved 18.58→18.67 (+0.5%). Enabled for new MLX runs at sequence ≥128;
+  old checkpoints resume without it unless their saved arguments opted in.
+- [ ] **Profile phase costs before each optimization.** Separate forward/backward, MUD,
+  validation, data, and synchronization time. Keep changes only when end-to-end
+  tokens/second improves at representative 48M and 1B shapes.
+- [ ] **Use faster/distributed hardware for full 1B training.** Single M1 Max estimates are
+  roughly 30–60 tok/s at 1B scale; software improvements alone do not make a 20B-token run
+  practical. Re-benchmark PyTorch/CUDA or distributed training before committing that budget.
+
 ---
 
 ## RFMoE design reference

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 import math
@@ -14,6 +15,14 @@ from mlx.nn.utils import checkpoint as activation_checkpoint
 
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
+from mlx_ternary_kernel import pack_ternary_weight, ternary_quantized_linear
+
+
+_effective_weight_cache: ContextVar[dict[tuple[object, str], object] | None] = ContextVar(
+    "effective_weight_cache",
+    default=None,
+)
+_recurrent_quantized_matmul: ContextVar[bool] = ContextVar("recurrent_quantized_matmul", default=False)
 
 
 @lru_cache(maxsize=32)
@@ -116,16 +125,39 @@ class MLXHBitLinear(nn.Module):
             x = x + self.activation_mix * mx.stop_gradient(quantized_x - x)
         return x
 
-    def effective_weight(self, dtype, weight: mx.array | None = None) -> mx.array:
+    def effective_weight(
+        self,
+        dtype,
+        weight: mx.array | None = None,
+        cache_key: object | None = None,
+    ) -> mx.array:
+        cache = _effective_weight_cache.get()
+        if cache is not None:
+            key = (id(self) if weight is None else cache_key, str(dtype))
+            if key[0] is not None and key in cache:
+                return cache[key]
         weight = self.weight if weight is None else weight
         weight_scale = mx.maximum(mx.mean(mx.abs(weight), axis=-1, keepdims=True), 1e-5)
         normalized = weight / weight_scale
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
         quantized_weight = ternary * weight_scale
-        return (weight + self.weight_mix * mx.stop_gradient(quantized_weight - weight)).astype(dtype)
+        effective = (weight + self.weight_mix * mx.stop_gradient(quantized_weight - weight)).astype(dtype)
+        if cache is not None and key[0] is not None:
+            cache[key] = effective
+        return effective
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.prepare_input(x)
+        if _recurrent_quantized_matmul.get() and min(self.weight.shape) >= 512:
+            cache = _effective_weight_cache.get()
+            key = (id(self), f"packed-{x.dtype}")
+            packed_weight = cache.get(key) if cache is not None else None
+            if packed_weight is None:
+                packed_weight = pack_ternary_weight(self.weight)
+                if cache is not None:
+                    cache[key] = packed_weight
+            packed, scales, _ = packed_weight
+            return ternary_quantized_linear(x, self.weight, packed, scales)
         return x @ self.effective_weight(x.dtype).T
 
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
@@ -170,21 +202,46 @@ class MLXEngram(nn.Module):
         for ngram_size in range(2, self.config.engram_max_ngram_size + 1):
             mixed = input_ids[..., None] * self.multipliers[0]
             for lag in range(1, ngram_size):
-                shifted = mx.full(input_ids.shape, self.config.engram_pad_id, dtype=input_ids.dtype)
-                shifted = mx.concatenate((shifted[:, :lag], input_ids[:, :-lag]), axis=1)
-                keep = mx.ones(input_ids.shape, dtype=mx.bool_)
-                keep = mx.concatenate((mx.zeros((input_ids.shape[0], lag), dtype=mx.bool_), keep[:, lag:]), axis=1)
+                if lag >= input_ids.shape[1]:
+                    shifted = mx.full(input_ids.shape, self.config.engram_pad_id, dtype=input_ids.dtype)
+                    keep = mx.zeros(input_ids.shape, dtype=mx.bool_)
+                else:
+                    shifted = mx.concatenate(
+                        (
+                            mx.full((input_ids.shape[0], lag), self.config.engram_pad_id, dtype=input_ids.dtype),
+                            input_ids[:, :-lag],
+                        ),
+                        axis=1,
+                    )
+                    keep = mx.concatenate(
+                        (
+                            mx.zeros((input_ids.shape[0], lag), dtype=mx.bool_),
+                            mx.ones((input_ids.shape[0], input_ids.shape[1] - lag), dtype=mx.bool_),
+                        ),
+                        axis=1,
+                    )
                 if segment_ids is not None:
-                    same = segment_ids[:, lag:] == segment_ids[:, :-lag]
-                    same = mx.concatenate((mx.zeros((input_ids.shape[0], lag), dtype=mx.bool_), same), axis=1)
+                    if lag >= segment_ids.shape[1]:
+                        same = mx.zeros(segment_ids.shape, dtype=mx.bool_)
+                    else:
+                        same = segment_ids[:, lag:] == segment_ids[:, :-lag]
+                        same = mx.concatenate((mx.zeros((input_ids.shape[0], lag), dtype=mx.bool_), same), axis=1)
                     keep = keep & same
                 shifted = mx.where(keep, shifted, self.config.engram_pad_id)
                 mixed = mx.bitwise_xor(mixed, shifted[..., None] * self.multipliers[lag])
             hashes.append(mx.remainder(mixed, self.config.engram_vocab_size))
         return mx.concatenate(hashes, axis=-1)
 
-    def __call__(self, hidden_states: mx.array, input_ids: mx.array, segment_ids: mx.array | None) -> mx.array:
-        memory = self.embedding(self.hash_ids(input_ids, segment_ids) + self.offsets)
+    def _values(
+        self,
+        hidden_states: mx.array,
+        input_ids: mx.array,
+        segment_ids: mx.array | None,
+        tail_length: int | None = None,
+    ):
+        hashes = self.hash_ids(input_ids, segment_ids)
+        hashes = hashes[:, -tail_length:] if tail_length is not None else hashes
+        memory = self.embedding(hashes + self.offsets)
         memory = memory.reshape(*memory.shape[:-2], -1)
         key = self.key_norm(self.key_proj(memory))
         query = self.query_norm(hidden_states)
@@ -192,18 +249,86 @@ class MLXEngram(nn.Module):
         score = mx.sign(score) * mx.sqrt(mx.maximum(mx.abs(score), 1e-6))
         value = mx.sigmoid(score)[..., None] * self.value_proj(memory)
         normalized = self.conv_norm(value)
+        return value, normalized
+
+    def _convolve(self, normalized: mx.array, segment_ids: mx.array | None = None) -> mx.array:
         convolved = mx.zeros_like(normalized)
         for lag in range(self.config.engram_kernel_size):
-            shifted = normalized if lag == 0 else mx.concatenate(
-                (mx.zeros_like(normalized[:, :lag]), normalized[:, :-lag]), axis=1
-            )
-            if segment_ids is not None and lag > 0:
+            if lag == 0:
+                shifted = normalized
+            elif lag >= normalized.shape[1]:
+                shifted = mx.zeros_like(normalized)
+            else:
+                shifted = mx.concatenate((mx.zeros_like(normalized[:, :lag]), normalized[:, :-lag]), axis=1)
+            if segment_ids is not None and 0 < lag < segment_ids.shape[1]:
                 same = segment_ids[:, lag:] == segment_ids[:, :-lag]
                 same = mx.concatenate((mx.zeros((segment_ids.shape[0], lag), dtype=mx.bool_), same), axis=1)
                 shifted = shifted * same[..., None]
             weight = self.short_conv_weight[:, self.config.engram_kernel_size - 1 - lag]
             convolved = convolved + shifted * weight
+        return convolved
+
+    def __call__(self, hidden_states: mx.array, input_ids: mx.array, segment_ids: mx.array | None) -> mx.array:
+        value, normalized = self._values(hidden_states, input_ids, segment_ids)
+        return value + nn.silu(self._convolve(normalized, segment_ids))
+
+    def prefill(
+        self,
+        hidden_states: mx.array,
+        input_ids: mx.array,
+        cache: "MLXEngramInferenceCache",
+    ) -> mx.array:
+        value, normalized = self._values(hidden_states, input_ids, None)
+        cache.normalized = normalized[:, -(self.config.engram_kernel_size - 1) :]
+        return value + nn.silu(self._convolve(normalized))
+
+    def extend(
+        self,
+        hidden_states: mx.array,
+        input_ids: mx.array,
+        token_history: mx.array,
+        cache: "MLXEngramInferenceCache",
+    ) -> mx.array:
+        ids = mx.concatenate((token_history, input_ids), axis=1)
+        value, normalized = self._values(hidden_states, ids, None, input_ids.shape[1])
+        combined = normalized if cache.normalized is None else mx.concatenate((cache.normalized, normalized), axis=1)
+        convolved = self._convolve(combined)[:, -input_ids.shape[1] :]
+        cache.normalized = combined[:, -(self.config.engram_kernel_size - 1) :]
         return value + nn.silu(convolved)
+
+    def incremental(
+        self,
+        hidden_states: mx.array,
+        input_ids: mx.array,
+        token_history: mx.array,
+        cache: "MLXEngramInferenceCache",
+    ) -> mx.array:
+        ids = mx.concatenate((token_history, input_ids), axis=1)
+        if ids.shape[1] < self.config.engram_max_ngram_size:
+            padding = mx.full(
+                (ids.shape[0], self.config.engram_max_ngram_size - ids.shape[1]),
+                self.config.engram_pad_id,
+                dtype=ids.dtype,
+            )
+            ids = mx.concatenate((padding, ids), axis=1)
+        value, normalized = self._values(hidden_states, ids, None, 1)
+        history = cache.normalized
+        convolved = normalized * self.short_conv_weight[:, -1]
+        for lag in range(1, self.config.engram_kernel_size):
+            if history is not None and history.shape[1] >= lag:
+                index = history.shape[1] - lag
+                convolved = convolved + history[:, index : index + 1] * self.short_conv_weight[:, -1 - lag]
+        cache.normalized = normalized if history is None else mx.concatenate((history, normalized), axis=1)
+        cache.normalized = cache.normalized[:, -(self.config.engram_kernel_size - 1) :]
+        return value + nn.silu(convolved)
+
+
+@dataclass
+class MLXEngramInferenceCache:
+    normalized: mx.array | None = None
+
+    def clone(self) -> "MLXEngramInferenceCache":
+        return MLXEngramInferenceCache(self.normalized)
 
 
 class MLXRFMoEExpert(nn.Module):
@@ -249,7 +374,11 @@ class MLXRFMoE(nn.Module):
     def _grouped_linear(x: mx.array, layers: list[MLXHBitLinear], expert_indices: mx.array) -> mx.array:
         prepared = layers[0].prepare_input(x)
         weights = mx.stack([layer.weight for layer in layers])
-        weights = layers[0].effective_weight(prepared.dtype, weights).swapaxes(-1, -2)
+        weights = layers[0].effective_weight(
+            prepared.dtype,
+            weights,
+            tuple(id(layer) for layer in layers),
+        ).swapaxes(-1, -2)
         return mx.squeeze(
             mx.gather_mm(
                 prepared[:, None, :],
@@ -266,6 +395,7 @@ class MLXRFMoE(nn.Module):
         weights = layers[0].effective_weight(
             prepared.dtype,
             mx.stack([layer.weight for layer in layers]),
+            tuple(id(layer) for layer in layers),
         )
         return masked_grouped_linear(prepared, weights, active)
 
@@ -283,6 +413,7 @@ class MLXRFMoE(nn.Module):
         weights = layers[0].effective_weight(
             prepared.dtype,
             mx.stack([layer.weight for layer in layers]),
+            tuple(id(layer) for layer in layers),
         )
         return compacted_grouped_linear(
             prepared,
@@ -299,6 +430,7 @@ class MLXRFMoE(nn.Module):
         a_gate = a_gates[0].effective_weight(
             score_input.dtype,
             mx.stack([layer.weight for layer in a_gates]),
+            tuple(id(layer) for layer in a_gates),
         )
         z = mx.einsum("td,erd->etr", score_input, a_gate)
         biases = mx.stack([expert.bias for expert in self.experts])
@@ -479,6 +611,7 @@ class MLXPaTHAttention(nn.Module):
         super().__init__()
         self.config = config
         self.num_blocks = config.block_size
+        self.fixed_block_width = None
         hidden = config.hidden_size
         self.head_dim = hidden // config.num_attention_heads
         self.qkv = MLXHBitLinear(hidden, hidden * 3, config)
@@ -509,6 +642,19 @@ class MLXPaTHAttention(nn.Module):
         self.memory_k = mx.zeros(shape, dtype=mx.float32)
         self.memory_v = mx.zeros(shape, dtype=mx.float32)
         self.memory_initialized = mx.zeros((batch_size,), dtype=mx.bool_)
+
+    def new_inference_cache(self, batch_size: int) -> "MLXPaTHInferenceCache":
+        shape = (
+            batch_size,
+            self.config.num_attention_heads,
+            self.config.infini_memory_dim,
+            self.head_dim,
+        )
+        return MLXPaTHInferenceCache(
+            memory_k=mx.zeros(shape, dtype=mx.float32),
+            memory_v=mx.zeros(shape, dtype=mx.float32),
+            memory_initialized=mx.zeros((batch_size,), dtype=mx.bool_),
+        )
 
     def _next_memory(
         self,
@@ -554,6 +700,10 @@ class MLXPaTHAttention(nn.Module):
         return shifted
 
     def path_vectors(self, x: mx.array, segment_ids: mx.array | None) -> mx.array:
+        vectors, _ = self._path_vectors(x, segment_ids)
+        return vectors
+
+    def _path_vectors(self, x: mx.array, segment_ids: mx.array | None):
         projected = self.path_up(self.path_down(x))
         convolved = (
             projected * self.path_conv_weight[:, 2]
@@ -563,7 +713,231 @@ class MLXPaTHAttention(nn.Module):
         convolved = nn.silu(convolved.astype(mx.float32)).reshape(
             x.shape[0], x.shape[1], self.config.num_attention_heads, self.head_dim
         )
-        return convolved / mx.maximum(mx.linalg.norm(convolved, axis=-1, keepdims=True), 1e-6)
+        vectors = convolved / mx.maximum(mx.linalg.norm(convolved, axis=-1, keepdims=True), 1e-6)
+        return vectors, projected
+
+    def _project(self, x: mx.array, segment_ids: mx.array | None):
+        batch, length, _ = x.shape
+        qkv = self.qkv(x).reshape(
+            batch,
+            length,
+            3,
+            self.config.num_attention_heads,
+            self.head_dim,
+        )
+        q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
+        k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
+        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
+        w, projected = self._path_vectors(x, segment_ids)
+        beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
+        forget_logits = self.path_forget(x).astype(mx.float32)
+        log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
+        return q, k, v, w, beta, log_forget, projected
+
+    def _project_extension(self, x: mx.array, cache: "MLXPaTHInferenceCache"):
+        batch, length, _ = x.shape
+        qkv = self.qkv(x).reshape(
+            batch,
+            length,
+            3,
+            self.config.num_attention_heads,
+            self.head_dim,
+        )
+        q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
+        k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
+        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
+        projected = self.path_up(self.path_down(x))
+        combined = projected if cache.path_projected is None else mx.concatenate((cache.path_projected, projected), axis=1)
+        convolved = combined * self.path_conv_weight[:, 2]
+        for lag, weight_index in ((1, 1), (2, 0)):
+            if lag < combined.shape[1]:
+                shifted = mx.concatenate((mx.zeros_like(combined[:, :lag]), combined[:, :-lag]), axis=1)
+                convolved = convolved + shifted * self.path_conv_weight[:, weight_index]
+        convolved = nn.silu(convolved[:, -length:].astype(mx.float32)).reshape(
+            batch, length, self.config.num_attention_heads, self.head_dim
+        )
+        w = convolved / mx.maximum(mx.linalg.norm(convolved, axis=-1, keepdims=True), 1e-6)
+        beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
+        forget_logits = self.path_forget(x).astype(mx.float32)
+        log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
+        cache.path_projected = combined[:, -2:]
+        return q, k, v, w, beta, log_forget
+
+    def incremental(
+        self,
+        x: mx.array,
+        cache: "MLXPaTHInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        batch, _, hidden = x.shape
+        qkv = self.qkv(x).reshape(batch, 1, 3, self.config.num_attention_heads, self.head_dim)
+        q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
+        k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
+        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
+
+        projected = self.path_up(self.path_down(x))
+        convolved = projected * self.path_conv_weight[:, 2]
+        if cache.path_projected is not None:
+            history = cache.path_projected
+            if history.shape[1] >= 1:
+                convolved = convolved + history[:, -1:] * self.path_conv_weight[:, 1]
+            if history.shape[1] >= 2:
+                convolved = convolved + history[:, -2:-1] * self.path_conv_weight[:, 0]
+            cache.path_projected = mx.concatenate((history, projected), axis=1)[:, -2:]
+        else:
+            cache.path_projected = projected
+        w = nn.silu(convolved.astype(mx.float32)).reshape(
+            batch, 1, self.config.num_attention_heads, self.head_dim
+        )
+        w = w / mx.maximum(mx.linalg.norm(w, axis=-1, keepdims=True), 1e-6)
+        beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
+        forget_logits = self.path_forget(x).astype(mx.float32)
+        log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
+
+        cache.q = q if cache.q is None else mx.concatenate((cache.q, q), axis=2)
+        cache.k = k if cache.k is None else mx.concatenate((cache.k, k), axis=2)
+        cache.v = v if cache.v is None else mx.concatenate((cache.v, v), axis=2)
+        cache.w = w if cache.w is None else mx.concatenate((cache.w, w), axis=1)
+        cache.beta = beta if cache.beta is None else mx.concatenate((cache.beta, beta), axis=1)
+        cache.log_forget = (
+            log_forget if cache.log_forget is None else mx.concatenate((cache.log_forget, log_forget), axis=1)
+        )
+
+        local = self.path_chunk(cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, None)
+        local = local[:, :, -1:]
+        scores = q.astype(mx.float32) @ cache.memory_k.swapaxes(-1, -2)
+        scores = scores * self.head_dim**-0.5
+        memory_context = mx.softmax(scores, axis=-1).astype(v.dtype) @ cache.memory_v.astype(v.dtype)
+        gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
+        mixed = (1.0 - gate) * local + gate * memory_context
+        local = mx.where(cache.memory_initialized[:, None, None, None], mixed, local)
+        context = local.transpose(0, 2, 1, 3).reshape(batch, 1, hidden)
+
+        chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
+        if cache.q.shape[2] == chunk_width:
+            if update_memory:
+                cache.memory_k, cache.memory_v, cache.memory_initialized = self._next_memory(
+                    cache.k,
+                    cache.v,
+                    mx.ones((batch,), dtype=mx.bool_),
+                    cache.memory_k,
+                    cache.memory_v,
+                    cache.memory_initialized,
+                )
+            cache.clear_open_chunk()
+        return self.out(context)
+
+    def extend(
+        self,
+        x: mx.array,
+        cache: "MLXPaTHInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        batch, length, hidden = x.shape
+        q, k, v, w, beta, log_forget = self._project_extension(x, cache)
+        chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
+        outputs = []
+        offset = 0
+        while offset < length:
+            open_length = 0 if cache.q is None else cache.q.shape[2]
+            take = min(chunk_width - open_length, length - offset)
+            q_new = q[:, :, offset : offset + take]
+            k_new = k[:, :, offset : offset + take]
+            v_new = v[:, :, offset : offset + take]
+            w_new = w[:, offset : offset + take]
+            beta_new = beta[:, offset : offset + take]
+            forget_new = log_forget[:, offset : offset + take]
+            if open_length:
+                chunk_q = mx.concatenate((cache.q, q_new), axis=2)
+                chunk_k = mx.concatenate((cache.k, k_new), axis=2)
+                chunk_v = mx.concatenate((cache.v, v_new), axis=2)
+                chunk_w = mx.concatenate((cache.w, w_new), axis=1)
+                chunk_beta = mx.concatenate((cache.beta, beta_new), axis=1)
+                chunk_forget = mx.concatenate((cache.log_forget, forget_new), axis=1)
+            else:
+                chunk_q, chunk_k, chunk_v = q_new, k_new, v_new
+                chunk_w, chunk_beta, chunk_forget = w_new, beta_new, forget_new
+            local = self.path_chunk(
+                chunk_q,
+                chunk_k,
+                chunk_v,
+                chunk_w,
+                chunk_beta,
+                chunk_forget,
+                None,
+            )[:, :, open_length:]
+            scores = q_new.astype(mx.float32) @ cache.memory_k.swapaxes(-1, -2)
+            scores = scores * self.head_dim**-0.5
+            memory_context = mx.softmax(scores, axis=-1).astype(v.dtype) @ cache.memory_v.astype(v.dtype)
+            gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
+            mixed = (1.0 - gate) * local + gate * memory_context
+            outputs.append(mx.where(cache.memory_initialized[:, None, None, None], mixed, local))
+            if chunk_q.shape[2] == chunk_width:
+                if update_memory:
+                    cache.memory_k, cache.memory_v, cache.memory_initialized = self._next_memory(
+                        chunk_k,
+                        chunk_v,
+                        mx.ones((batch,), dtype=mx.bool_),
+                        cache.memory_k,
+                        cache.memory_v,
+                        cache.memory_initialized,
+                    )
+                cache.clear_open_chunk()
+            else:
+                cache.q, cache.k, cache.v = chunk_q, chunk_k, chunk_v
+                cache.w, cache.beta, cache.log_forget = chunk_w, chunk_beta, chunk_forget
+            offset += take
+        context = mx.concatenate(outputs, axis=2).transpose(0, 2, 1, 3).reshape(batch, length, hidden)
+        return self.out(context)
+
+    def prefill(
+        self,
+        x: mx.array,
+        cache: "MLXPaTHInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        batch, length, hidden = x.shape
+        q, k, v, w, beta, log_forget, projected = self._project(x, None)
+        chunks = []
+        chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
+        for start in range(0, length, chunk_width):
+            end = min(start + chunk_width, length)
+            local = self.path_chunk(
+                q[:, :, start:end],
+                k[:, :, start:end],
+                v[:, :, start:end],
+                w[:, start:end],
+                beta[:, start:end],
+                log_forget[:, start:end],
+                None,
+            )
+            scores = q[:, :, start:end].astype(mx.float32) @ cache.memory_k.swapaxes(-1, -2)
+            scores = scores * self.head_dim**-0.5
+            memory_context = mx.softmax(scores, axis=-1).astype(v.dtype) @ cache.memory_v.astype(v.dtype)
+            gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
+            mixed = (1.0 - gate) * local + gate * memory_context
+            local = mx.where(cache.memory_initialized[:, None, None, None], mixed, local)
+            if end - start == chunk_width:
+                if update_memory:
+                    cache.memory_k, cache.memory_v, cache.memory_initialized = self._next_memory(
+                        k[:, :, start:end],
+                        v[:, :, start:end],
+                        mx.ones((batch,), dtype=mx.bool_),
+                        cache.memory_k,
+                        cache.memory_v,
+                        cache.memory_initialized,
+                    )
+            else:
+                cache.q = q[:, :, start:end]
+                cache.k = k[:, :, start:end]
+                cache.v = v[:, :, start:end]
+                cache.w = w[:, start:end]
+                cache.beta = beta[:, start:end]
+                cache.log_forget = log_forget[:, start:end]
+            chunks.append(local)
+        cache.path_projected = projected[:, -2:]
+        context = mx.concatenate(chunks, axis=2).transpose(0, 2, 1, 3).reshape(batch, length, hidden)
+        return self.out(context)
 
     def path_chunk(
         self,
@@ -607,22 +981,9 @@ class MLXPaTHAttention(nn.Module):
         update_memory: bool,
     ):
         batch, length, hidden = x.shape
-        qkv = self.qkv(x).reshape(
-            batch,
-            length,
-            3,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
-        k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
-        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
-        w = self.path_vectors(x, segment_ids)
-        beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
-        forget_logits = self.path_forget(x).astype(mx.float32)
-        log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
+        q, k, v, w, beta, log_forget, _ = self._project(x, segment_ids)
         chunks = []
-        block_width = (length + self.num_blocks - 1) // self.num_blocks
+        block_width = self.fixed_block_width or (length + self.num_blocks - 1) // self.num_blocks
         memory_safe = (
             mx.ones((batch,), dtype=mx.bool_)
             if segment_ids is None
@@ -687,6 +1048,55 @@ class MLXPaTHAttention(nn.Module):
         return output
 
 
+@dataclass
+class MLXPaTHInferenceCache:
+    memory_k: mx.array
+    memory_v: mx.array
+    memory_initialized: mx.array
+    path_projected: mx.array | None = None
+    q: mx.array | None = None
+    k: mx.array | None = None
+    v: mx.array | None = None
+    w: mx.array | None = None
+    beta: mx.array | None = None
+    log_forget: mx.array | None = None
+
+    def clear_open_chunk(self) -> None:
+        self.q = self.k = self.v = self.w = self.beta = self.log_forget = None
+
+    def clone(self) -> "MLXPaTHInferenceCache":
+        return MLXPaTHInferenceCache(
+            self.memory_k,
+            self.memory_v,
+            self.memory_initialized,
+            self.path_projected,
+            self.q,
+            self.k,
+            self.v,
+            self.w,
+            self.beta,
+            self.log_forget,
+        )
+
+    def arrays(self) -> list[mx.array]:
+        return [
+            value
+            for value in (
+                self.memory_k,
+                self.memory_v,
+                self.memory_initialized,
+                self.path_projected,
+                self.q,
+                self.k,
+                self.v,
+                self.w,
+                self.beta,
+                self.log_forget,
+            )
+            if value is not None
+        ]
+
+
 class MLXHybridBlock(nn.Module):
     def __init__(self, config: MLXBitNetConfig, layer_id: int):
         super().__init__()
@@ -710,6 +1120,59 @@ class MLXHybridBlock(nn.Module):
     def _dense_mlp(self, x: mx.array) -> mx.array:
         gate, value = mx.split(self.up(x), 2, axis=-1)
         return self.down(nn.silu(self.mid(nn.silu(gate) * value)))
+
+    def new_inference_cache(self, batch_size: int) -> "MLXBlockInferenceCache":
+        return MLXBlockInferenceCache(
+            attention=self.attn.new_inference_cache(batch_size),
+            engram=MLXEngramInferenceCache() if self.engram is not None else None,
+        )
+
+    def incremental(
+        self,
+        x: mx.array,
+        input_ids: mx.array,
+        token_history: mx.array,
+        cache: "MLXBlockInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        if self.engram is not None:
+            x = x + self.engram.incremental(x, input_ids, token_history, cache.engram)
+        attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
+        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        normalized = self.mlp_norm(x)
+        output = self.moe(normalized) if self.moe is not None else self._dense_mlp(normalized)
+        return self.mlp_post(x + self.mlp_scale * output)
+
+    def extend(
+        self,
+        x: mx.array,
+        input_ids: mx.array,
+        token_history: mx.array,
+        cache: "MLXBlockInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        if self.engram is not None:
+            x = x + self.engram.extend(x, input_ids, token_history, cache.engram)
+        attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
+        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        normalized = self.mlp_norm(x)
+        output = self.moe(normalized) if self.moe is not None else self._dense_mlp(normalized)
+        return self.mlp_post(x + self.mlp_scale * output)
+
+    def prefill(
+        self,
+        x: mx.array,
+        input_ids: mx.array,
+        cache: "MLXBlockInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        if self.engram is not None:
+            x = x + self.engram.prefill(x, input_ids, cache.engram)
+        attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
+        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        normalized = self.mlp_norm(x)
+        output = self.moe(normalized) if self.moe is not None else self._dense_mlp(normalized)
+        return self.mlp_post(x + self.mlp_scale * output)
 
     def __call__(
         self,
@@ -745,12 +1208,57 @@ class MLXHybridBlock(nn.Module):
         return self.mlp_post(x + self.mlp_scale * output)
 
 
+@dataclass
+class MLXBlockInferenceCache:
+    attention: MLXPaTHInferenceCache
+    engram: MLXEngramInferenceCache | None
+
+    def clone(self) -> "MLXBlockInferenceCache":
+        return MLXBlockInferenceCache(
+            self.attention.clone(),
+            self.engram.clone() if self.engram is not None else None,
+        )
+
+    def arrays(self) -> list[mx.array]:
+        values = self.attention.arrays()
+        if self.engram is not None and self.engram.normalized is not None:
+            values.append(self.engram.normalized)
+        return values
+
+
+@dataclass
+class MLXInferenceCache:
+    layers: list[MLXBlockInferenceCache]
+    token_history: mx.array
+    num_loops: int
+    position: int = 0
+
+    def clone(self) -> "MLXInferenceCache":
+        return MLXInferenceCache(
+            [layer.clone() for layer in self.layers],
+            self.token_history,
+            self.num_loops,
+            self.position,
+        )
+
+    def arrays(self) -> list[mx.array]:
+        return [self.token_history, *(value for layer in self.layers for value in layer.arrays())]
+
+
 class MLXBitNet(nn.Module):
     """MLX BitNet with PaTH/Infini, Engram, RFMoE, Hyperloop, and MTP."""
 
-    def __init__(self, config: MLXBitNetConfig):
+    def __init__(
+        self,
+        config: MLXBitNetConfig,
+        *,
+        reuse_recurrent_weights: bool = True,
+        recurrent_quantized_matmul: bool = False,
+    ):
         super().__init__()
         self.config = config
+        self.reuse_recurrent_weights = reuse_recurrent_weights
+        self.recurrent_quantized_matmul = recurrent_quantized_matmul
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.subln = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.blocks = [MLXHybridBlock(config, layer_id) for layer_id in range(config.num_hidden_layers)]
@@ -779,6 +1287,132 @@ class MLXBitNet(nn.Module):
         for block in self.blocks:
             block.attn.num_blocks = max(1, blocks)
 
+    def set_inference_block_width(self, width: int | None) -> None:
+        for block in self.blocks:
+            block.attn.fixed_block_width = width
+
+    def new_inference_cache(self, batch_size: int = 1, num_loops: int | None = None) -> MLXInferenceCache:
+        loops = self.config.num_loops if num_loops is None else num_loops
+        prelude_end = self.config.num_prelude_layers
+        recurrent_end = prelude_end + self.config.num_recurrent_layers
+        execution = [
+            *self.blocks[:prelude_end],
+            *(block for _ in range(loops) for block in self.blocks[prelude_end:recurrent_end]),
+            *self.blocks[recurrent_end:],
+        ]
+        return MLXInferenceCache(
+            [block.new_inference_cache(batch_size) for block in execution],
+            mx.zeros((batch_size, 0), dtype=mx.int32),
+            loops,
+        )
+
+    def inference_step(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
+        if tokens.ndim != 2 or tokens.shape[1] != 1:
+            raise ValueError("inference_step requires one token per batch row")
+        x = self.subln(self.embedding(tokens))
+        prelude_end = self.config.num_prelude_layers
+        recurrent_end = prelude_end + self.config.num_recurrent_layers
+        cache_index = 0
+        for block in self.blocks[:prelude_end]:
+            x = block.incremental(x, tokens, cache.token_history, cache.layers[cache_index], True)
+            cache_index += 1
+        if self.config.num_recurrent_layers:
+            streams = self.loop_hc.expand(x)
+            for loop_index in range(cache.num_loops):
+                x, post, residual = self.loop_hc.project_in(streams)
+                for block in self.blocks[prelude_end:recurrent_end]:
+                    x = block.incremental(
+                        x,
+                        tokens,
+                        cache.token_history,
+                        cache.layers[cache_index],
+                        loop_index == cache.num_loops - 1,
+                    )
+                    cache_index += 1
+                embedding_index = min(loop_index, 63)
+                output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
+                streams = self.loop_hc.write_back(streams, output, post, residual)
+            x = self.loop_hc.fold(streams)
+        for block in self.blocks[recurrent_end:]:
+            x = block.incremental(x, tokens, cache.token_history, cache.layers[cache_index], True)
+            cache_index += 1
+        cache.token_history = mx.concatenate((cache.token_history, tokens), axis=1)[
+            :, -(self.config.engram_max_ngram_size - 1) :
+        ]
+        cache.position += 1
+        return self.norm(x)
+
+    def inference_extend(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
+        if tokens.ndim != 2 or tokens.shape[1] < 1:
+            raise ValueError("inference_extend requires a non-empty rank-2 token array")
+        x = self.subln(self.embedding(tokens))
+        prelude_end = self.config.num_prelude_layers
+        recurrent_end = prelude_end + self.config.num_recurrent_layers
+        cache_index = 0
+        for block in self.blocks[:prelude_end]:
+            x = block.extend(x, tokens, cache.token_history, cache.layers[cache_index], True)
+            cache_index += 1
+        if self.config.num_recurrent_layers:
+            streams = self.loop_hc.expand(x)
+            for loop_index in range(cache.num_loops):
+                x, post, residual = self.loop_hc.project_in(streams)
+                for block in self.blocks[prelude_end:recurrent_end]:
+                    x = block.extend(
+                        x,
+                        tokens,
+                        cache.token_history,
+                        cache.layers[cache_index],
+                        loop_index == cache.num_loops - 1,
+                    )
+                    cache_index += 1
+                embedding_index = min(loop_index, 63)
+                output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
+                streams = self.loop_hc.write_back(streams, output, post, residual)
+            x = self.loop_hc.fold(streams)
+        for block in self.blocks[recurrent_end:]:
+            x = block.extend(x, tokens, cache.token_history, cache.layers[cache_index], True)
+            cache_index += 1
+        cache.token_history = mx.concatenate((cache.token_history, tokens), axis=1)[
+            :, -(self.config.engram_max_ngram_size - 1) :
+        ]
+        cache.position += tokens.shape[1]
+        return self.norm(x)
+
+    def prefill(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
+        if tokens.ndim != 2 or tokens.shape[1] < 1:
+            raise ValueError("prefill requires a non-empty rank-2 token array")
+        if cache.position:
+            raise ValueError("prefill requires an empty inference cache")
+        x = self.subln(self.embedding(tokens))
+        prelude_end = self.config.num_prelude_layers
+        recurrent_end = prelude_end + self.config.num_recurrent_layers
+        cache_index = 0
+        for block in self.blocks[:prelude_end]:
+            x = block.prefill(x, tokens, cache.layers[cache_index], True)
+            cache_index += 1
+        if self.config.num_recurrent_layers:
+            streams = self.loop_hc.expand(x)
+            for loop_index in range(cache.num_loops):
+                x, post, residual = self.loop_hc.project_in(streams)
+                for block in self.blocks[prelude_end:recurrent_end]:
+                    x = block.prefill(
+                        x,
+                        tokens,
+                        cache.layers[cache_index],
+                        loop_index == cache.num_loops - 1,
+                    )
+                    cache_index += 1
+                embedding_index = min(loop_index, 63)
+                output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
+                streams = self.loop_hc.write_back(streams, output, post, residual)
+            x = self.loop_hc.fold(streams)
+        for block in self.blocks[recurrent_end:]:
+            x = block.prefill(x, tokens, cache.layers[cache_index], True)
+            cache_index += 1
+        cache.token_history = tokens[:, -(self.config.engram_max_ngram_size - 1) :]
+        cache.position = tokens.shape[1]
+        return self.norm(x)
+
     def rfmoe_aux_losses(self, s: float, alpha: float):
         density = mx.array(0.0)
         locality = mx.array(0.0)
@@ -794,15 +1428,27 @@ class MLXBitNet(nn.Module):
         hard = mx.mean(mx.stack(hard_densities)) if hard_densities else mx.array(0.0)
         return density, locality, diversity, hard
 
-    def __call__(
+    def mtp_logits(self, hidden: mx.array) -> list[mx.array]:
+        return [transform(hidden) @ self.embedding.weight.T for transform in self.mtp_transforms]
+
+    def selected_mtp_logits(self, hidden: mx.array, selector: mx.array) -> mx.array:
+        transformed = mx.stack([transform(hidden) for transform in self.mtp_transforms], axis=2)
+        selected = mx.sum(transformed * selector[None, None, :, None], axis=2)
+        return selected @ self.embedding.weight.T
+
+    def draft_logits(self, hidden: mx.array) -> mx.array:
+        last = hidden[:, -1:]
+        transformed = mx.concatenate([transform(last) for transform in self.mtp_transforms], axis=1)
+        return transformed @ self.embedding.weight.T
+
+    def hidden_states(
         self,
         tokens: mx.array,
         segment_ids: mx.array | None = None,
         num_loops: int | None = None,
-        return_mtp: bool = False,
         reset_memory: bool = True,
         checkpoint_activations: bool = False,
-    ):
+    ) -> mx.array:
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
@@ -815,24 +1461,48 @@ class MLXBitNet(nn.Module):
             x = block(x, tokens, segment_ids, True, checkpoint_activations)
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
-            for loop_index in range(loops):
-                x, post, residual = self.loop_hc.project_in(streams)
-                for block in self.blocks[prelude_end:recurrent_end]:
-                    x = block(
-                        x,
-                        tokens,
-                        segment_ids,
-                        loop_index == loops - 1,
-                        checkpoint_activations,
-                    )
-                embedding_index = min(loop_index, 63)
-                output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
-                streams = self.loop_hc.write_back(streams, output, post, residual)
+            cache_token = _effective_weight_cache.set({}) if self.reuse_recurrent_weights and loops > 1 else None
+            quantized_token = _recurrent_quantized_matmul.set(self.recurrent_quantized_matmul)
+            try:
+                for loop_index in range(loops):
+                    x, post, residual = self.loop_hc.project_in(streams)
+                    for block in self.blocks[prelude_end:recurrent_end]:
+                        x = block(
+                            x,
+                            tokens,
+                            segment_ids,
+                            loop_index == loops - 1,
+                            checkpoint_activations,
+                        )
+                    embedding_index = min(loop_index, 63)
+                    output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
+                    streams = self.loop_hc.write_back(streams, output, post, residual)
+            finally:
+                if cache_token is not None:
+                    _effective_weight_cache.reset(cache_token)
+                _recurrent_quantized_matmul.reset(quantized_token)
             x = self.loop_hc.fold(streams)
         for block in self.blocks[recurrent_end:]:
             x = block(x, tokens, segment_ids, True, checkpoint_activations)
-        hidden = self.norm(x)
+        return self.norm(x)
+
+    def __call__(
+        self,
+        tokens: mx.array,
+        segment_ids: mx.array | None = None,
+        num_loops: int | None = None,
+        return_mtp: bool = False,
+        reset_memory: bool = True,
+        checkpoint_activations: bool = False,
+    ):
+        hidden = self.hidden_states(
+            tokens,
+            segment_ids,
+            num_loops,
+            reset_memory,
+            checkpoint_activations,
+        )
         logits = hidden @ self.embedding.weight.T
         if return_mtp:
-            return logits, [transform(hidden) @ self.embedding.weight.T for transform in self.mtp_transforms]
+            return logits, self.mtp_logits(hidden)
         return logits

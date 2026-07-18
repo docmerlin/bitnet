@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-coda-layers", type=int, default=2)
     parser.add_argument("--num-loops", type=int, default=4)
     parser.add_argument("--min-num-loops", type=int, default=1)
+    parser.add_argument("--loop-curriculum-start-ratio", type=float, default=0.0)
     parser.add_argument("--loop-curriculum-ratio", type=float, default=0.2)
     parser.add_argument("--initial-blocks", type=int, default=8)
     parser.add_argument("--final-blocks", type=int, default=16)
@@ -65,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
     parser.add_argument("--no-optimizer-8bit", action="store_true")
+    parser.add_argument("--cmud-momentum-8bit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-ratio", type=float, default=0.08)
@@ -73,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooldown-steps", type=int, default=0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--z-loss-coef", type=float, default=1e-4)
-    parser.add_argument("--mtp-depth", type=int, default=0)
+    parser.add_argument("--mtp-depth", type=int, default=4)
     parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
     parser.add_argument("--engram", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--engram-layer-ids", default="1,15")
@@ -100,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-kernel", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--recurrent-quantized-matmul", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--save-interval", type=int, default=500)
@@ -122,6 +125,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("activation bits must be at least 2")
     if not 0 <= args.mixture_switch_ratio <= 1:
         raise ValueError("mixture-switch-ratio must be between zero and one")
+    if args.min_num_loops < 1:
+        raise ValueError("min-num-loops must be positive")
+    if not 0 <= args.loop_curriculum_start_ratio <= args.loop_curriculum_ratio <= 1:
+        raise ValueError("loop curriculum must satisfy 0 <= start <= end <= 1")
 
 
 def _gradient_compile_safe(
@@ -143,6 +150,19 @@ def _masked_ce(logits, targets, valid):
     return mx.sum(losses * valid) / mx.maximum(mx.sum(valid), 1)
 
 
+def mtp_head_index(step: int, microbatch_index: int, accumulation_steps: int, depth: int) -> int:
+    return ((step - 1) * accumulation_steps + microbatch_index) % depth
+
+
+def prepare_mtp_batch(targets, segment_ids, label_segment_ids, index: int, depth: int):
+    shift = index + 1
+    shifted_targets = mx.concatenate((targets[:, shift:], mx.zeros_like(targets[:, :shift])), axis=1)
+    valid = segment_ids[:, :-shift] == label_segment_ids[:, shift:]
+    valid = mx.concatenate((valid, mx.zeros(segment_ids[:, :shift].shape, dtype=mx.bool_)), axis=1)
+    selector = mx.arange(depth) == index
+    return shifted_targets, valid, selector
+
+
 def create_gradient_step(
     model: MLXBitNet,
     *,
@@ -154,30 +174,55 @@ def create_gradient_step(
     diversity_coef: float = 0.0,
     gradient_checkpointing: bool = False,
 ):
-    def loss_fn(inputs, targets, segment_ids, label_segment_ids, density_lam, rfmoe_s, rfmoe_alpha):
+    def loss_fn(
+        inputs,
+        targets,
+        segment_ids,
+        label_segment_ids,
+        density_lam,
+        rfmoe_s,
+        rfmoe_alpha,
+        mtp_targets=None,
+        mtp_valid=None,
+        mtp_selector=None,
+    ):
         return_mtp = model.config.mtp_depth > 0
-        output = model(
-            inputs,
-            segment_ids,
-            num_loops=num_loops,
-            return_mtp=return_mtp,
-            checkpoint_activations=gradient_checkpointing,
-        )
-        logits, mtp_logits = output if return_mtp else (output, [])
+        if return_mtp and mtp_selector is not None:
+            hidden = model.hidden_states(
+                inputs,
+                segment_ids,
+                num_loops,
+                checkpoint_activations=gradient_checkpointing,
+            )
+            logits = hidden @ model.embedding.weight.T
+            selected_mtp_logits = model.selected_mtp_logits(hidden, mtp_selector)
+            mtp_logits = []
+        else:
+            output = model(
+                inputs,
+                segment_ids,
+                num_loops=num_loops,
+                return_mtp=return_mtp,
+                checkpoint_activations=gradient_checkpointing,
+            )
+            logits, mtp_logits = output if return_mtp else (output, [])
         valid = segment_ids == label_segment_ids
         loss = _masked_ce(logits, targets, valid)
         if z_loss_coef > 0:
             log_z = mx.logsumexp(logits.astype(mx.float32), axis=-1)
             loss = loss + z_loss_coef * mx.sum(mx.square(log_z) * valid) / mx.maximum(mx.sum(valid), 1)
-        mtp_losses = []
-        for index, depth_logits in enumerate(mtp_logits):
-            shift = index + 1
-            if shift >= targets.shape[1]:
-                continue
-            depth_valid = segment_ids[:, : -shift] == label_segment_ids[:, shift:]
-            mtp_losses.append(_masked_ce(depth_logits[:, :-shift], targets[:, shift:], depth_valid))
-        if mtp_losses:
-            loss = loss + mtp_loss_coef * mx.mean(mx.stack(mtp_losses))
+        if return_mtp and mtp_selector is not None:
+            loss = loss + mtp_loss_coef * _masked_ce(selected_mtp_logits, mtp_targets, mtp_valid)
+        else:
+            mtp_losses = []
+            for index, depth_logits in enumerate(mtp_logits):
+                shift = index + 1
+                if shift >= targets.shape[1]:
+                    continue
+                depth_valid = segment_ids[:, : -shift] == label_segment_ids[:, shift:]
+                mtp_losses.append(_masked_ce(depth_logits[:, :-shift], targets[:, shift:], depth_valid))
+            if mtp_losses:
+                loss = loss + mtp_loss_coef * mx.mean(mx.stack(mtp_losses))
         if model.config.use_rfmoe:
             density, locality, diversity, _ = model.rfmoe_aux_losses(rfmoe_s, rfmoe_alpha)
             loss = loss + density_lam * density
@@ -339,10 +384,9 @@ def lr_multiplier(step: int, total_steps: int, warmup_steps: int, cooldown_steps
     return max(minimum * (1.0 - cooldown), 0.0)
 
 
-def evaluate(model: MLXBitNet, tokenizer, args) -> dict[str, float]:
+def build_validation_batches(tokenizer, args) -> list[tuple[mx.array, mx.array, mx.array, mx.array]]:
     if args.validation_batches <= 0:
-        return {}
-    model.eval()
+        return []
     stream = build_batch_stream(
         parse_mixture(args.val_mixture),
         tokenizer,
@@ -355,16 +399,53 @@ def evaluate(model: MLXBitNet, tokenizer, args) -> dict[str, float]:
         max_document_tokens=args.max_document_tokens,
         micro_batch_size=args.micro_batch_size,
     )
+    return [convert_batch(next(stream)) for _ in range(args.validation_batches)]
+
+
+def evaluate(model: MLXBitNet, batches) -> dict[str, float]:
+    if not batches:
+        return {}
+    model.eval()
     losses = []
-    for _ in range(args.validation_batches):
-        inputs, targets, segments, label_segments = convert_batch(next(stream))
-        logits = model(inputs, segments)
+    mtp_losses = [[] for _ in range(model.config.mtp_depth)]
+    mtp_correct = [0.0] * model.config.mtp_depth
+    mtp_agreement = [0.0] * model.config.mtp_depth
+    mtp_counts = [0.0] * model.config.mtp_depth
+    for inputs, targets, segments, label_segments in batches:
+        output = model(inputs, segments, return_mtp=model.config.mtp_depth > 0)
+        logits, depth_logits = output if model.config.mtp_depth > 0 else (output, [])
         loss = _masked_ce(logits, targets, segments == label_segments)
-        mx.eval(loss)
+        depth_metrics = []
+        for index, values in enumerate(depth_logits):
+            shift = index + 1
+            valid = segments[:, :-shift] == label_segments[:, shift:]
+            predictions = mx.argmax(values[:, :-shift], axis=-1)
+            main_predictions = mx.argmax(logits[:, shift:], axis=-1)
+            depth_metrics.append(
+                (
+                    _masked_ce(values[:, :-shift], targets[:, shift:], valid),
+                    mx.sum((predictions == targets[:, shift:]) * valid),
+                    mx.sum((predictions == main_predictions) * valid),
+                    mx.sum(valid),
+                )
+            )
+        mx.eval(loss, depth_metrics)
         losses.append(float(loss.item()))
+        for index, (depth_loss, correct, agreement, count) in enumerate(depth_metrics):
+            mtp_losses[index].append(float(depth_loss.item()))
+            mtp_correct[index] += float(correct.item())
+            mtp_agreement[index] += float(agreement.item())
+            mtp_counts[index] += float(count.item())
     model.train()
     mean_loss = sum(losses) / len(losses)
-    return {"val_loss": mean_loss, "val_perplexity": math.exp(min(mean_loss, 20.0))}
+    metrics = {"val_loss": mean_loss, "val_perplexity": math.exp(min(mean_loss, 20.0))}
+    for index, values in enumerate(mtp_losses):
+        depth = index + 2
+        count = max(mtp_counts[index], 1.0)
+        metrics[f"mtp_loss_depth_{depth}"] = sum(values) / len(values)
+        metrics[f"mtp_accuracy_depth_{depth}"] = mtp_correct[index] / count
+        metrics[f"mtp_agreement_depth_{depth}"] = mtp_agreement[index] / count
+    return metrics
 
 
 def main() -> None:
@@ -376,6 +457,8 @@ def main() -> None:
         for key, value in (saved.get("training_args") or {}).items():
             if key not in protected and hasattr(args, key):
                 setattr(args, key, value)
+        if "recurrent_quantized_matmul" not in (saved.get("training_args") or {}):
+            args.recurrent_quantized_matmul = False
     validate_args(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -438,6 +521,7 @@ def main() -> None:
             block_size=args.mud_block_size,
             betas=(args.lion_beta1, args.lion_beta2),
             eight_bit=not args.no_optimizer_8bit,
+            mud_eight_bit=args.cmud_momentum_8bit,
         )
     optimizer.init(model.trainable_parameters())
     trainer_state = {
@@ -504,6 +588,7 @@ def main() -> None:
     if late_stream is not None:
         print(f"Late training mixture: {args.late_train_mixture}")
 
+    validation_batches = build_validation_batches(tokenizer, args) if args.eval_interval > 0 else []
     metrics_path = output_dir / "metrics.jsonl"
     started = time.perf_counter()
     gradient_steps = {}
@@ -515,7 +600,11 @@ def main() -> None:
     )
     for step in range(trainer_state["step"] + 1, total_steps + 1):
         progress = trainer_state["tokens_processed"] / max(args.total_tokens, 1)
-        loop_fraction = min(progress / max(args.loop_curriculum_ratio, 1e-8), 1.0)
+        loop_fraction = min(max(
+            (progress - args.loop_curriculum_start_ratio)
+            / max(args.loop_curriculum_ratio - args.loop_curriculum_start_ratio, 1e-8),
+            0.0,
+        ), 1.0)
         active_loops = config.num_loops if args.loop_curriculum_ratio <= 0 else round(
             args.min_num_loops + loop_fraction * (config.num_loops - args.min_num_loops)
         )
@@ -534,12 +623,15 @@ def main() -> None:
             - quant_fraction * (args.stage1_activation_bits - args.final_activation_bits)
         )
         model.set_quantization_state(weight_mix, activation_mix, activation_bits)
+        model.recurrent_quantized_matmul = (
+            args.recurrent_quantized_matmul and args.sequence_length >= 128 and weight_mix >= 1.0
+        )
         rf_fraction = min(progress / max(args.rfmoe_curriculum_ratio, 1e-8), 1.0)
         if args.rfmoe_curriculum_ratio <= 0:
             rf_fraction = 1.0
         rf_s = rf_fraction * args.rfmoe_zipf_s
         rf_alpha = 1.0 + rf_fraction * (args.rfmoe_uniform_alpha - 1.0)
-        key = (active_loops, active_blocks)
+        key = (active_loops, active_blocks, model.recurrent_quantized_matmul)
         if key not in gradient_steps:
             compile_gradient = _gradient_compile_safe(
                 config,
@@ -564,14 +656,18 @@ def main() -> None:
         accumulated_gradients = None
         losses = []
         hard_densities = []
-        for _ in range(args.grad_accumulation_steps):
+        for microbatch_index in range(args.grad_accumulation_steps):
             batch = convert_batch(next(active_stream))
-            loss, gradients = gradient_step(
+            gradient_args = [
                 *batch,
                 mx.array(trainer_state["density_lambda"]),
                 mx.array(rf_s),
                 mx.array(rf_alpha),
-            )
+            ]
+            if config.mtp_depth > 0:
+                index = mtp_head_index(step, microbatch_index, args.grad_accumulation_steps, config.mtp_depth)
+                gradient_args.extend(prepare_mtp_batch(batch[1], batch[2], batch[3], index, config.mtp_depth))
+            loss, gradients = gradient_step(*gradient_args)
             hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
             try:
                 mx.eval(loss, gradients, hard_density, model.state)
@@ -595,12 +691,7 @@ def main() -> None:
                 )
                 gradient_steps[key] = (gradient_step, False)
                 gradient_is_compiled = False
-                loss, gradients = gradient_step(
-                    *batch,
-                    mx.array(trainer_state["density_lambda"]),
-                    mx.array(rf_s),
-                    mx.array(rf_alpha),
-                )
+                loss, gradients = gradient_step(*gradient_args)
                 hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
                 mx.eval(loss, gradients, hard_density, model.state)
             losses.append(float(loss.item()))
@@ -649,7 +740,7 @@ def main() -> None:
                 handle.write(json.dumps(metrics, sort_keys=True) + "\n")
             print(" | ".join(f"{key}={value}" for key, value in metrics.items()))
         if args.eval_interval > 0 and step % args.eval_interval == 0:
-            validation = evaluate(model, tokenizer, args)
+            validation = evaluate(model, validation_batches)
             print(" | ".join(f"{key}={value}" for key, value in validation.items()))
             if validation and validation["val_loss"] < trainer_state["best_val_loss"]:
                 trainer_state["best_val_loss"] = validation["val_loss"]

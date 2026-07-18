@@ -122,20 +122,21 @@ def loop_count_for_progress(
     min_loops: int,
     max_loops: int,
     curriculum_ratio: float,
+    curriculum_start_ratio: float = 0.0,
 ) -> int:
     """Ramp recurrent loop count from ``min_loops`` to ``max_loops``.
 
-    Linear in token progress over the first ``curriculum_ratio`` of training,
-    then hold at ``max_loops``. ``curriculum_ratio <= 0`` means always
-    ``max_loops`` (no ramp). Used so deep unrolls (e.g. R=4) are not forced
-    from step 0.
+    Hold ``min_loops`` through ``curriculum_start_ratio``, ramp linearly until
+    ``curriculum_ratio``, then hold ``max_loops``. ``curriculum_ratio <= 0``
+    means always ``max_loops`` (no ramp).
     """
     min_loops = max(1, int(min_loops))
     max_loops = max(min_loops, int(max_loops))
     if curriculum_ratio <= 0.0 or min_loops == max_loops:
         return max_loops
     progress = min(max(float(token_progress), 0.0), 1.0)
-    frac = min(progress / curriculum_ratio, 1.0)
+    start = min(max(float(curriculum_start_ratio), 0.0), curriculum_ratio)
+    frac = min(max((progress - start) / max(curriculum_ratio - start, 1e-8), 0.0), 1.0)
     # Inclusive linear steps: frac=0 → min, frac=1 → max.
     value = min_loops + frac * (max_loops - min_loops)
     return int(round(value))

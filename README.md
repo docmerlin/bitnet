@@ -49,8 +49,13 @@ Key properties:
   - **Hyperloop-style loop HC** (always on for the recurrent core): 4 residual streams,
     input-dependent `H_pre`/`H_post`, **diagonal** `H_res=diag(σ(·))` (no Sinkhorn),
     plus loop position embeddings — applied only at loop boundaries (Zeitoun et al.)
-  - **Trainability:** R curriculum (`--min-num-loops`→`--num-loops` over
-    `--loop-curriculum-ratio`, default 1→4 over 20% tokens); gradient checkpointing
+  - **Trainability:** R curriculum (`--min-num-loops`→`--num-loops` from
+    `--loop-curriculum-start-ratio` to `--loop-curriculum-ratio`, default 1→4 over
+    0–20% tokens). **Recommended for local wall-clock-limited training:** use the 30–70%
+    schedule with `--loop-curriculum-start-ratio 0.3 --loop-curriculum-ratio 0.7`; it won
+    the measured equal-wall-clock comparison by processing more tokens. Use 0–20% when
+    optimizing quality per token;
+    gradient checkpointing
     default on / compile off (XOR); `--checkpoint-granularity loop|layer` —
     **loop** (default) fewer recompute segments, **layer** max VRAM save;
     small-scale sublayer outs; logs `active_loops` + HC/AttnRes health
@@ -85,7 +90,8 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 - `mlx_convert.py`: warm-convert PyTorch C-MUD checkpoints to MLX
 - `mlx_path_kernel.py`: trainable custom Metal solve for PaTH-FoX
 - `mlx_rfmoe_kernel.py`: differentiable conditional Metal expert projections
-- `mlx_optim.py`: native blockwise C-MUD and blockwise-int8 C-Lion optimizer
+- `mlx_ternary_kernel.py`: packed 2-bit recurrent ternary Metal matmul with STE backward
+- `mlx_optim.py`: native blockwise C-MUD with default int8 matrix momentum and int8 C-Lion
 - `utils.py`: shared BLT RoPE, attention-mask, and checkpoint helpers
 - `data/streams.py`: packing + PrefetchStream
 - `training/runtime.py`: choose_device, AMP, logger, evaluate
@@ -190,6 +196,16 @@ Fuller GPU profile:
 ```
 
 These launchers drive `train.py`, not BLT stack.
+
+### MLX generation
+
+Generate from a native MLX checkpoint. Checkpoints trained with `--mtp-depth` use exact
+greedy speculative decoding by default; pass `--no-speculative` for the vanilla baseline.
+
+```bash
+python3 mlx_generate.py runs/bitnet/checkpoints/final.safetensors \
+  --prompt "The quick brown fox" --max-new-tokens 64
+```
 
 ### BLT local smoke run
 
@@ -520,6 +536,8 @@ python3 -m py_compile path/to/file.py
 - Real Meta BLT teacher path designed and regression-tested through local stubs and interface checks here, but actual upstream Meta runtime still depends on external gated assets and upstream packages.
 - BLT path explicitly supports suffix-padded masks; non-suffix masks rejected.
 - BLT local smoke runner is functionality check, not quality benchmark.
+- Cache and performance optimizations must be benchmarked with at least 500M physical
+  parameters, preferably the full 1B configuration. Smaller shapes are smoke tests only.
 - BitNet and BLT paths intentionally separate; features added to one not auto-mirrored in other.
 
 ## Notes

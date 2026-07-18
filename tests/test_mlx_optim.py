@@ -70,6 +70,28 @@ def test_mlx_clion_block_quantization_and_routing() -> None:
     assert "embedding.weight.exp_avg_q" in lion_state
     assert lion_state["embedding.weight.exp_avg_q"].dtype == mx.int8
     assert optimizer.checkpoint_config()["block_size"] == 4
+    assert not optimizer.checkpoint_config()["mud_eight_bit"]
+
+
+def test_mlx_mud_block_quantization() -> None:
+    parameter = mx.ones((64, 64), dtype=mx.bfloat16)
+    gradient = mx.random.normal(parameter.shape).astype(mx.bfloat16)
+    mud = MUD(learning_rate=0.1, weight_decay=0.0, eight_bit=True)
+    state = {}
+    mud.init_single(parameter, state)
+
+    updated = mud.apply_single(gradient, parameter, state)
+    restored = dequantize_blockwise(
+        state["momentum_buffer_q"],
+        state["momentum_buffer_scale"],
+        parameter.shape,
+    )
+    mx.eval(updated, restored)
+
+    assert state["momentum_buffer_q"].dtype == mx.int8
+    assert "momentum_buffer" not in state
+    relative_error = mx.mean(mx.abs(restored - gradient.astype(mx.float32))) / mx.mean(mx.abs(gradient))
+    assert relative_error.item() < 0.02
 
 
 def test_mlx_cmud_reduces_loss() -> None:

@@ -138,10 +138,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Starting loop count for the depth curriculum (ramps up to --num-loops).",
     )
     parser.add_argument(
+        "--loop-curriculum-start-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of training held at --min-num-loops before ramping.",
+    )
+    parser.add_argument(
         "--loop-curriculum-ratio",
         type=float,
         default=0.2,
-        help="Fraction of training over which active loops ramp min→max (0 = always max).",
+        help="Fraction of training by which active loops reach max (0 = always max).",
     )
     parser.add_argument("--num-heads", type=int, default=defaults.num_attention_heads)
     parser.add_argument("--intermediate-size", type=int, default=defaults.intermediate_size)
@@ -248,8 +254,8 @@ def main() -> None:
         parser.error("--mixture-switch-ratio must be between 0.0 and 1.0")
     if args.min_num_loops < 1:
         parser.error("--min-num-loops must be >= 1")
-    if not 0.0 <= args.loop_curriculum_ratio <= 1.0:
-        parser.error("--loop-curriculum-ratio must be between 0.0 and 1.0")
+    if not 0.0 <= args.loop_curriculum_start_ratio <= args.loop_curriculum_ratio <= 1.0:
+        parser.error("loop curriculum must satisfy 0 <= start <= end <= 1")
     if args.compile and args.gradient_checkpointing:
         print(
             "Note: --compile and --gradient-checkpointing both set; "
@@ -329,8 +335,8 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Model parameters: {parameter_count / 1e6:.2f}M")
     print(
-        f"Loop curriculum: R={min_loops}→{max_loops} over "
-        f"{args.loop_curriculum_ratio:.0%} of tokens "
+        f"Loop curriculum: R={min_loops}→{max_loops} from "
+        f"{args.loop_curriculum_start_ratio:.0%} to {args.loop_curriculum_ratio:.0%} of tokens "
         f"(effective depth at max ≈ {model_config.effective_depth})"
     )
     print(f"Tokenizer vocab size: {len(tokenizer)}")
@@ -423,6 +429,7 @@ def main() -> None:
                 min_loops=min_loops,
                 max_loops=max_loops,
                 curriculum_ratio=args.loop_curriculum_ratio,
+                curriculum_start_ratio=args.loop_curriculum_start_ratio,
             )
             rfmoe_s, rfmoe_alpha = rfmoe_staircase_schedule(train_progress, args)
             mixture_stage, _ = choose_stage_mixture(
