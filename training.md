@@ -304,7 +304,7 @@ Implemented:
 - `mlx_generate.py`: vanilla and MTP speculative greedy generation. MTP proposals use only
   the final hidden position, verification accepts only target-model argmax matches, and
   generated tokens are therefore identical to vanilla greedy decoding.
-- `mlx_optim.py`: 256-row blockwise C-MUD for non-embedding matrices and blockwise-int8
+- `mlx_optim.py`: 64-row blockwise C-MUD for non-embedding matrices and blockwise-int8
   C-Lion for embeddings, norms, biases, and gates, including cautious masking, Metal
   triangular whitening, independent learning rates, optional int8 CMUD matrix momentum,
   and resumable optimizer state.
@@ -400,6 +400,61 @@ Legacy optimizer configs omit `mud_eight_bit` and retain FP32 momentum when resu
 At full 1.089B scale with sequence 256, three measured end-to-end CMUD steps improved from
 5.11 to 18.24 tokens/second (3.57x) with matching loss; FP32 state pushed the 32 GiB M1 Max
 into severe unified-memory pressure.
+
+The dominant CMUD operation was blockwise triangular decorrelation: 22.46 ms of a 23.76 ms
+`2048×1024` matrix update. Reducing independent whitening blocks from 256 to 64 rows and
+batching all block solves into one Metal launch preserved exact blockwise arithmetic while
+cutting common `1024×1024` and `2048×1024` decorrelation to 0.98 and 1.20 ms. At the 48M
+benchmark shape, CMUD fell from 0.286 to 0.046 seconds and end-to-end throughput rose from
+2,319 to 2,900 tokens/second (+25%). A physical-1.089B, active-loop-1 A/B kept optimizer
+size identical while limiting thermal interference: CMUD fell 2.405→0.893 seconds and
+end-to-end throughput rose 75.17→134.09 tokens/second (+78%). Full-depth sequential 1B
+runs remained thermally unstable on the M1 Max.
+
+Smaller blocks did not hurt the short quality check. The equal-token 48.33M run reached
+validation perplexity 17.19 and training loss 3.644, versus 18.91 and 3.758 with 256-row
+blocks. Its 274.6-second wall time is excluded from speed comparison because it ran after
+multiple full-1B thermal stress tests. New MLX runs default to `--mud-block-size 64`; resumed
+checkpoints reconstruct their saved optimizer block size.
+
+MLX activation checkpointing can target only the repeated recurrent core. Enable it with
+`--gradient-checkpointing`; use `--gradient-checkpoint-scope all` only when prelude and coda
+activations also need recomputation. On the full 1.089B model at sequence 256, a three-step
+CMUD sweep measured:
+
+| Checkpoint scope | Peak memory | Throughput |
+| --- | ---: | ---: |
+| None | 13.257 GiB | 19.56 tok/s |
+| Recurrent | 12.434 GiB | 26.80 tok/s |
+| All blocks | 12.490 GiB | 24.34 tok/s |
+
+A repeated recurrent/no-checkpoint A/B after thermal slowdown still favored recurrent-only
+at 20.70 versus 17.76 tokens/second, while peak memory repeated exactly. Full-stack
+checkpointing provided no additional measured saving and needlessly recomputed the one-pass
+prelude and coda. Checkpointing remains opt-in because smaller models and batches may not
+benefit. Checkpoints saved before the scope flag retain their prior all-block behavior.
+
+Phase profiling is opt-in with `--profile-phases` in either `mlx_train.py` or
+`mlx_benchmark.py`. Trainer logs average data, forward/backward, CMUD, and synchronization
+wait per step since the previous log, plus validation wall time on evaluation lines.
+Synchronization wait is a subset of forward/backward and CMUD time, not an additive phase:
+MLX executes most lazy graph work while `mx.eval` waits for completion.
+
+At the 48.33M shape, a three-step real-data run at maximum loop depth and full quantization
+reached steady-state data/forward-backward/CMUD times of 0.011/2.823/0.289 seconds and
+2,622 tokens/second. Validation took 0.312 seconds. The first two steps waited 2.6–3.1
+seconds on stream refill, demonstrating that data stalls can dominate short measurements
+even though buffered data was only 0.4% of the steady-state training step.
+
+At the full 1.089B shape with sequence 256, batch one, packed recurrent matmuls, and int8
+CMUD momentum, the materialized-gradient profile measured 12.37 seconds for
+forward/backward, 25.95 seconds for CMUD, and 5.66 seconds for one validation forward.
+End-to-end training reached 6.68 tokens/second with a 15.00 GiB peak. Synchronization wait
+was 37.32 seconds of the 38.32-second step and overlaps both compute phases. This is slower
+than the fused-step benchmark because profiling follows the trainer's separate gradient and
+optimizer evaluations and retains the full gradient tree. At 1B scale, CMUD and gradient
+materialization are the next software bottlenecks; at 48M scale, forward/backward dominates
+once the input stream is warm.
 
 The delayed loop-depth curriculum is available through
 `--loop-curriculum-start-ratio`; the existing `--loop-curriculum-ratio` remains the point

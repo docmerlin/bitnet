@@ -25,11 +25,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--active-loops", type=int, default=None)
     parser.add_argument("--path-window-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--mud-block-size", type=int, default=64)
     parser.add_argument("--mlx-dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--mlx-path-kernel", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reuse-recurrent-weights", action="store_true")
     parser.add_argument("--recurrent-quantized-matmul", action="store_true")
     parser.add_argument("--cmud-momentum-8bit", action="store_true")
+    parser.add_argument(
+        "--gradient-checkpoint-scope",
+        choices=("none", "recurrent", "all"),
+        default="none",
+    )
+    parser.add_argument("--profile-phases", action="store_true")
     return parser
 
 
@@ -46,8 +53,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("prelude and coda layer counts must be non-negative")
     if args.path_window_size < 1 or args.sequence_length % args.path_window_size:
         raise ValueError("sequence-length must be divisible by path-window-size")
+    if args.mud_block_size < 1:
+        raise ValueError("mud-block-size must be positive")
     if args.backend != "mlx" and args.optimizer != "adamw":
         raise ValueError("CMUD benchmark is only available with MLX")
+    if args.backend != "mlx" and args.gradient_checkpoint_scope != "none":
+        raise ValueError("Activation checkpoint benchmark is only available with MLX")
+    if args.profile_phases and (args.backend != "mlx" or args.optimizer != "cmud"):
+        raise ValueError("Phase profiling requires MLX CMUD")
 
 
 def run_mlx(args: argparse.Namespace) -> dict[str, float]:
@@ -89,7 +102,7 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
             mud_learning_rate=args.learning_rate,
             fallback_learning_rate=args.learning_rate,
             weight_decay=0.01,
-            block_size=256,
+            block_size=args.mud_block_size,
             eight_bit=True,
             mud_eight_bit=args.cmud_momentum_8bit,
         )
@@ -98,12 +111,25 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
     )
 
     def loss_fn(inputs: mx.array, targets: mx.array, segment_ids: mx.array) -> mx.array:
-        logits = model(inputs, segment_ids, num_loops=args.active_loops).astype(mx.float32)
+        logits = model(
+            inputs,
+            segment_ids,
+            num_loops=args.active_loops,
+            checkpoint_activations=args.gradient_checkpoint_scope,
+        ).astype(mx.float32)
         return nn.losses.cross_entropy(logits, targets, reduction="mean")
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
     optimizer.init(model.trainable_parameters())
     state = [model.state, optimizer.state]
+
+    @partial(mx.compile, inputs=model.state, outputs=model.state)
+    def gradient_step(inputs: mx.array, targets: mx.array, segment_ids: mx.array):
+        return loss_and_grad(inputs, targets, segment_ids)
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def apply_step(gradients):
+        optimizer.update(model, gradients)
 
     @partial(mx.compile, inputs=state, outputs=state)
     def train_step(inputs: mx.array, targets: mx.array, segment_ids: mx.array) -> mx.array:
@@ -115,21 +141,55 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
     inputs, targets = tokens[:, :-1], tokens[:, 1:]
     segment_ids = mx.zeros(inputs.shape, dtype=mx.int32)
     for _ in range(args.warmup_steps):
-        mx.eval(train_step(inputs, targets, segment_ids), state)
+        if args.profile_phases:
+            loss, gradients = gradient_step(inputs, targets, segment_ids)
+            mx.eval(loss, gradients, model.state)
+            apply_step(gradients)
+            mx.eval(state)
+        else:
+            mx.eval(train_step(inputs, targets, segment_ids), state)
+    mx.reset_peak_memory()
     start = time.perf_counter()
     loss = None
+    phase_totals = {"forward_backward": 0.0, "mud": 0.0, "sync_wait": 0.0}
     for _ in range(args.steps):
-        loss = train_step(inputs, targets, segment_ids)
-        mx.eval(loss, state)
+        if args.profile_phases:
+            phase_started = time.perf_counter()
+            loss, gradients = gradient_step(inputs, targets, segment_ids)
+            sync_started = time.perf_counter()
+            mx.eval(loss, gradients, model.state)
+            phase_totals["forward_backward"] += time.perf_counter() - phase_started
+            phase_totals["sync_wait"] += time.perf_counter() - sync_started
+
+            phase_started = time.perf_counter()
+            apply_step(gradients)
+            sync_started = time.perf_counter()
+            mx.eval(state)
+            phase_totals["mud"] += time.perf_counter() - phase_started
+            phase_totals["sync_wait"] += time.perf_counter() - sync_started
+        else:
+            loss = train_step(inputs, targets, segment_ids)
+            mx.eval(loss, state)
     elapsed = time.perf_counter() - start
+    peak_memory = mx.get_peak_memory()
     parameters = sum(value.size for _, value in tree_flatten(model.parameters()))
-    return {
+    metrics = {
         "elapsed_sec": elapsed,
         "loss": float(loss.item()),
         "parameters": float(parameters),
+        "peak_memory_gib": peak_memory / 1024**3,
         "steps_per_second": args.steps / elapsed,
         "tokens_per_second": args.steps * args.batch_size * args.sequence_length / elapsed,
     }
+    if args.profile_phases:
+        validation_started = time.perf_counter()
+        validation_loss = loss_fn(inputs, targets, segment_ids)
+        mx.eval(validation_loss, model.state)
+        metrics.update(
+            {f"profile_{phase}_seconds": value / args.steps for phase, value in phase_totals.items()}
+        )
+        metrics["profile_validation_seconds"] = time.perf_counter() - validation_started
+    return metrics
 
 
 def run_torch(args: argparse.Namespace) -> dict[str, float]:

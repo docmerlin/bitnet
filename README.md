@@ -207,6 +207,30 @@ python3 mlx_generate.py runs/bitnet/checkpoints/final.safetensors \
   --prompt "The quick brown fox" --max-new-tokens 64
 ```
 
+### MLX activation checkpointing
+
+For memory-constrained recurrent training, checkpoint only the repeated core:
+
+```bash
+python3 mlx_train.py --gradient-checkpointing
+```
+
+This recurrent-only scope saved 0.82 GiB and improved throughput in the full-1.089B,
+sequence-256 benchmark. `--gradient-checkpoint-scope all` also recomputes prelude and coda;
+use it only when the extra scope is required. Checkpointing remains off by default.
+
+Profile real trainer phase costs before performance work:
+
+```bash
+python3 mlx_train.py --profile-phases
+```
+
+Logs separate data, forward/backward, CMUD, synchronization wait, and validation timing.
+Synchronization wait overlaps compute phases because MLX evaluates lazy graphs in `mx.eval`.
+
+New MLX runs use batched 64-row CMUD whitening. `--mud-block-size` remains available for
+ablation; resumed checkpoints retain their saved block size.
+
 ### BLT local smoke run
 
 ```bash

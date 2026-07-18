@@ -87,7 +87,7 @@ def test_rfmoe_masked_grouped_metal_matches_forward_and_gradients() -> None:
 def test_mlx_training_step_is_finite() -> None:
     args = Namespace(
         backend="mlx",
-        optimizer="adamw",
+        optimizer="cmud",
         steps=1,
         warmup_steps=0,
         batch_size=1,
@@ -103,15 +103,23 @@ def test_mlx_training_step_is_finite() -> None:
         active_loops=None,
         path_window_size=4,
         learning_rate=1e-3,
+        mud_block_size=4,
         mlx_dtype="float32",
         mlx_path_kernel=True,
         reuse_recurrent_weights=False,
         recurrent_quantized_matmul=False,
         cmud_momentum_8bit=False,
+        gradient_checkpoint_scope="none",
+        profile_phases=True,
     )
     validate_args(args)
     metrics = run_mlx(args)
     assert metrics["loss"] > 0
+    assert metrics["peak_memory_gib"] > 0
+    assert metrics["profile_forward_backward_seconds"] > 0
+    assert metrics["profile_mud_seconds"] > 0
+    assert metrics["profile_sync_wait_seconds"] > 0
+    assert metrics["profile_validation_seconds"] > 0
     assert metrics["tokens_per_second"] > 0
     args.num_loops = 0
     with pytest.raises(ValueError, match="num-loops must be positive"):
@@ -123,8 +131,11 @@ def test_mlx_training_defaults_use_fast_local_batch() -> None:
     assert args.micro_batch_size == 4
     assert args.grad_accumulation_steps == 4
     assert not args.gradient_checkpointing
+    assert args.gradient_checkpoint_scope == "recurrent"
+    assert not args.profile_phases
+    assert build_parser().parse_args(["--profile-phases"]).profile_phases
     assert args.validation_batches == 5
-    assert args.mud_block_size == 256
+    assert args.mud_block_size == 64
     assert args.mtp_depth == 4
     assert args.recurrent_quantized_matmul
     assert args.cmud_momentum_8bit
@@ -666,15 +677,24 @@ def test_mlx_rfmoe_accelerated_backends_match_host_compaction(backend) -> None:
     assert accelerated.last_density.item() == host.last_density.item() == 0.75
 
 
-def test_mlx_activation_checkpointing_preserves_gradients_and_state() -> None:
+@pytest.mark.parametrize(
+    ("num_prelude_layers", "num_recurrent_layers", "checkpoint_scope"),
+    ((1, 0, True), (0, 1, "recurrent")),
+)
+def test_mlx_activation_checkpointing_preserves_gradients_and_state(
+    num_prelude_layers,
+    num_recurrent_layers,
+    checkpoint_scope,
+) -> None:
     config = MLXBitNetConfig(
         vocab_size=32,
         hidden_size=8,
         num_attention_heads=2,
         intermediate_size=16,
-        num_prelude_layers=1,
-        num_recurrent_layers=0,
+        num_prelude_layers=num_prelude_layers,
+        num_recurrent_layers=num_recurrent_layers,
         num_coda_layers=0,
+        num_loops=2,
         block_size=1,
         path_window_size=4,
         infini_memory_dim=4,
@@ -701,7 +721,7 @@ def test_mlx_activation_checkpointing_preserves_gradients_and_state() -> None:
     checkpointed_loss, checkpointed_gradients = nn.value_and_grad(
         checkpointed,
         lambda ids, segment_ids: mx.mean(
-            mx.square(checkpointed(ids, segment_ids, checkpoint_activations=True))
+            mx.square(checkpointed(ids, segment_ids, checkpoint_activations=checkpoint_scope))
         ),
     )(tokens, segments)
     mx.eval(reference_loss, reference_gradients, checkpointed_loss, checkpointed_gradients)
@@ -723,6 +743,40 @@ def test_mlx_activation_checkpointing_preserves_gradients_and_state() -> None:
         rtol=1e-5,
         atol=1e-6,
     ).item()
+
+
+def test_mlx_activation_checkpointing_selects_recurrent_blocks(monkeypatch) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=1,
+        num_recurrent_layers=1,
+        num_coda_layers=1,
+        num_loops=2,
+        block_size=1,
+        path_window_size=4,
+        use_engram=False,
+    )
+    model = MLXBitNet(config)
+    checkpointed_modules = []
+    original = nn.utils.checkpoint
+
+    def counted(module, *args, **kwargs):
+        checkpointed_modules.append(module)
+        return original(module, *args, **kwargs)
+
+    monkeypatch.setattr("mlx_model.activation_checkpoint", counted)
+    tokens = mx.array([[1, 2, 3, 4]])
+    output = model(tokens, checkpoint_activations="recurrent")
+    mx.eval(output)
+
+    assert len(checkpointed_modules) == 4
+    assert all(
+        module in (model.blocks[1], model.blocks[1].attn)
+        for module in checkpointed_modules
+    )
 
 
 def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> None:

@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3)
     parser.add_argument("--mud-momentum", type=float, default=0.95)
     parser.add_argument("--mud-passes", type=int, default=1)
-    parser.add_argument("--mud-block-size", type=int, default=256)
+    parser.add_argument("--mud-block-size", type=int, default=64)
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
     parser.add_argument("--no-optimizer-8bit", action="store_true")
@@ -101,8 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--precision", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gradient-checkpoint-scope", choices=("recurrent", "all"), default="recurrent")
     parser.add_argument("--path-kernel", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--recurrent-quantized-matmul", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--profile-phases", action="store_true")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--save-interval", type=int, default=500)
@@ -172,7 +174,7 @@ def create_gradient_step(
     mtp_loss_coef: float = 0.0,
     locality_coef: float = 0.0,
     diversity_coef: float = 0.0,
-    gradient_checkpointing: bool = False,
+    gradient_checkpointing: bool | str = False,
 ):
     def loss_fn(
         inputs,
@@ -453,12 +455,15 @@ def main() -> None:
     saved = None
     if args.resume_from:
         saved = json.loads(Path(args.resume_from).with_suffix(".json").read_text(encoding="utf-8"))
-        protected = {"output_dir", "resume_from", "compile", "path_kernel", "precision"}
-        for key, value in (saved.get("training_args") or {}).items():
+        protected = {"output_dir", "resume_from", "compile", "path_kernel", "precision", "profile_phases"}
+        saved_args = saved.get("training_args") or {}
+        for key, value in saved_args.items():
             if key not in protected and hasattr(args, key):
                 setattr(args, key, value)
-        if "recurrent_quantized_matmul" not in (saved.get("training_args") or {}):
+        if "recurrent_quantized_matmul" not in saved_args:
             args.recurrent_quantized_matmul = False
+        if saved_args.get("gradient_checkpointing") and "gradient_checkpoint_scope" not in saved_args:
+            args.gradient_checkpoint_scope = "all"
     validate_args(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -592,6 +597,9 @@ def main() -> None:
     metrics_path = output_dir / "metrics.jsonl"
     started = time.perf_counter()
     gradient_steps = {}
+    checkpoint_scope = args.gradient_checkpoint_scope if args.gradient_checkpointing else False
+    profile_totals = {"data": 0.0, "forward_backward": 0.0, "mud": 0.0, "sync_wait": 0.0}
+    profile_steps = 0
     apply_step, state = create_apply_step(
         model,
         optimizer,
@@ -647,7 +655,7 @@ def main() -> None:
                 mtp_loss_coef=args.mtp_loss_coef,
                 locality_coef=args.rfmoe_locality_coef,
                 diversity_coef=args.rfmoe_diversity_coef,
-                gradient_checkpointing=args.gradient_checkpointing,
+                gradient_checkpointing=checkpoint_scope,
             )
             gradient_steps[key] = (gradient_step, compile_gradient)
         gradient_step, gradient_is_compiled = gradient_steps[key]
@@ -657,7 +665,11 @@ def main() -> None:
         losses = []
         hard_densities = []
         for microbatch_index in range(args.grad_accumulation_steps):
+            if args.profile_phases:
+                phase_started = time.perf_counter()
             batch = convert_batch(next(active_stream))
+            if args.profile_phases:
+                profile_totals["data"] += time.perf_counter() - phase_started
             gradient_args = [
                 *batch,
                 mx.array(trainer_state["density_lambda"]),
@@ -667,8 +679,12 @@ def main() -> None:
             if config.mtp_depth > 0:
                 index = mtp_head_index(step, microbatch_index, args.grad_accumulation_steps, config.mtp_depth)
                 gradient_args.extend(prepare_mtp_batch(batch[1], batch[2], batch[3], index, config.mtp_depth))
+            if args.profile_phases:
+                phase_started = time.perf_counter()
             loss, gradients = gradient_step(*gradient_args)
             hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
+            if args.profile_phases:
+                sync_started = time.perf_counter()
             try:
                 mx.eval(loss, gradients, hard_density, model.state)
             except RuntimeError as error:
@@ -687,13 +703,16 @@ def main() -> None:
                     mtp_loss_coef=args.mtp_loss_coef,
                     locality_coef=args.rfmoe_locality_coef,
                     diversity_coef=args.rfmoe_diversity_coef,
-                    gradient_checkpointing=args.gradient_checkpointing,
+                    gradient_checkpointing=checkpoint_scope,
                 )
                 gradient_steps[key] = (gradient_step, False)
                 gradient_is_compiled = False
                 loss, gradients = gradient_step(*gradient_args)
                 hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
                 mx.eval(loss, gradients, hard_density, model.state)
+            if args.profile_phases:
+                profile_totals["forward_backward"] += time.perf_counter() - phase_started
+                profile_totals["sync_wait"] += time.perf_counter() - sync_started
             losses.append(float(loss.item()))
             hard_densities.append(float(hard_density.item()))
             accumulated_gradients = gradients if accumulated_gradients is None else tree_map(
@@ -701,13 +720,21 @@ def main() -> None:
                 accumulated_gradients,
                 gradients,
             )
+        if args.profile_phases:
+            phase_started = time.perf_counter()
         accumulated_gradients = tree_map(
             lambda gradient: gradient / args.grad_accumulation_steps,
             accumulated_gradients,
         )
         multiplier = lr_multiplier(step - 1, total_steps, warmup_steps, cooldown_steps, args.min_lr_ratio)
         grad_norm = apply_step(accumulated_gradients, mx.array(multiplier))
+        if args.profile_phases:
+            sync_started = time.perf_counter()
         mx.eval(model.state, optimizer.state, grad_norm)
+        if args.profile_phases:
+            profile_totals["mud"] += time.perf_counter() - phase_started
+            profile_totals["sync_wait"] += time.perf_counter() - sync_started
+            profile_steps += 1
         elapsed = time.perf_counter() - step_started
         trainer_state["step"] = step
         trainer_state["tokens_processed"] += tokens_per_step
@@ -733,6 +760,15 @@ def main() -> None:
                 "quant_activation_bits": activation_bits,
                 "time": time.time(),
             }
+            if args.profile_phases:
+                metrics.update(
+                    {
+                        f"profile_{phase}_seconds": value / profile_steps
+                        for phase, value in profile_totals.items()
+                    }
+                )
+                profile_totals = dict.fromkeys(profile_totals, 0.0)
+                profile_steps = 0
             if config.use_rfmoe:
                 metrics["rfmoe_density"] = sum(hard_densities) / len(hard_densities)
                 metrics["rfmoe_lambda"] = trainer_state["density_lambda"]
@@ -740,7 +776,11 @@ def main() -> None:
                 handle.write(json.dumps(metrics, sort_keys=True) + "\n")
             print(" | ".join(f"{key}={value}" for key, value in metrics.items()))
         if args.eval_interval > 0 and step % args.eval_interval == 0:
+            if args.profile_phases:
+                validation_started = time.perf_counter()
             validation = evaluate(model, validation_batches)
+            if args.profile_phases and validation:
+                validation["profile_validation_seconds"] = time.perf_counter() - validation_started
             print(" | ".join(f"{key}={value}" for key, value in validation.items()))
             if validation and validation["val_loss"] < trainer_state["best_val_loss"]:
                 trainer_state["best_val_loss"] = validation["val_loss"]

@@ -33,8 +33,44 @@ _RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
     """,
 )
 
+_BATCHED_RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
+    name="mud_batched_rectangular_lower_solve",
+    input_names=["matrix", "rhs"],
+    output_names=["solution"],
+    source=r"""
+        uint column = thread_position_in_grid.x;
+        uint batch = thread_position_in_grid.y;
+        uint rows = matrix_shape[1];
+        uint columns = rhs_shape[2];
+        if (column >= columns || batch >= rhs_shape[0]) {
+            return;
+        }
+        uint matrix_offset = batch * rows * rows;
+        uint rhs_offset = batch * rows * columns;
+        for (uint row = 0; row < rows; ++row) {
+            float value = float(rhs[rhs_offset + row * columns + column]);
+            for (uint inner = 0; inner < row; ++inner) {
+                value -= float(matrix[matrix_offset + row * rows + inner])
+                    * float(solution[rhs_offset + inner * columns + column]);
+            }
+            value /= float(matrix[matrix_offset + row * rows + row]);
+            solution[rhs_offset + row * columns + column] = T(value);
+        }
+    """,
+)
+
 
 def lower_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
+    if rhs.ndim == 3:
+        batches, _, columns = rhs.shape
+        return _BATCHED_RECTANGULAR_LOWER_SOLVE(
+            inputs=[matrix.astype(mx.float32), rhs.astype(mx.float32)],
+            template=[("T", mx.float32)],
+            grid=(columns, batches, 1),
+            threadgroup=(min(columns, 256), 1, 1),
+            output_shapes=[rhs.shape],
+            output_dtypes=[mx.float32],
+        )[0]
     columns = rhs.shape[1]
     return _RECTANGULAR_LOWER_SOLVE(
         inputs=[matrix.astype(mx.float32), rhs.astype(mx.float32)],
@@ -64,6 +100,15 @@ def mud_decorrelate(
     if transposed:
         q = q.T
     block_size = q.shape[0] if block_size is None else block_size
+    if q.shape[0] > block_size and q.shape[0] % block_size == 0:
+        blocks = q.reshape(-1, block_size, q.shape[1])
+        for _ in range(passes):
+            blocks = blocks / (mx.linalg.norm(blocks, axis=2, keepdims=True) + eps)
+            triangle = mx.tril(blocks @ blocks.swapaxes(-1, -2)) + eps * mx.eye(block_size)
+            blocks = lower_solve(triangle, blocks)
+            blocks = blocks / (mx.linalg.norm(blocks, axis=2, keepdims=True) + eps)
+        q = blocks.reshape(q.shape)
+        return (q.T if transposed else q).astype(original_dtype)
     blocks = []
     for start in range(0, q.shape[0], block_size):
         block = q[start : start + block_size]

@@ -1447,18 +1447,21 @@ class MLXBitNet(nn.Module):
         segment_ids: mx.array | None = None,
         num_loops: int | None = None,
         reset_memory: bool = True,
-        checkpoint_activations: bool = False,
+        checkpoint_activations: bool | str = False,
     ) -> mx.array:
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
+        checkpoint_scope = "all" if checkpoint_activations is True else checkpoint_activations or "none"
+        if checkpoint_scope not in ("none", "recurrent", "all"):
+            raise ValueError("checkpoint_activations must be none, recurrent, or all")
         if reset_memory:
             self.reset_memory(tokens.shape[0])
         x = self.subln(self.embedding(tokens))
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
         for block in self.blocks[:prelude_end]:
-            x = block(x, tokens, segment_ids, True, checkpoint_activations)
+            x = block(x, tokens, segment_ids, True, checkpoint_scope == "all")
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
             cache_token = _effective_weight_cache.set({}) if self.reuse_recurrent_weights and loops > 1 else None
@@ -1472,7 +1475,7 @@ class MLXBitNet(nn.Module):
                             tokens,
                             segment_ids,
                             loop_index == loops - 1,
-                            checkpoint_activations,
+                            checkpoint_scope in ("recurrent", "all"),
                         )
                     embedding_index = min(loop_index, 63)
                     output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
@@ -1483,7 +1486,7 @@ class MLXBitNet(nn.Module):
                 _recurrent_quantized_matmul.reset(quantized_token)
             x = self.loop_hc.fold(streams)
         for block in self.blocks[recurrent_end:]:
-            x = block(x, tokens, segment_ids, True, checkpoint_activations)
+            x = block(x, tokens, segment_ids, True, checkpoint_scope == "all")
         return self.norm(x)
 
     def __call__(
@@ -1493,7 +1496,7 @@ class MLXBitNet(nn.Module):
         num_loops: int | None = None,
         return_mtp: bool = False,
         reset_memory: bool = True,
-        checkpoint_activations: bool = False,
+        checkpoint_activations: bool | str = False,
     ):
         hidden = self.hidden_states(
             tokens,

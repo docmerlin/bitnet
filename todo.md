@@ -108,19 +108,34 @@ Priority order after current cache/MTP inference work:
   run measured 246.8s/PPL 18.91 versus FP32 momentum at 247.3s/PPL 18.67. Enabled by
   default for new MLX runs; full-1B sequence-256 CMUD training measured 5.11→18.24 tok/s
   (3.57x) with matching loss. `--no-cmud-momentum-8bit` restores FP32 momentum. Production
-  still uses CMUD only.
-- [ ] **Add selective MLX activation checkpointing.** Checkpoint only memory-heavy recurrent
-  regions needed to fit the target batch instead of recomputing every sublayer. Measure
-  memory and tokens/second for each granularity.
+  still uses CMUD only. Follow-up batched independent 64-row whitening cut 48M CMUD time
+  0.286→0.046s and raised end-to-end throughput 2,319→2,900 tok/s (+25%). At physical
+  1.089B scale with one active loop, CMUD fell 2.405→0.893s and end-to-end throughput rose
+  75.17→134.09 tok/s (+78%). The equal-token 48.33M run reached PPL 17.19 versus 18.91
+  with 256-row blocks. New MLX runs therefore default to 64 rows; saved configs retain their
+  original block size.
+- [x] **Add selective MLX activation checkpointing.** `--gradient-checkpointing` now
+  checkpoints only the repeated recurrent core by default; `--gradient-checkpoint-scope all`
+  preserves full-stack behavior. At full 1.089B scale and sequence 256, no checkpointing,
+  recurrent-only, and all-block scopes measured 13.257/12.434/12.490 GiB peak memory and
+  19.56/26.80/24.34 tok/s. A repeated recurrent/no-checkpoint A/B under thermal slowdown
+  remained faster at 20.70/17.76 tok/s. Recurrent-only therefore saves 0.82 GiB without
+  paying needless prelude/coda recomputation; checkpointing remains opt-in.
 - [x] **Build fused recurrent ternary Metal training kernel.** Packed 2-bit affine codes
   preserve ternary values; custom Metal packs weights and MLX `quantized_matmul` handles
   forward/input-gradient with STE weight gradients. Full-1B sequence-256 throughput improved
   44.19→55.38 tok/s (+25.3%). Equal-token 48.33M training improved 285→247.3s (1.15x)
   while validation PPL moved 18.58→18.67 (+0.5%). Enabled for new MLX runs at sequence ≥128;
   old checkpoints resume without it unless their saved arguments opted in.
-- [ ] **Profile phase costs before each optimization.** Separate forward/backward, MUD,
-  validation, data, and synchronization time. Keep changes only when end-to-end
-  tokens/second improves at representative 48M and 1B shapes.
+- [x] **Profile phase costs before each optimization.** `mlx_train.py --profile-phases`
+  reports per-step data, forward/backward, CMUD, and synchronization wait plus validation
+  wall time; `mlx_benchmark.py --profile-phases` provides the same split without checkpoint
+  writes. At steady-state 48.33M scale, data/forward-backward/CMUD were 0.011/2.823/0.289s
+  and validation was 0.312s. Initial stream refills instead cost 2.6–3.1s. At full 1.089B
+  scale with materialized gradients, forward/backward took 12.37s, CMUD 25.95s, validation
+  5.66s, and peak memory reached 15.00 GiB. Synchronization wait overlaps compute phases
+  because MLX executes lazy graphs during `mx.eval`; it was 3.03s at 48M and 37.32s at 1B.
+  Future optimizations must report end-to-end throughput at both representative scales.
 - [ ] **Use faster/distributed hardware for full 1B training.** Single M1 Max estimates are
   roughly 30–60 tok/s at 1B scale; software improvements alone do not make a 20B-token run
   practical. Re-benchmark PyTorch/CUDA or distributed training before committing that budget.
