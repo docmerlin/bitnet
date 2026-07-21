@@ -2,34 +2,46 @@
 
 ## Goal
 
-Train a general language model with strong coding ability by expanding from clean,
-short, common patterns into composition, technical knowledge, reasoning, and
-repository-scale work. Difficulty should rise gradually, but foundational data must
-remain in every phase to prevent forgetting and abrupt distribution shifts.
+Train general LM w/ strong coding: clean short patterns → composition, technical knowledge, reasoning, repo-scale work. Raise difficulty gradual; keep foundational data every phase — prevent forget + abrupt distribution shift.
 
-This is a competence-based curriculum, not a set of hard grade levels. Phase changes
-should follow validation results rather than token count alone.
+Competence-based curriculum, not hard grade levels. Phase change follow validation, not token count alone.
 
 ## Principles
 
-- Start with clean and learnable data, not artificial toy language alone.
-- Introduce difficult material gradually while replaying earlier material.
-- Prefer examples with useful loss: neither already memorized nor overwhelmingly hard.
-- Track difficulty separately by length, rarity, syntax, reasoning depth, context
-  distance, and noise. One scalar cannot describe every kind of difficulty.
-- Preserve document and repository boundaries when packing sequences.
-- Keep base pretraining, instruction tuning, and evaluation data separate.
-- Compare any curriculum against a shuffled-data baseline using the same data, token
-  budget, optimizer schedule, and seeds.
+- Start clean learnable data, not toy language alone.
+- Introduce hard material gradual; replay earlier material.
+- Prefer useful loss: not already memorized, not overwhelmingly hard.
+- Track difficulty separate: length, rarity, syntax, reasoning depth, context distance, noise. One scalar not enough.
+- Preserve document + repo boundaries when packing.
+- Keep base pretrain, instruction tune, eval data separate.
+- Compare curriculum vs shuffled-data baseline: same data, token budget, optimizer schedule, seeds.
 
-Relevant foundations include curriculum learning (Bengio et al., 2009), self-paced
-learning (Kumar et al., 2010), competence-based curricula (Platanios et al., 2019),
-mastery learning, interleaving, spaced practice, and the zone of proximal development.
+Foundations: curriculum learning (Bengio et al., 2009), self-paced learning (Kumar et al., 2010), competence-based curricula (Platanios et al., 2019), mastery learning, interleaving, spaced practice, zone of proximal development.
+
+## Dense FFN middle layer (square mid)
+
+Default dense FFN = three stages, not classic two-mat SwiGLU alone:
+
+1. **up** — expand `H → 2I` (fused gate + value for SwiGLU)
+2. **mid** — **square** projection `I → I` (same width in/out)
+3. **down** — project `I → H`
+
+Mid intentionally square: intermediate width fixed between up post-SwiGLU features and down. Disable w/ `--no-use-ffn-mid` (MLX) for traditional two-mat; RFMoE experts same square mid (`w_mid`).
+
+### Cold start from scratch: identity on the square mid
+
+**Start train from scratch** (no checkpoint): square mid **master weight = identity matrix**, not random Kaiming/uniform.
+
+- **Why:** Random mid scramble expand features under ternary STE. Identity keep 3-mat near classic 2-mat: `silu(I @ h)` = mild pointwise nonlinearity until train move mid off `I`.
+- **Where:** dense `ffn_mid` / MLX `mid`, RFMoE `w_mid`, BLT `mid_proj` (PyTorch + MLX). Helpers: `training/arch_upgrade.py` (`copy_square_identity_`, `init_all_ffn_mid_identity`).
+- **Resume / soft upgrade:** missing mid tensors → fill identity (`init_missing_ffn_mid_identity`); 2-mat warm start not blow when third stage added.
+- **Do not** re-randomize mid after model build on from-scratch run. Trained ckpts keep learned mid; only cold start + missing-key upgrades force `I`.
+
+Short equal-token A/B: random mid ~48M lose bad vs 2-mat SwiGLU; identity cold-start ~100M bring 3-mat near equal-param 2-mat final PPL. Identity mid at step 0 = training contract, not optional tweak.
 
 ## Base-Training Schedule
 
-Target about 35-40% code over the complete run. Code rises from short, well-documented
-examples to complete files and repository-level relationships.
+Target ~35-40% code over full run. Code rise short well-documented examples → complete files + repo-level relations.
 
 | Training progress | Natural text | Educational/reference | Math/reasoning | Standalone code | Repository code |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -38,41 +50,37 @@ examples to complete files and repository-level relationships.
 | 50-85% | 25% | 15% | 15% | 30% | 15% |
 | 85-100% | 25% | 15% | 15% | 25% | 20% |
 
-Treat these ratios as starting points. Adjust them using held-out loss and skill probes,
-not training loss alone. Earlier categories never fall to zero.
+Ratios = starting points. Adjust via held-out loss + skill probes, not train loss alone. Earlier categories never → zero.
 
 ### Phase 1: Foundations
 
-- Clean, short prose with common vocabulary and punctuation.
-- Simple factual statements, questions, stories, and instructions.
-- Basic arithmetic, comparison, classification, and symbolic transformations.
-- READMEs, API documentation, standard-library examples, short functions, basic tests,
-  JSON, YAML, SQL, shell, and configuration files.
+- Clean short prose, common vocab + punctuation.
+- Simple facts, questions, stories, instructions.
+- Basic arithmetic, comparison, classification, symbolic transforms.
+- READMEs, API docs, stdlib examples, short functions, basic tests, JSON, YAML, SQL, shell, config files.
 
 ### Phase 2: Composition
 
-- Paragraphs, coreference, temporal and causal relations, and multi-step instructions.
-- Introductory textbooks, science, mathematics, and programming material.
-- Complete source files, implementation/test pairs, docstring-to-code, code explanation,
-  algorithms, and data structures.
+- Paragraphs, coreference, temporal/causal relations, multi-step instructions.
+- Intro textbooks, science, math, programming.
+- Complete source files, impl/test pairs, docstring-to-code, code explain, algorithms, data structures.
 
 ### Phase 3: Reasoning
 
-- Multi-step mathematics, logic, debugging, verification, and error correction.
-- Technical documents and longer code contexts.
-- Related files, imports, tests, issues, patches, and commit messages.
+- Multi-step math, logic, debug, verification, error correction.
+- Technical docs + longer code contexts.
+- Related files, imports, tests, issues, patches, commit messages.
 
 ### Phase 4: Long Context and Repositories
 
-- Document-level retrieval with distant dependencies and distractors.
-- File trees followed by selected documentation, source files, and tests.
-- Cross-file symbol use, build failures, API migrations, refactoring, and security review.
-- Long code and prose contexts that exercise PaTH-FoX and Infini memory.
+- Document-level retrieval w/ distant deps + distractors.
+- File trees → selected docs, source, tests.
+- Cross-file symbols, build fails, API migrations, refactor, security review.
+- Long code/prose contexts exercise PaTH-FoX + Infini memory.
 
 ## Public Data Sources
 
-Public availability does not guarantee permission to train. Record source, version,
-license, and filtering decisions. Recheck dataset cards before each download.
+Public availability ≠ train permission. Record source, version, license, filter decisions. Recheck dataset cards each download.
 
 | Role | Dataset | Use |
 | --- | --- | --- |
@@ -92,12 +100,11 @@ license, and filtering decisions. Recheck dataset cards before each download.
 | Instruction tuning | [SmolTalk](https://huggingface.co/datasets/HuggingFaceTB/smoltalk) | Post-training for smaller assistants. |
 | Dialogue | [OpenAssistant OASST2](https://huggingface.co/datasets/OpenAssistant/oasst2) | Human dialogue for post-training. |
 
-For a minimal first base run, use FineWeb-Edu, Wikipedia, FineMath, and a permissively
-licensed subset of The Stack v2. Add OpenStax and TinyStories only as early supplements.
+Minimal first base run: FineWeb-Edu, Wikipedia, FineMath, permissive Stack v2 subset. Add OpenStax + TinyStories only as early supplements.
 
 ## Code Curriculum
 
-Default language allocation inside the code portion:
+Default language alloc inside code portion:
 
 - 25% Python
 - 20% JavaScript and TypeScript
@@ -107,14 +114,11 @@ Default language allocation inside the code portion:
 - 10% SQL and shell
 - 10% HTML, CSS, configuration, and other languages
 
-Shift this mix toward intended use. For a Python-first model, 40-50% Python is
-reasonable.
+Shift mix toward intended use. Python-first model → 40-50% Python OK.
 
-Use fill-in-the-middle on 30-50% of code sequences beginning in phase 2, while keeping
-ordinary left-to-right prediction. Fill-in-the-middle better matches completion,
-editing, and patch generation.
+Fill-in-the-middle on 30-50% code sequences from phase 2; keep ordinary LTR prediction. FIM better match completion, edit, patch gen.
 
-Repository examples should retain meaningful structure:
+Repo examples keep meaningful structure:
 
 ```text
 repository metadata
@@ -124,13 +128,11 @@ source files
 tests
 ```
 
-Do not concatenate unrelated repositories into fake projects. Filter vendored
-dependencies, generated files, minified JavaScript, lockfiles, build outputs, data
-blobs, secrets, credentials, and near-duplicate forks.
+Do not concat unrelated repos into fake projects. Filter vendored deps, generated files, minified JS, lockfiles, build outputs, data blobs, secrets, credentials, near-duplicate forks.
 
 ## Post-Training
 
-After base pretraining, use a coding-focused instruction mixture:
+After base pretrain, coding-focused instruction mix:
 
 - 30% code generation
 - 20% debugging and repair
@@ -139,27 +141,23 @@ After base pretraining, use a coding-focused instruction mixture:
 - 10% explanation and code review
 - 15% general instruction following
 
-Favor executable solutions with tests over prose-only coding conversations.
+Favor executable solutions w/ tests over prose-only coding chat.
 
 ## Advancement Criteria
 
 Advance difficulty when:
 
-- Validation loss for the current tier plateaus.
-- Earlier-tier validation remains stable.
-- The next tier produces finite, useful loss rather than persistent outliers.
+- Validation loss for current tier plateau.
+- Earlier-tier validation stay stable.
+- Next tier produce finite useful loss, not persistent outliers.
 - Skill probes show transfer beyond memorized examples.
-- Long-context retrieval, code completion, and repository probes improve without a
-  material regression in general language quality.
+- Long-context retrieval, code completion, repo probes improve w/o material general-language regression.
 
-If earlier-tier performance regresses, increase replay before adding more advanced data.
-If a sample has extreme loss, inspect it for corruption or excessive difficulty rather
-than automatically emphasizing it.
+Earlier-tier regress → increase replay before more advanced data. Extreme sample loss → inspect corruption/excessive difficulty; do not auto-emphasize.
 
 ## Evaluation and Contamination
 
-Keep evaluation sets out of all training and deduplicate against prompts and solutions.
-Reserve at least:
+Keep eval sets out of all train; dedupe vs prompts + solutions. Reserve at least:
 
 - General language: MMLU, ARC, HellaSwag
 - Mathematics: GSM8K and selected held-out mathematical probes
@@ -167,26 +165,22 @@ Reserve at least:
 - Repository work: SWE-bench
 - Long context: LongBench and custom PaTH-FoX retrieval probes
 
-Track results by curriculum tier, domain, context length, and code language. Also track
-forgetting after each mixture transition. A curriculum succeeds only if it beats the
-shuffled baseline at equal tokens and compute, or reaches equivalent quality sooner.
+Track by curriculum tier, domain, context length, code language. Track forget after each mixture transition. Curriculum succeed only if beat shuffled baseline at equal tokens + compute, or reach equal quality sooner.
 
 ## First Experiment
 
-1. Build three pools: foundational, core, and advanced.
-2. Start with phase-1 ratios and transition smoothly rather than swapping datasets.
-3. Keep at least 15-20% foundational replay throughout training.
-4. Run one shuffled-mixture baseline and one curriculum run with matched settings.
-5. Evaluate every pool plus held-out language, math, code, and long-context probes.
-6. Change ratios only after measurements identify a bottleneck.
+1. Build three pools: foundational, core, advanced.
+2. Start phase-1 ratios; transition smooth, not swap datasets.
+3. Keep ≥15-20% foundational replay throughout.
+4. Run one shuffled-mixture baseline + one curriculum run, matched settings.
+5. Eval every pool + held-out language, math, code, long-context probes.
+6. Change ratios only after measurements find bottleneck.
 
 ## Pre-Run Result: 2026-07-12
 
-A bounded MPS pilot verified that the proposed early mixture learns and established a
-rough local throughput range. This was a pipeline and learning-slope measurement, not a
-quality result or curriculum-versus-shuffle comparison.
+Bounded MPS pilot: early mixture learns + rough local throughput. Pipeline + learning-slope measure, not quality or curriculum-vs-shuffle.
 
-Pilot configuration:
+Pilot config:
 
 - Apple M1 Max, 32 GiB unified memory, PyTorch MPS, FP32
 - 0.25M parameters, 2 layers, hidden size 64, sequence length 64
@@ -207,53 +201,30 @@ Pilot configuration:
 | 7,168 | 3.389 | 29.6 |
 | 8,192 | 3.367 | 29.0 |
 
-Loss fell rapidly through about 4,000 tokens, then gains diminished. The run completed
-training in 89.8 seconds, including frequent validation, for 91 effective tokens/second;
-steady training steps usually reported 300-500 tokens/second. The validation sample is
-too small for model-selection decisions, but the monotonic curve confirms basic
-trainability.
+Loss fall fast through ~4,000 tokens, then gains diminish. Run 89.8s incl frequent val → 91 effective tok/s; steady steps often 300-500 tok/s. Val sample too small for model-select; monotonic curve confirm basic trainability.
 
-The repository's local profile was also measured at its real startup scale:
+Repo local profile at real startup scale:
 
 - 47.28M parameters, hidden size 512, sequence length 512
 - Effective depth 8 at curriculum start and 20 at maximum loop count
 - One-step measurements: approximately 123-153 tokens/second
 
-At that rate, the configured 10M-token local run takes roughly 19-23 hours before
-evaluation, checkpoint, and data stalls. It remains a shakeout run: 10M tokens are only
-0.21 tokens per parameter. A rough compute-optimal floor of 20 tokens per parameter is
-about 946M tokens, or 73-91 uninterrupted days at measured MPS speed. Meaningful
-convergence at this scale therefore requires faster hardware, distributed training, or a
-smaller model. Measure sustained throughput over at least 100 steps before scheduling a
-long run; one-step MPS timings have substantial startup and synchronization variance.
+At that rate, 10M-token local run ~19-23h before eval/ckpt/data stalls. Shakeout only: 10M tokens = 0.21 tok/param. Rough compute-optimal floor 20 tok/param ≈ 946M tokens → 73-91 uninterrupted days at measured MPS speed. Meaningful convergence need faster HW, distributed train, or smaller model. Measure sustained throughput ≥100 steps before long run; one-step MPS timings have big startup + sync variance.
 
-The pilot artifacts are under ignored directories `runs/curriculum-prerun/`,
-`runs/local-scale-benchmark/`, and `runs/local-max-depth-benchmark/`. Training completed
-and checkpoints were written. The Python 3.14 shutdown hang found during the pilot was
-traced to threaded PyArrow parquet reads entering Python-backed HTTPS files during
-interpreter finalization. The trainer now uses synchronous parquet batches on Python 3.14;
-other Python versions retain the threaded path. A full MPS training/checkpoint smoke test
-now exits normally.
+Pilot artifacts under ignored dirs `runs/curriculum-prerun/`, `runs/local-scale-benchmark/`, `runs/local-max-depth-benchmark/`. Training complete + ckpts written. Python 3.14 shutdown hang: threaded PyArrow parquet reads enter Python-backed HTTPS during interpreter finalization. Trainer now sync parquet batches on Python 3.14; other Pythons keep threaded path. Full MPS train/ckpt smoke now exit normal.
 
 ## MLX Training-Step Benchmark: 2026-07-13
 
-`mlx_benchmark.py` ports the dominant dense block path to MLX: ternary weight and
-activation STE, dense Hadamard preprocessing, exact chunked PaTH-FoX attention,
-sandwich RMSNorm, SwiGLU FFN, and tied embeddings. It intentionally excludes Engram,
-Infini state writes, RFMoE, and loop HC so the first measurement isolates the dense
-training path. Both backends run the same dimensions and 100 optimizer steps over one
-fixed synthetic batch; loss values are not quality or convergence measurements.
+`mlx_benchmark.py` ports dominant dense block path to MLX: ternary weight + activation STE, dense Hadamard preprocess, exact chunked PaTH-FoX attention, sandwich RMSNorm, SwiGLU FFN, tied embeddings. Intentionally exclude Engram, Infini state writes, RFMoE, loop HC — isolate dense train path. Same dims + 100 optimizer steps over one fixed synthetic batch; loss not quality/convergence measure.
 
-Small launch-bound shape (`2` layers, hidden `64`, sequence `64`, vocabulary `2,048`,
-PaTH window `16`):
+Small launch-bound shape (`2` layers, hidden `64`, sequence `64`, vocabulary `2,048`, PaTH window `16`):
 
 | Backend | Precision | Tokens/second | Relative to PyTorch |
 | --- | --- | ---: | ---: |
 | PyTorch MPS | FP32 | 1,877 | 1.00x |
 | MLX compiled | BF16 | 4,208 | 2.24x |
 
-Local-profile shape with two representative blocks (hidden `512`, sequence `512`,
-vocabulary `32,768`, PaTH window `64`, 24.22M parameters):
+Local-profile shape, two representative blocks (hidden `512`, sequence `512`, vocabulary `32,768`, PaTH window `64`, 24.22M parameters):
 
 | Backend | Precision | Tokens/second | Relative to PyTorch |
 | --- | --- | ---: | ---: |
@@ -261,18 +232,11 @@ vocabulary `32,768`, PaTH window `64`, 24.22M parameters):
 | MLX compiled, substitution fallback | BF16 | 2,552 | 0.50x |
 | MLX compiled, custom Metal solve | BF16 | 13,532 | 2.66x |
 
-MLX has no GPU `solve_triangular`, which PaTH-FoX uses once per attention window. The
-initial port's exact compiled forward substitution dominated at window 64. The custom
-kernel in `mlx_path_kernel.py` assigns one Metal thread to each right-hand-side column and
-performs dependency-ordered substitution over rows. Its custom VJP solves against `A^T`
-and applies the analytical matrix gradient, so it supports training rather than forward
-timing only. Forward and gradient parity pass at `1e-4` tolerance.
+MLX no GPU `solve_triangular` (PaTH-FoX once per attention window). Initial port exact compiled forward substitution dominate at window 64. Custom kernel `mlx_path_kernel.py`: one Metal thread per RHS column, dependency-ordered row substitution. Custom VJP solve vs `A^T` + analytical matrix gradient → train, not forward-only timing. Forward + grad parity pass at `1e-4` tolerance.
 
-The kernel path is about 5.3x faster than the MLX fallback and makes this representative
-MLX path 2.66x faster than PyTorch MPS. The reusable model also uses MLX's native orthonormal
-Hadamard transform instead of a dense matrix multiplication.
+Kernel path ~5.3x faster than MLX fallback; representative MLX path 2.66x faster than PyTorch MPS. Reusable model use MLX native orthonormal Hadamard, not dense matmul.
 
-Reproduce the realistic measurements:
+Reproduce realistic measurements:
 
 ```bash
 python3 mlx_benchmark.py --backend mlx --steps 100 --warmup-steps 5 \
@@ -288,58 +252,24 @@ python3 mlx_benchmark.py --backend torch --steps 100 --warmup-steps 5 \
 
 Implemented:
 
-- `mlx_model.py`: ternary blocks, native Hadamard transform, custom Metal PaTH solve,
-  packed-document masking, Engram, Infini memory, grouped sparse RFMoE dispatch through
-  conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda execution,
-  and MTP heads.
-- `mlx_rfmoe_kernel.py`: conditional grouped expert projections plus sparse custom
-  input/weight VJPs. The default hybrid path uses one host compaction, compact
-  `gather_mm` forwards, and compact route-wise backward kernels.
-- `mlx_train.py`: streaming Hugging Face mixtures through the existing tokenizer and
-  packer, compiled BF16 gradients and optimizer updates, activation checkpointing,
-  gradient accumulation, CE/z/MTP/RF auxiliary losses, quantization/loop/block/RF/data/LR
-  curricula, validation, JSONL metrics, and resumable safetensor model/optimizer
-  checkpoints. Resume restores MLX RNG, mixture RNG, Hugging Face iterator positions,
-  shuffle buffers, and partial packed sequences.
-- `mlx_generate.py`: vanilla and MTP speculative greedy generation. MTP proposals use only
-  the final hidden position, verification accepts only target-model argmax matches, and
-  generated tokens are therefore identical to vanilla greedy decoding.
-- `mlx_optim.py`: 64-row blockwise C-MUD for non-embedding matrices and blockwise-int8
-  C-Lion for embeddings, norms, biases, and gates, including cautious masking, Metal
-  triangular whitening, independent learning rates, optional int8 CMUD matrix momentum,
-  and resumable optimizer state.
-- MLX defaults to four 4-sequence microbatches per optimizer update and leaves activation
-  checkpointing off. Sampled MTP defaults to depth 4; pass `--mtp-depth 0` to disable it.
-  Use smaller microbatches with `--gradient-checkpointing` on memory-constrained machines.
-  Override blockwise whitening with `--mud-block-size`; converted and legacy checkpoints
-  preserve their original full-matrix C-MUD behavior.
-- Five 4-sequence validation batches preserve the previous default sample count while
-  avoiding the 4x validation expansion caused by larger microbatches. Validation batches
-  are materialized once so repeated evaluations do not rescan the held-out data offset.
-- Whole-gradient compilation remains limited to block counts that divide sequence length.
-  Irregular layouts run eagerly because retaining each compiled curriculum graph eventually
-  exhausts unified-memory headroom. Any remaining MLX argument-buffer failure automatically
-  retries that layout eagerly.
-- All-feature FineWeb-Edu smoke exercised Engram, Infini safety, RFMoE, Hyperloop, MTP,
-  two-microbatch accumulation, validation, best/numbered/last/final saves, and resumed at
-  the next optimizer step with finite loss.
+- `mlx_model.py`: ternary blocks, native Hadamard, custom Metal PaTH solve, packed-document mask, Engram, Infini memory, grouped sparse RFMoE via conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda, MTP heads, optional dense square mid (`use_ffn_mid`; cold-start mid master = identity), classic 2-mat SwiGLU when mid off.
+- `mlx_rfmoe_kernel.py`: conditional grouped expert projections + sparse custom input/weight VJPs. Default hybrid: one host compaction, compact `gather_mm` forwards, compact route-wise backward kernels.
+- `mlx_train.py`: stream HF mixtures via existing tokenizer/packer, compiled BF16 grads + optimizer updates, activation ckpt, grad accum, CE/z/MTP/RF aux losses, quantization/loop/block/RF/data/LR curricula, val, JSONL metrics, resumable safetensor model/optimizer ckpts. Resume restore MLX RNG, mixture RNG, HF iterator positions, shuffle buffers, partial packed sequences.
+- `mlx_generate.py`: vanilla + MTP speculative greedy. MTP proposals use final hidden position only; verification accept only target-model argmax matches → generated tokens = vanilla greedy.
+- `mlx_optim.py`: 64-row blockwise C-MUD for non-embedding mats + blockwise-int8 C-Lion for embeddings/norms/biases/gates; cautious mask, Metal triangular whitening, independent LRs, optional int8 CMUD matrix momentum, resumable optimizer state.
+- MLX default: four 4-sequence microbatches per optimizer update; activation ckpt off. Sampled MTP default depth 4; `--mtp-depth 0` disable. Smaller microbatches + `--gradient-checkpointing` on memory-tight machines. Override whitening `--mud-block-size`; converted/legacy ckpts keep original full-matrix C-MUD.
+- Five 4-sequence val batches keep previous default sample count; avoid 4x val expansion from larger microbatches. Val batches materialize once — repeated eval no rescan held-out offset.
+- Whole-gradient compile only when block counts divide sequence length. Irregular layouts run eager: retained compiled curriculum graphs exhaust unified-memory headroom. Remaining MLX argument-buffer failure auto-retry that layout eager.
+- All-feature FineWeb-Edu smoke: Engram, Infini safety, RFMoE, Hyperloop, MTP, two-microbatch accum, val, best/numbered/last/final saves, resume next optimizer step w/ finite loss.
+- From-scratch: every square FFN mid (`mid` / `w_mid`) → identity matrix; see **Dense FFN middle layer (square mid)** above. `--use-ffn-mid` / `--no-use-ffn-mid` select 3-mat vs 2-mat dense FFN.
 
-Remaining differences are implementation and training-trajectory parity, not missing
-model features:
+Remaining diffs = impl + train-trajectory parity, not missing features:
 
-- RFMoE preserves independent self-gating: every expert scores every token and every pair
-  above `theta` executes. Default `--rfmoe-backend auto` selects `hybrid` when Metal is
-  available and `host` otherwise. Hybrid was fastest in local RFMoE and one/two-block
-  measurements, `metal` keeps static shapes and activation recomputation for lower-memory
-  compiled runs, and `host` retains native `gather_mm` backward for parity checks and
-  inference.
-- Multi-host distributed training is not implemented.
-- Converted PyTorch and older MLX checkpoints have no dataset stream state, so their first
-  MLX resume warns and restarts data. Checkpoints subsequently written by `mlx_train.py`
-  resume exactly.
+- RFMoE keep independent self-gating: every expert score every token; every pair above `theta` execute. Default `--rfmoe-backend auto` → `hybrid` when Metal available else `host`. Hybrid fastest local RFMoE + one/two-block measures; `metal` keep static shapes + act recompute for lower-memory compile; `host` keep native `gather_mm` backward for parity + inference.
+- Multi-host distributed train not implemented.
+- Converted PyTorch / older MLX ckpts lack dataset stream state → first MLX resume warn + restart data. Ckpts later written by `mlx_train.py` resume exact.
 
-At hidden size 512, 8 experts, expert width 256, 512 tokens, BF16, and 25% active
-density, RFMoE layer measurements were:
+At hidden size 512, 8 experts, expert width 256, 512 tokens, BF16, 25% active density, RFMoE layer measures:
 
 | Backend | Forward | Forward + backward |
 | --- | ---: | ---: |
@@ -347,80 +277,25 @@ density, RFMoE layer measurements were:
 | Static Metal | 18.6 ms | 33.5 ms |
 | Hybrid host-forward/Metal-backward | 3.9 ms | 9.1 ms |
 
-Hybrid training beat static Metal by 2.99x at 12.5% density, 3.86x at 50%, and 4.05x
-at 100%. Hybrid retains RFMoE intermediates instead of activation-checkpointing that
-sublayer, trading memory for speed.
+Hybrid train beat static Metal 2.99x at 12.5% density, 3.86x at 50%, 4.05x at 100%. Hybrid keep RFMoE intermediates (no act-ckpt that sublayer) — trade memory for speed.
 
-With 256-row C-MUD blocks and 16 accumulated 512-token microbatches, the full dense MLX
-trainer measured 2,760 tokens/second at curriculum depth 8 and 1,304 tokens/second at
-maximum depth 20. These synthetic-step figures include activation recomputation, gradient
-clipping, and optimizer updates, but exclude data loading, validation, and checkpoints.
+256-row C-MUD blocks + 16 accumulated 512-token microbatches: full dense MLX trainer 2,760 tok/s at curriculum depth 8, 1,304 tok/s at max depth 20. Synthetic-step figures include act recompute, grad clip, optimizer updates; exclude data load, val, ckpts.
 
-On the same M1 Max, fixed maximum-depth real-data steps measured 1,297 tokens/second with
-the original one-sequence, 16-accumulation checkpointed defaults. Disabling activation
-checkpointing reached 1,711; four-sequence microbatches with four accumulations reached
-2,594 tokens/second with matching short-run losses and gradient norms. Eight-sequence
-microbatches added only about 4% with less memory headroom, while 16 sequences exceeded
-practical unified-memory capacity. The four-by-four configuration is the new default.
-Compiling irregular curriculum layouts added 17-30% in short probes but regressed sustained
-training through retained-graph memory pressure, so they remain eager. FP16 added only
-about 2% and changed the loss trajectory immediately, so BF16 remains the default.
-A 100-update run with the new defaults finished at training loss 2.7600 and averaged 2,999
-tokens/second over maximum-depth checkpoints, versus 2.7644 and 1,306 tokens/second for
-the previous defaults. Validation loss is not directly comparable because the new run
-evaluated 20 sequences instead of the earlier five-sequence A/B sample.
+Same M1 Max, fixed max-depth real-data steps: 1,297 tok/s w/ original one-sequence, 16-accum checkpointed defaults. Disable act ckpt → 1,711; four-sequence microbatches × four accum → 2,594 tok/s, matching short-run loss + grad norms. Eight-sequence microbatches +~4% w/ less memory headroom; 16 sequences exceed practical unified-memory. Four-by-four = new default. Compile irregular curriculum layouts +17-30% short probes but regress sustained train via retained-graph memory pressure → stay eager. FP16 +~2% only, change loss trajectory immediately → BF16 stay default. 100-update run new defaults: train loss 2.7600, avg 2,999 tok/s over max-depth ckpts vs 2.7644 and 1,306 tok/s previous defaults. Val loss not directly comparable (new run 20 sequences vs earlier five-sequence A/B sample).
 
-Effective ternary-weight reuse must be measured at production parameter scale. A 32M-
-parameter proxy was inconclusive, while the full 1.089B-parameter physical model at hidden
-1024, `8 + 48×4 + 8` layers, sequence 64, and BF16 showed a repeatable gain. Two 20-step
-runs per mode measured median throughput of 69.35 tokens/second normally and 73.38 with
-forward-scoped recurrent weight reuse, a 5.8% speedup with identical loss. Reuse is enabled
-by default and recomputed each forward so optimizer updates remain visible. Reproduce the
-A/B with `mlx_benchmark.py` using `--num-prelude-layers 8 --num-layers 48
---num-coda-layers 8 --num-loops 4`; add `--reuse-recurrent-weights` for the cached run.
+Effective ternary-weight reuse measure at production param scale. 32M-param proxy inconclusive; full 1.089B physical model hidden 1024, `8 + 48×4 + 8` layers, sequence 64, BF16 → repeatable gain. Two 20-step runs/mode: median 69.35 tok/s normal, 73.38 w/ forward-scoped recurrent weight reuse (+5.8%, identical loss). Reuse default on; recompute each forward so optimizer updates stay visible. Reproduce A/B w/ `mlx_benchmark.py` using `--num-prelude-layers 8 --num-layers 48 --num-coda-layers 8 --num-loops 4`; add `--reuse-recurrent-weights` for cached run.
 
-Recurrent dense projections also use a packed 2-bit Metal path once the ternary curriculum
-reaches full weight quantization. `mlx_ternary_kernel.py` fuses row-scale reduction and
-ternary packing; MLX's native `quantized_matmul` handles forward and input-gradient while a
-custom VJP keeps the STE weight gradient. On the full 1.089B physical model at sequence 256,
-two 10-step BF16 measurements reached 55.38 versus 44.19 tokens/second, a 25.3% speedup.
-At sequence 64 packing overhead instead caused a 4.6% regression, so `mlx_train.py` enables
-the path only for sequence lengths at least 128. An equal-token 48.33M sampled-MTP run
-finished in 247.3 versus 285 seconds (1.15x) with validation perplexity 18.67 versus 18.58.
-New MLX runs enable it by default; use `--no-recurrent-quantized-matmul` for strict old
-arithmetic. Checkpoints written before the flag existed resume with the old path.
+Recurrent dense projections use packed 2-bit Metal path once ternary curriculum reach full weight quant. `mlx_ternary_kernel.py` fuse row-scale reduction + ternary packing; MLX native `quantized_matmul` forward + input-grad; custom VJP keep STE weight grad. Full 1.089B physical model sequence 256: two 10-step BF16 → 55.38 vs 44.19 tok/s (+25.3%). Sequence 64 packing overhead → 4.6% regression, so `mlx_train.py` enable path only seq ≥128. Equal-token 48.33M sampled-MTP: 247.3 vs 285s (1.15x), val PPL 18.67 vs 18.58. New MLX runs enable by default; `--no-recurrent-quantized-matmul` for strict old arithmetic. Ckpts before flag resume old path.
 
-CMUD matrix momentum is stored blockwise-int8 by default; this does not introduce a
-standalone MUD training path. On the full 1.089B model, optimizer state
-fell from 7.68 to 5.03 GiB and initialization peak memory from 9.98 to 7.28 GiB. Three
-compiled CMUD-only apply steps improved from 0.123 to 0.234 steps/second. A seeded
-48.33M-parameter equal-token run showed no end-to-end speed gain and moved validation
-perplexity from 18.67 to 18.91. Use `--no-cmud-momentum-8bit` to restore FP32 momentum.
-Legacy optimizer configs omit `mud_eight_bit` and retain FP32 momentum when resumed.
-At full 1.089B scale with sequence 256, three measured end-to-end CMUD steps improved from
-5.11 to 18.24 tokens/second (3.57x) with matching loss; FP32 state pushed the 32 GiB M1 Max
-into severe unified-memory pressure.
+CMUD matrix momentum blockwise-int8 by default; not standalone MUD train path. Full 1.089B: optimizer state 7.68 → 5.03 GiB, init peak mem 9.98 → 7.28 GiB. Three compiled CMUD-only apply steps 0.123 → 0.234 steps/s. Seeded 48.33M equal-token: no end-to-end speed gain; val PPL 18.67 → 18.91. `--no-cmud-momentum-8bit` restore FP32 momentum. Legacy optimizer configs omit `mud_eight_bit` → FP32 momentum on resume. Full 1.089B sequence 256: three end-to-end CMUD steps 5.11 → 18.24 tok/s (3.57x), matching loss; FP32 state push 32 GiB M1 Max into severe unified-memory pressure.
 
-The dominant CMUD operation was blockwise triangular decorrelation: 22.46 ms of a 23.76 ms
-`2048×1024` matrix update. Reducing independent whitening blocks from 256 to 64 rows and
-batching all block solves into one Metal launch preserved exact blockwise arithmetic while
-cutting common `1024×1024` and `2048×1024` decorrelation to 0.98 and 1.20 ms. At the 48M
-benchmark shape, CMUD fell from 0.286 to 0.046 seconds and end-to-end throughput rose from
-2,319 to 2,900 tokens/second (+25%). A physical-1.089B, active-loop-1 A/B kept optimizer
-size identical while limiting thermal interference: CMUD fell 2.405→0.893 seconds and
-end-to-end throughput rose 75.17→134.09 tokens/second (+78%). Full-depth sequential 1B
-runs remained thermally unstable on the M1 Max.
+Dominant CMUD op = blockwise triangular decorrelation: 22.46 ms of 23.76 ms `2048×1024` matrix update. Cut independent whitening blocks 256 → 64 rows + batch all block solves one Metal launch: preserve exact blockwise arithmetic; common `1024×1024` + `2048×1024` decorrelation → 0.98 + 1.20 ms. 48M bench shape: CMUD 0.286 → 0.046s, end-to-end throughput 2,319 → 2,900 tok/s (+25%). Physical-1.089B active-loop-1 A/B keep optimizer size identical, limit thermal interference: CMUD 2.405→0.893s, end-to-end 75.17→134.09 tok/s (+78%). Full-depth sequential 1B runs stay thermally unstable on M1 Max.
 
-Smaller blocks did not hurt the short quality check. The equal-token 48.33M run reached
-validation perplexity 17.19 and training loss 3.644, versus 18.91 and 3.758 with 256-row
-blocks. Its 274.6-second wall time is excluded from speed comparison because it ran after
-multiple full-1B thermal stress tests. New MLX runs default to `--mud-block-size 64`; resumed
-checkpoints reconstruct their saved optimizer block size.
+Smaller blocks not hurt short quality check. Equal-token 48.33M: val PPL 17.19, train loss 3.644 vs 18.91 / 3.758 w/ 256-row blocks. 274.6s wall excluded from speed compare (ran after multiple full-1B thermal stress tests). New MLX default `--mud-block-size 64`; resumed ckpts reconstruct saved optimizer block size.
 
-MLX activation checkpointing can target only the repeated recurrent core. Enable it with
-`--gradient-checkpointing`; use `--gradient-checkpoint-scope all` only when prelude and coda
-activations also need recomputation. On the full 1.089B model at sequence 256, a three-step
-CMUD sweep measured:
+New MLX runs: BF16 MUD master weights, C-Lion masters stay FP32; `--cmud-master-dtype float32` restore FP32 MUD masters. Seeded 400-update, 3,276,800-token 48.33M A/B end 20-batch val loss/PPL 1.87602/6.52745 BF16 masters vs 1.87144/6.49765 FP32 masters (0.46% PPL regression). BF16 cut physical-1.089B active-loop-1 peak 10.57 → 8.80 GiB, matching five-step loss. Sequential runtime thermally unstable → memory save not speed supports default. Saved optimizer configs w/o dtype field retain FP32 masters on resume.
+
+MLX act ckpt can target only repeated recurrent core. Enable `--gradient-checkpointing`; `--gradient-checkpoint-scope all` only if prelude+coda also need recompute. Full 1.089B sequence 256, three-step CMUD sweep:
 
 | Checkpoint scope | Peak memory | Throughput |
 | --- | ---: | ---: |
@@ -428,43 +303,17 @@ CMUD sweep measured:
 | Recurrent | 12.434 GiB | 26.80 tok/s |
 | All blocks | 12.490 GiB | 24.34 tok/s |
 
-A repeated recurrent/no-checkpoint A/B after thermal slowdown still favored recurrent-only
-at 20.70 versus 17.76 tokens/second, while peak memory repeated exactly. Full-stack
-checkpointing provided no additional measured saving and needlessly recomputed the one-pass
-prelude and coda. Checkpointing remains opt-in because smaller models and batches may not
-benefit. Checkpoints saved before the scope flag retain their prior all-block behavior.
+Repeated recurrent/no-ckpt A/B after thermal slowdown still favor recurrent-only 20.70 vs 17.76 tok/s; peak mem repeat exact. Full-stack ckpt no extra measured saving; needless recompute one-pass prelude+coda. Ckpt remain opt-in — smaller models/batches may not benefit. Ckpts before scope flag retain prior all-block behavior.
 
-Phase profiling is opt-in with `--profile-phases` in either `mlx_train.py` or
-`mlx_benchmark.py`. Trainer logs average data, forward/backward, CMUD, and synchronization
-wait per step since the previous log, plus validation wall time on evaluation lines.
-Synchronization wait is a subset of forward/backward and CMUD time, not an additive phase:
-MLX executes most lazy graph work while `mx.eval` waits for completion.
+Phase profiling opt-in `--profile-phases` in `mlx_train.py` or `mlx_benchmark.py`. Trainer log avg data, forward/backward, CMUD, sync wait per step since previous log + val wall on eval lines. Sync wait subset of forward/backward + CMUD time, not additive phase: MLX run most lazy graph work while `mx.eval` wait complete.
 
-At the 48.33M shape, a three-step real-data run at maximum loop depth and full quantization
-reached steady-state data/forward-backward/CMUD times of 0.011/2.823/0.289 seconds and
-2,622 tokens/second. Validation took 0.312 seconds. The first two steps waited 2.6–3.1
-seconds on stream refill, demonstrating that data stalls can dominate short measurements
-even though buffered data was only 0.4% of the steady-state training step.
+48.33M shape, three-step real-data max loop depth + full quant: steady-state data/forward-backward/CMUD 0.011/2.823/0.289s, 2,622 tok/s. Val 0.312s. First two steps wait 2.6–3.1s on stream refill — data stalls dominate short measures even when buffered data only 0.4% of steady-state train step.
 
-At the full 1.089B shape with sequence 256, batch one, packed recurrent matmuls, and int8
-CMUD momentum, the materialized-gradient profile measured 12.37 seconds for
-forward/backward, 25.95 seconds for CMUD, and 5.66 seconds for one validation forward.
-End-to-end training reached 6.68 tokens/second with a 15.00 GiB peak. Synchronization wait
-was 37.32 seconds of the 38.32-second step and overlaps both compute phases. This is slower
-than the fused-step benchmark because profiling follows the trainer's separate gradient and
-optimizer evaluations and retains the full gradient tree. At 1B scale, CMUD and gradient
-materialization are the next software bottlenecks; at 48M scale, forward/backward dominates
-once the input stream is warm.
+Full 1.089B sequence 256, batch one, packed recurrent matmuls, int8 CMUD momentum: materialized-gradient profile 12.37s forward/backward, 25.95s CMUD, 5.66s one val forward. End-to-end train 6.68 tok/s, 15.00 GiB peak. Sync wait 37.32s of 38.32s step, overlap both compute phases. Slower than fused-step bench: profile follow trainer separate gradient + optimizer evals, retain full gradient tree. Exact final-backward, grad average, global clip, CMUD fusion tested not retained: 50.43M shape cut throughput 2,661 → 2,354 tok/s, peak mem 6.881 → 6.834 GiB. Stabilized physical-1.093B active-loop-1: three warmups + five timed steps — separate compiled graphs median 119.74 tok/s; lazy one-eval fusion 85.63 tok/s, save only 0.131 GiB peak. Monolithic compiled fusion slower still. Separate compiled backward + CMUD graphs = production path.
 
-The delayed loop-depth curriculum is available through
-`--loop-curriculum-start-ratio`; the existing `--loop-curriculum-ratio` remains the point
-where maximum depth is reached. On the full 1.089B physical model, BF16 sequence-64 phase
-measurements at active loop depths 1 through 4 were 184.08, 122.93, 92.81, and 72.77
-tokens/second. Weighting those costs by a 70–90% delayed ramp projects 141.31 effective
-tokens/second versus 77.56 for the default 0–20% ramp, a 1.82x compute-throughput gain.
+Delayed loop-depth curriculum via `--loop-curriculum-start-ratio`; `--loop-curriculum-ratio` = max depth reached. Full 1.089B physical model, BF16 sequence-64 phase measures active loop depths 1–4: 184.08, 122.93, 92.81, 72.77 tok/s. Weight costs by 70–90% delayed ramp → 141.31 effective tok/s vs 77.56 default 0–20% ramp (1.82x compute-throughput gain).
 
-Equal-token quality did not support making any delayed schedule the default. Seeded
-48.33M-parameter, 655,360-token sampled-MTP sweeps measured:
+Equal-token quality not support delayed schedule as default. Seeded 48.33M-param, 655,360-token sampled-MTP sweeps:
 
 | Loop ramp | Time | Speedup | Final validation PPL | PPL change |
 | --- | ---: | ---: | ---: | ---: |
@@ -473,7 +322,7 @@ Equal-token quality did not support making any delayed schedule the default. See
 | 50–80% | 218.6s | 1.30x | 22.13 | +19.1% |
 | 70–90% | 191.4s | 1.49x | 23.14 | +24.5% |
 
-The 30–70% ramp is the least harmful measured speed/quality tradeoff, but remains opt-in:
+30–70% ramp = least harmful measured speed/quality tradeoff; remain opt-in:
 
 ```bash
 python3 mlx_train.py \
@@ -481,46 +330,19 @@ python3 mlx_train.py \
   --loop-curriculum-ratio 0.7
 ```
 
-Equal wall-clock comparison favored that 30–70% ramp. The 0–20% baseline processed
-655,360 tokens in 285 seconds and reached validation perplexity 18.58. A 30–70% run
-processed 770,048 tokens in 265.8 seconds and reached best measured perplexity 17.73;
-a second bracketing run processed 819,200 tokens in 303.2 seconds and reached 16.64.
-Thus the delayed ramp lost quality per token but improved quality per local training time
-in this single-seed 48.33M experiment. It remains opt-in until this result survives larger
-models and multiple seeds. Later sequential sweeps thermally throttled the M1 Max and were
-excluded from wall-clock comparison.
+Equal wall-clock favor 30–70% ramp. 0–20% baseline: 655,360 tokens in 285s, val PPL 18.58. 30–70% run: 770,048 tokens in 265.8s, best measured PPL 17.73; second bracketing run 819,200 tokens in 303.2s, PPL 16.64. Delayed ramp lose quality per token, improve quality per local train time in single-seed 48.33M experiment. Opt-in until result survive larger models + multi-seed. Later sequential sweeps thermally throttle M1 Max — excluded from wall-clock compare.
 
-An 80-update MTP sweep used identical data, seed, curriculum, and a fixed four-sequence
-validation sample every 10 updates. Depths 0 through 4 reached perplexity 25 in 173, 189,
-221, 247, and 264 training seconds. Depth 2 reached perplexity 23.5 ten updates earlier
-than depth 0, but still took 221 versus 204 seconds. At 80 updates, validation perplexities
-were 18.97, 19.23, 18.76, 19.06, and 18.70 while training times were 267, 294, 345, 381,
-and 396 seconds. Exact all-head MTP improved some equal-token results but not
-time-to-perplexity in this single-seed short run, so the sampled policy below replaces it.
+80-update MTP sweep: identical data, seed, curriculum, fixed four-sequence val every 10 updates. Depths 0–4 reach PPL 25 in 173, 189, 221, 247, 264 train seconds. Depth 2 reach PPL 23.5 ten updates earlier than depth 0, still 221 vs 204s. At 80 updates, val PPLs 18.97, 19.23, 18.76, 19.06, 18.70; train times 267, 294, 345, 381, 396s. Exact all-head MTP improve some equal-token results not time-to-PPL in this single-seed short run → sampled policy below replace it.
 
-The cheaper MTP trainer rotates one future head through each accumulation microbatch. At
-depth 4 this reduces auxiliary vocabulary projections from 16 to 4 per optimizer update
-without changing the expected depth-mean loss or checkpoint tensors. A maximum-depth probe
-reached 2,293 tokens/second with a 13.2 GiB peak footprint, versus 1,718 tokens/second and
-16.5 GiB for exact depth 4. An 80-update sampled run finished in 285 seconds at validation
-perplexity 18.58, compared with 271 seconds and 18.97 without MTP and 401 seconds and 18.70
-for exact depth 4. Generation fixes PaTH chunk width to the final training layout so logits
-remain prefix-invariant during verification. On that sampled checkpoint, exact greedy
-speculation generated the same 128 tokens as vanilla decoding at 22.27 versus 16.95
-tokens/second, a 1.31x speedup, while reducing target-model calls from 128 to 96. This
-full-prefix reference has no incremental PaTH/Infini cache yet.
+Cheaper MTP trainer rotate one future head through each accum microbatch. Depth 4: aux vocab projections 16 → 4 per optimizer update; expected depth-mean loss + ckpt tensors unchanged. Max-depth probe: 2,293 tok/s, 13.2 GiB peak vs 1,718 tok/s + 16.5 GiB exact depth 4. 80-update sampled run: 285s, val PPL 18.58 vs 271s / 18.97 no MTP, 401s / 18.70 exact depth 4. Generation fix PaTH chunk width to final train layout → logits prefix-invariant during verification. Sampled ckpt: exact greedy speculation same 128 tokens as vanilla decode at 22.27 vs 16.95 tok/s (1.31x), target-model calls 128 → 96. Full-prefix reference no incremental PaTH/Infini cache yet.
 
-A 100-update real-data A/B with identical seed, stream, curriculum, and five validation
-batches every 20 updates compared 256-row blocks against full-matrix whitening. Blockwise
-C-MUD finished with validation loss 2.7053 versus 2.7601, sustained 1,306 versus 1,118
-tokens/second at maximum depth, and completed in 1,078 versus 1,181 seconds. This single
-seed supports the faster default but is not a statistical convergence study.
+Incremental MLX inference retain effective weights across prefill, token steps, batched verification; fully ternary ckpts use same packed 2-bit rep for cache lifetime. Interleaved six-sample synthetic 1.086B BF16, full-four-loop M1 Max: 1.23 tok/s rebuild dense effective weights each call, 3.71 persistent dense, 4.38 persistent packed. Random weights validate structural throughput only; speculative acceptance still need trained 1B MTP ckpt.
 
-Use `mlx_train.py` for native MLX experiments; do not expect identical step-by-step loss
-to `train.py` because backend kernels and RFMoE execution order differ.
+100-update real-data A/B identical seed, stream, curriculum, five val batches every 20 updates: 256-row blocks vs full-matrix whitening. Blockwise C-MUD: val loss 2.7053 vs 2.7601, sustained 1,306 vs 1,118 tok/s at max depth, complete 1,078 vs 1,181s. Single seed support faster default; not statistical convergence study.
 
-Convert a PyTorch C-MUD checkpoint, including optimizer momentum and exact Engram hash
-multipliers, before resuming with MLX:
+Use `mlx_train.py` for native MLX experiments; do not expect identical step-by-step loss vs `train.py` (backend kernels + RFMoE execution order differ).
+
+Convert PyTorch C-MUD ckpt (incl optimizer momentum + exact Engram hash multipliers) before MLX resume:
 
 ```bash
 python3 mlx_convert.py runs/bitnet/checkpoints/last.pt \
@@ -530,6 +352,4 @@ python3 mlx_train.py \
   --resume-from runs/mlx_bitnet/checkpoints/imported.safetensors
 ```
 
-Checkpoints created before optimizer parameter names were saved require
-`--allow-legacy-optimizer-order`. Use that flag only for an unmodified checkpoint
-written by this repository.
+Ckpts created before optimizer param names saved need `--allow-legacy-optimizer-order`. Use that flag only for unmodified ckpt written by this repo.

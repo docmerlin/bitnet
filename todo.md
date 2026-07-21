@@ -43,7 +43,7 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
 - Flat→skew curriculum (anneal s:0→s, α:1→α). `--rfmoe-curriculum-ratio`.
 - Functional-diversity loss (decorrelate per-token firing). `--rfmoe-diversity-coef`.
 - MTP (multi-token prediction) for AR data efficiency, k extra heads reuse tied unembedding. `--mtp-depth/-loss-coef`.
-- **Looped / recurrent-depth BitNetDeep:** prelude 8 + recurrent 48 × R + coda 8 (default R=4).
+- **Looped / recurrent-depth BitNetDeep:** prelude 8 + recurrent 32 × R + coda 8 (default R=4).
   Flat `layers.i` ModuleList; forward schedules loops. CLI structure flags + `--num-loops`.
   Infini policy B: read every loop, write only last recurrent loop. Eval override: `num_loops=`.
 - **Hyperloop loop HC** (`layers/loop_mhc.py`): 4 streams, diagonal `H_res` (no Sinkhorn),
@@ -85,6 +85,72 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
 
 Note: linear R curriculum is the default train path; full always-max R via
 `--loop-curriculum-ratio 0`.
+
+### MLX inference performance
+
+Full-depth synthetic 1.085B BF16 baseline on M1 Max, batch one and a 32-token
+prompt: prefill took 1.02-1.18s, cached vanilla decode reached 1.10 tok/s, and
+the four-head MTP proposal path reached 1.07 calls/s. Peak memory was 2.87 GiB
+without MTP drafts and 3.37 GiB with them. Random weights cannot measure useful
+speculative acceptance; repeat generated-token throughput on a trained 1B checkpoint.
+
+Small-model diagnosis (2026-07-19, M1 Max): a trained 1.8M h96 probe
+(`1+4×4+1` = 18 effective layers) only reached ~44–56 tok/s vanilla decode; a
+10.5M h256 probe with the same looped depth stayed ~44 tok/s. Speed is nearly
+flat in param count, so decode is architecture/launch-bound, not FLOP-bound.
+Main costs: looped depth multiplies work; PaTH `incremental` re-runs full
+`path_chunk` (triangular solve + local logits) on the open chunk every token;
+~7 HBitLinear + 2 Linear per block (~126 ternary matmuls/token at 18 execs);
+uncompiled eager graphs with per-token `mx.eval`; packed 2-bit matmul gated
+off when `min(weight.shape) < 512`; production Infini/PaTH geometry
+(`infini_memory_dim=64`, `path_window_size=64`) oversized for tiny probes.
+
+- [x] **Persist inference ternary weights.** Each generation cache now retains effective or
+  packed weights from first use; speculative branch clones share that immutable cache.
+- [x] **Use the inference weight cache everywhere.** `prefill`, `inference_step`, and
+  `inference_extend` now share one cache instead of re-scaling, thresholding, casting, and
+  running fresh dense BF16 weights on every token and recurrent loop. Fully ternary checkpoints
+  loaded by `mlx_generate.py` enable packed inference automatically.
+- [x] **Fused ternary M=1 decode kernel.** `ternary_fused_linear_m1` (act quant + add/sub GEMV) and `ternary_fused_ffn_m1` (up/mid/down) in one Metal dispatch for token decode; wired into `MLXHBitLinear` / dense FFN when M=1 and fully quantized.
+- [x] **Benchmark the 2-bit decode kernel at M=1.** An interleaved six-sample full-depth
+  1.086B BF16 benchmark measured uncached dense at 1.23 tok/s, persistent dense at 3.71 tok/s,
+  and persistent packed `mx.quantized_matmul` at 4.38 tok/s. The generic packed kernel wins;
+  defer a custom Metal GEMV until profiling shows another kernel can recover meaningful time.
+- [x] **True incremental PaTH decode.** Open-chunk T = S^{-1}D is **border-updated O(L²) per
+  token** via `path_border_update_t` (not a full L×L re-solve). Last-query attention uses
+  `path_chunk_last_with_t` without rebuilding the system. Prefill/extend seed T with one
+  full solve for the residual open chunk. `--path-decode recompute` keeps the old full
+  open-chunk baseline. Parity tests cover border T vs full solve and incremental vs recompute.
+- [x] **Compile static incremental work.** Functionalized cache flatten/apply + `mx.compile` specialized per open-chunk length; enabled by default in `mlx_generate.py` (`--compile-step`). Falls back cleanly if compile fails. Functionalize cache arrays as explicit graph
+  inputs/outputs and benchmark `mx.compile` around one physical block, recurrent loop, or
+  full `inference_step`. A direct compiled closure fails today because mutable cache arrays
+  are not explicit outputs. Biggest expected win for small hidden sizes where Metal launch
+  and Python graph rebuild dominate FLOPs. Avoid one giant full-depth graph unless MLX
+  compiler limits and compile latency prove acceptable.
+- [x] **Eval-time loop override.** `mlx_generate.py --num-loops N` overrides checkpoint schedule; default remains curriculum/scheduled R. Expose `num_loops=1` (or lower R) for interactive
+  generation; linear speedup vs full curriculum depth. Keep training/eval quality path at
+  scheduled R.
+- [ ] **Simpler generate-time FFN path.** Decode currently pays the full 3-mat dense FFN
+  (`up` → square `mid` → `down`) plus PaTH extras every block. Consider a generate-only
+  simplification or fused kernel if quality allows; otherwise fuse the three matmuls into
+  fewer launches.
+- [x] **Lower packed-kernel size gate / always-cache effective weights.** Removed `min(shape)>=512` gate; `pin_inference_weights()` materializes one dense/packed weight per HBitLinear for the generation lifetime (default on in generate). Packed ternary
+  matmul only runs when `min(weight.shape) >= 512` and last dim % 32 == 0, so h96/h256
+  probes never hit it and stay launch-bound dense GEMVs. Revisit the 512 gate, or ensure
+  small-width decode always uses a single cached effective weight without per-call
+  rematerialization overhead.
+- [ ] **Scale Infini/PaTH geometry with model size.** Keep production `infini_memory_dim=64`
+  and `path_window_size=64` for full models, but default smaller probes to matching dims /
+  chunk widths so open-chunk solves and memory scores are not production-sized on toy nets.
+- [x] **Instrument generate phase breakdown.** `mlx_generate.py --profile` reports prefill/decode/eval-sync and e2e tok/s. Add optional timing in `mlx_generate.py` /
+  a small harness for prefill, `path_chunk`, linear/HBit, Infini, Engram, and `mx.eval` sync
+  so future optimizations report end-to-end tok/s plus per-phase ms at 2M, 10M, and 1B.
+- [x] **Batch speculative verification.** `inference_extend` already evaluates candidate
+  spans together, converting several token-wise GEMVs toward GEMMs. Measure its net benefit
+  and accepted tokens/target call once a trained 1B MTP checkpoint exists.
+
+CMUD momentum, BF16 optimizer masters, backward fusion, and activation checkpointing are
+training-only and do not apply to inference.
 
 ### MLX training performance
 
@@ -136,9 +202,14 @@ Priority order after current cache/MTP inference work:
   5.66s, and peak memory reached 15.00 GiB. Synchronization wait overlaps compute phases
   because MLX executes lazy graphs during `mx.eval`; it was 3.03s at 48M and 37.32s at 1B.
   Future optimizations must report end-to-end throughput at both representative scales.
-- [ ] **Use faster/distributed hardware for full 1B training.** Single M1 Max estimates are
-  roughly 30–60 tok/s at 1B scale; software improvements alone do not make a 20B-token run
-  practical. Re-benchmark PyTorch/CUDA or distributed training before committing that budget.
+- [x] **Reject final-backward/CMUD fusion after measurement.** Exact accumulation, global
+  clipping, and CMUD fusion preserved loss and optimizer state but reduced throughput from
+  2,661→2,354 tok/s at 50.43M. A three-warmup, five-step physical-1.093B active-loop-1
+  test measured 119.74 tok/s split versus 85.63 lazy-fused; fusion saved only 0.131 GiB peak.
+  Monolithic compiled fusion was slower still, so production retains separate compiled graphs.
+- [ ] **Deferred: use faster/distributed hardware for full 1B training.** Hardware changes
+  are unavailable for now. Single M1 Max estimates are roughly 30–60 tok/s at 1B scale;
+  revisit PyTorch/CUDA or distributed benchmarking when hardware access changes.
 
 ---
 

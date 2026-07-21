@@ -9,7 +9,7 @@ class TernaryConfig:
 
     Key design choices for deep ternary stability and efficiency on weak hardware:
     - Hidden size 1024 (power of 2, friendly for Hadamard transform)
-    - Looped depth: unique prelude + recurrent core × R + coda (default 8+48×R+8)
+    - Looped depth: unique prelude + recurrent core × R + coda (default 8+32×R+8)
     - RMSNorm + SubLN (extra sub-layer norm for ternary weight stability)
     - PaTH-FoX data-dependent positions inside bounded local windows
     - EVERY layer uses BOTH Infini-Attention and sandwich RMSNorm AttnRes residuals
@@ -18,7 +18,7 @@ class TernaryConfig:
     - Always: tied embeddings, full-precision lm_head, per-head QK norm
 
     Layer structure (resolved in ``__post_init__``):
-    - Production default: prelude=8, recurrent=48, coda=8, num_loops=4
+    - Production default: prelude=8, recurrent=32, coda=8, num_loops=4
     - Flat / test: pass only ``num_hidden_layers=N`` → (0, N, 0) with num_loops=1
     - Explicit structure: pass any of prelude/recurrent/coda; sum becomes unique count
     """
@@ -104,7 +104,7 @@ class TernaryConfig:
            Default loops=4 when unset.
         2. Only ``num_hidden_layers`` set → flat stack (0, N, 0), default loops=1
            (compat for tests and old checkpoints).
-        3. Nothing set → production 8 / 48 / 8 with loops=4.
+        3. Nothing set → production 8 / 32 / 8 with loops=4.
         """
         structure_given = (
             self.num_prelude_layers is not None
@@ -122,7 +122,7 @@ class TernaryConfig:
             p, r, c = 0, int(self.num_hidden_layers), 0
             loops = 1 if self.num_loops is None else int(self.num_loops)
         else:
-            p, r, c = 8, 48, 8
+            p, r, c = 8, 32, 8
             loops = 4 if self.num_loops is None else int(self.num_loops)
 
         if p < 0 or r < 0 or c < 0:

@@ -32,6 +32,10 @@ def test_rfmoe_forward_and_grad() -> None:
     assert expert.w_mid.weight.shape == (32, 32)
     assert expert.w_up.weight.shape == (32, hidden)
     assert expert.w_down.weight.shape == (hidden, 32)
+    eye = torch.eye(32, dtype=expert.w_mid.weight.dtype)
+    assert torch.allclose(expert.w_mid.weight.detach().cpu(), eye, atol=1e-5), (
+        "w_mid must cold-start as identity"
+    )
     x = torch.randn(4, 10, hidden)
     y = moe(x)
     assert y.shape == x.shape

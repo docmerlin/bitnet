@@ -39,8 +39,8 @@ Key properties:
   - **Sandwich RMSNorm** residual: `post(x + scale * sublayer(pre(x)))` on attn and FFN
     (pre-norm + residual-stream post-norm; stabilizes looped unrolls)
   - Attention Residuals (learned scale on each residual branch)
-- **looped / recurrent-depth** layout (default): 8 prelude + 48 unique recurrent × `R` loops + 8 coda
-  - same 64 unique params as a flat 64-layer stack; effective depth = `8 + 48R + 8` (default `R=4` → 208)
+- **looped / recurrent-depth** layout (default): 8 prelude + 32 unique recurrent × `R` loops + 8 coda
+  - same 48 unique params as a flat 48-layer stack; effective depth = `8 + 32R + 8` (default `R=4` → 144)
   - CLI: `--num-prelude-layers`, `--num-recurrent-layers`, `--num-coda-layers`, `--num-loops`
   - flat ablation: `--num-layers N` alone → `(0, N, 0)` with `R=1`
   - test-time depth: `model(..., num_loops=R)` without new parameters
@@ -201,6 +201,8 @@ These launchers drive `train.py`, not BLT stack.
 
 Generate from a native MLX checkpoint. Checkpoints trained with `--mtp-depth` use exact
 greedy speculative decoding by default; pass `--no-speculative` for the vanilla baseline.
+Generation retains ternary weights across the whole cache lifetime and automatically uses
+packed 2-bit matmul once the checkpoint has reached full weight quantization.
 
 ```bash
 python3 mlx_generate.py runs/bitnet/checkpoints/final.safetensors \
@@ -230,6 +232,10 @@ Synchronization wait overlaps compute phases because MLX evaluates lazy graphs i
 
 New MLX runs use batched 64-row CMUD whitening. `--mud-block-size` remains available for
 ablation; resumed checkpoints retain their saved block size.
+
+New MLX runs store MUD matrix masters in BF16 while retaining FP32 C-Lion masters for
+embeddings and other fallback parameters. `--cmud-master-dtype float32` restores FP32 MUD
+masters; resumed checkpoints retain their saved dtype.
 
 ### BLT local smoke run
 

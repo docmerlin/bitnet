@@ -7,7 +7,7 @@ set -euo pipefail
 # stack can run on a Mac Mini or similar machine:
 # - 2 prelude + 4 recurrent × 4 loops + 2 coda (8 unique, effective depth 20)
 # Remove the model-shape overrides below to train the full configuration from
-# config.py (8/48/8 × R=4).
+# config.py (8/32/8 × R=4).
 
 python3 train.py \
   --output-dir runs/bitnet_local \

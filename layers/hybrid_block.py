@@ -99,6 +99,11 @@ class HybridTransformerBlock(nn.Module):
             inter = config.intermediate_size
             self.ffn_up = HBitLinear(config.hidden_size, inter * 2, bias=False, config=config)
             self.ffn_mid = HBitLinear(inter, inter, bias=False, config=config)
+            # Cold start: identity mid ≈ classic 2-mat path (silu pass-through on expand).
+            with torch.no_grad():
+                self.ffn_mid.weight.copy_(
+                    torch.eye(inter, device=self.ffn_mid.weight.device, dtype=self.ffn_mid.weight.dtype)
+                )
             self.ffn_down = HBitLinear(inter, config.hidden_size, bias=False, config=config)
 
         # sigmoid(0)=0.5 at init: attention path starts damped.

@@ -71,6 +71,7 @@ def test_mlx_clion_block_quantization_and_routing() -> None:
     assert lion_state["embedding.weight.exp_avg_q"].dtype == mx.int8
     assert optimizer.checkpoint_config()["block_size"] == 4
     assert not optimizer.checkpoint_config()["mud_eight_bit"]
+    assert optimizer.checkpoint_config()["mud_master_dtype"] == "float32"
 
 
 def test_mlx_mud_block_quantization() -> None:
@@ -147,3 +148,33 @@ def test_mlx_optimizer_state_stays_float32_for_bfloat16_parameters() -> None:
         small_update = small_step_lion.apply_single(gradient, small_update, small_state)
     mx.eval(small_update)
     assert mx.all(small_update < parameter).item()
+
+
+def test_mlx_optimizer_can_store_bfloat16_mud_master_parameters() -> None:
+    model = nn.Linear(64, 64)
+    model.set_dtype(mx.bfloat16)
+    optimizer = CMUD(
+        mud_learning_rate=0.1,
+        fallback_learning_rate=0.1,
+        weight_decay=0.0,
+        eight_bit=True,
+        mud_master_dtype="bfloat16",
+    )
+    parameters = model.trainable_parameters()
+    optimizer.init(parameters)
+    optimizer.update(model, {key: mx.ones_like(value) for key, value in parameters.items()})
+    mx.eval(optimizer.state)
+
+    state = dict(tree_flatten(optimizer.state))
+    mud_masters = [
+        value for key, value in state.items()
+        if key.startswith("states.0") and key.endswith("master_parameter")
+    ]
+    clion_masters = [
+        value for key, value in state.items()
+        if key.startswith("states.1") and key.endswith("master_parameter")
+    ]
+    assert len(mud_masters) == len(clion_masters) == 1
+    assert mud_masters[0].dtype == mx.bfloat16
+    assert clion_masters[0].dtype == mx.float32
+    assert optimizer.checkpoint_config()["mud_master_dtype"] == "bfloat16"

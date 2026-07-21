@@ -41,6 +41,11 @@ class RFMoEExpert(nn.Module):
         self.b_gate = HBitLinear(rank, expert_dim, bias=False, config=config)         # r -> D_act
         self.w_up = HBitLinear(hidden_size, expert_dim, bias=False, config=config)    # D -> D_act
         self.w_mid = HBitLinear(expert_dim, expert_dim, bias=False, config=config)    # D_act -> D_act
+        # Cold start: identity mid ≈ classic 2-mat expert body.
+        with torch.no_grad():
+            self.w_mid.weight.copy_(
+                torch.eye(expert_dim, device=self.w_mid.weight.device, dtype=self.w_mid.weight.dtype)
+            )
         self.w_down = HBitLinear(expert_dim, hidden_size, bias=False, config=config)  # D_act -> D
         # Per-expert fire bias. Warm-started ~0 so every expert fires early
         # (explore/specialize); a density loss ramps it up later to enforce

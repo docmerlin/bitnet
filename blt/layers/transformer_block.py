@@ -84,6 +84,15 @@ class TernaryMLP(nn.Module):
         self.gate_proj = HBitLinear(dim, hidden_dim, config=config)
         self.up_proj = HBitLinear(dim, hidden_dim, config=config)
         self.mid_proj = HBitLinear(hidden_dim, hidden_dim, config=config)
+        # Cold start: identity mid ≈ classic 2-mat SwiGLU path.
+        with torch.no_grad():
+            self.mid_proj.weight.copy_(
+                torch.eye(
+                    hidden_dim,
+                    device=self.mid_proj.weight.device,
+                    dtype=self.mid_proj.weight.dtype,
+                )
+            )
         self.down_proj = HBitLinear(hidden_dim, dim, config=config)
         self.dropout = config.dropout
 

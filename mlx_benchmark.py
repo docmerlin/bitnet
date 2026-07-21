@@ -31,10 +31,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reuse-recurrent-weights", action="store_true")
     parser.add_argument("--recurrent-quantized-matmul", action="store_true")
     parser.add_argument("--cmud-momentum-8bit", action="store_true")
+    parser.add_argument("--cmud-master-dtype", choices=("float32", "bfloat16"), default="bfloat16")
     parser.add_argument(
         "--gradient-checkpoint-scope",
         choices=("none", "recurrent", "all"),
         default="none",
+    )
+    parser.add_argument(
+        "--use-ffn-mid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Dense FFN square mid (3-mat). --no-use-ffn-mid = classic 2-mat SwiGLU.",
     )
     parser.add_argument("--profile-phases", action="store_true")
     return parser
@@ -90,6 +97,7 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
         use_path_kernel=args.mlx_path_kernel,
         use_engram=False,
         use_rfmoe=False,
+        use_ffn_mid=args.use_ffn_mid,
     )
     model = MLXBitNet(
         config,
@@ -105,6 +113,7 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
             block_size=args.mud_block_size,
             eight_bit=True,
             mud_eight_bit=args.cmud_momentum_8bit,
+            mud_master_dtype=args.cmud_master_dtype,
         )
         if args.optimizer == "cmud"
         else optim.AdamW(learning_rate=args.learning_rate, weight_decay=0.01)

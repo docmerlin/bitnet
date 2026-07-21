@@ -105,7 +105,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Flat unique layer count (prelude=0, recurrent=N, coda=0). "
         "Ignored when any of --num-prelude/recurrent/coda-layers is set. "
-        "Default with no structure flags: 8/48/8 looped.",
+        "Default with no structure flags: 8/32/8 looped.",
     )
     parser.add_argument(
         "--num-prelude-layers",
@@ -117,7 +117,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--num-recurrent-layers",
         type=int,
         default=None,
-        help="Unique layers in the looped middle stack (default 48).",
+        help="Unique layers in the looped middle stack (default 32).",
     )
     parser.add_argument(
         "--num-coda-layers",

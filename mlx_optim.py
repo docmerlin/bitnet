@@ -9,6 +9,7 @@ import mlx.optimizers as optim
 
 
 QUANT_BLOCK_SIZE = 2048
+MASTER_DTYPES = {"float32": mx.float32, "bfloat16": mx.bfloat16}
 
 _RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
     name="mud_rectangular_lower_solve",
@@ -153,14 +154,18 @@ class MUD(optim.Optimizer):
         weight_decay: float = 0.0,
         block_size: int | None = None,
         eight_bit: bool = False,
+        master_dtype: str = "float32",
     ):
         super().__init__()
+        if master_dtype not in MASTER_DTYPES:
+            raise ValueError(f"Unsupported master dtype: {master_dtype}")
         self._maybe_schedule("learning_rate", learning_rate)
         self.momentum = momentum
         self.passes = passes
         self.weight_decay = weight_decay
         self.block_size = block_size
         self.eight_bit = eight_bit
+        self.master_dtype = master_dtype
 
     def init_single(self, parameter: mx.array, state: dict):
         if self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE:
@@ -169,7 +174,7 @@ class MUD(optim.Optimizer):
             state["momentum_buffer_scale"] = mx.zeros((blocks,), dtype=mx.float32)
         else:
             state["momentum_buffer"] = mx.zeros(parameter.shape, dtype=mx.float32)
-        state["master_parameter"] = parameter.astype(mx.float32)
+        state["master_parameter"] = parameter.astype(MASTER_DTYPES[self.master_dtype])
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
         parameter_dtype = parameter.dtype
@@ -198,8 +203,10 @@ class MUD(optim.Optimizer):
             state.pop("momentum_buffer_q", None)
             state.pop("momentum_buffer_scale", None)
         learning_rate = self.learning_rate.astype(mx.float32)
-        master_parameter = state.get("master_parameter", parameter.astype(mx.float32))
-        master_parameter = master_parameter * (1.0 - learning_rate * self.weight_decay) - learning_rate * update
+        master_parameter = state.get("master_parameter", parameter.astype(MASTER_DTYPES[self.master_dtype]))
+        master_parameter = (
+            master_parameter * (1.0 - learning_rate * self.weight_decay) - learning_rate * update
+        ).astype(MASTER_DTYPES[self.master_dtype])
         state["master_parameter"] = master_parameter
         return master_parameter.astype(parameter_dtype)
 
@@ -249,7 +256,9 @@ class CLion(optim.Optimizer):
             state.pop("exp_avg_q", None)
             state.pop("exp_avg_scale", None)
         master_parameter = state.get("master_parameter", parameter.astype(mx.float32))
-        master_parameter = master_parameter - self.learning_rate.astype(mx.float32) * update
+        master_parameter = (
+            master_parameter - self.learning_rate.astype(mx.float32) * update
+        ).astype(mx.float32)
         state["master_parameter"] = master_parameter
         return master_parameter.astype(parameter.dtype)
 
@@ -267,10 +276,19 @@ class CMUD(optim.MultiOptimizer):
         eight_bit: bool = True,
         mud_eight_bit: bool = False,
         block_size: int | None = None,
+        mud_master_dtype: str = "float32",
     ):
         self.mud_learning_rate = mud_learning_rate
         self.fallback_learning_rate = fallback_learning_rate
-        mud = MUD(mud_learning_rate, momentum, passes, weight_decay, block_size, mud_eight_bit)
+        mud = MUD(
+            mud_learning_rate,
+            momentum,
+            passes,
+            weight_decay,
+            block_size,
+            mud_eight_bit,
+            mud_master_dtype,
+        )
         clion = CLion(fallback_learning_rate, betas, eight_bit)
         super().__init__([mud, clion], [self._is_mud_parameter])
 
@@ -296,4 +314,5 @@ class CMUD(optim.MultiOptimizer):
             "betas": [clion.beta1, clion.beta2],
             "eight_bit": clion.eight_bit,
             "mud_eight_bit": mud.eight_bit,
+            "mud_master_dtype": mud.master_dtype,
         }

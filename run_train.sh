@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # Intended research model shape (looped recurrent-depth):
 # - hidden size 1024
-# - 8 prelude + 48 unique recurrent × 4 loops + 8 coda (64 unique params)
-# - effective depth 8+192+8 = 208
+# - 8 prelude + 32 unique recurrent × 4 loops + 8 coda (48 unique params)
+# - effective depth 8+128+8 = 144
 # - 32 heads
 # - 128k hierarchical vocabulary target
 # - early broad web/data mixture
@@ -14,7 +14,7 @@ set -euo pipefail
 #
 # The defaults below assume a reasonably capable CUDA machine. If you have less
 # VRAM, reduce --sequence-length, keep --micro-batch-size at 1, and increase
-# --grad-accumulation-steps. Drop --num-loops to 1 for a flat 64-layer stack.
+# --grad-accumulation-steps. Drop --num-loops to 1 for a flat 48-layer stack.
 
 python3 train.py \
   --output-dir runs/bitnet_full \

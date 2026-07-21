@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--intermediate-size", type=int, default=1024)
+    parser.add_argument(
+        "--use-ffn-mid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Dense FFN square mid (3-mat). --no-use-ffn-mid = classic 2-mat SwiGLU.",
+    )
     parser.add_argument("--num-prelude-layers", type=int, default=2)
     parser.add_argument("--num-recurrent-layers", type=int, default=4)
     parser.add_argument("--num-coda-layers", type=int, default=2)
@@ -67,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lion-beta2", type=float, default=0.98)
     parser.add_argument("--no-optimizer-8bit", action="store_true")
     parser.add_argument("--cmud-momentum-8bit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cmud-master-dtype", choices=("float32", "bfloat16"), default="bfloat16")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-ratio", type=float, default=0.08)
@@ -504,6 +511,7 @@ def main() -> None:
             rfmoe_theta=args.rfmoe_theta,
             rfmoe_backend=args.rfmoe_backend,
             mtp_depth=args.mtp_depth,
+            use_ffn_mid=args.use_ffn_mid,
         )
     if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
         print(
@@ -516,6 +524,7 @@ def main() -> None:
     if args.resume_from and saved.get("optimizer_config"):
         optimizer = CMUD(**saved["optimizer_config"])
         args.mud_block_size = optimizer.optimizers[0].block_size
+        args.cmud_master_dtype = optimizer.optimizers[0].master_dtype
     else:
         optimizer = CMUD(
             mud_learning_rate=args.mud_learning_rate,
@@ -527,6 +536,7 @@ def main() -> None:
             betas=(args.lion_beta1, args.lion_beta2),
             eight_bit=not args.no_optimizer_8bit,
             mud_eight_bit=args.cmud_momentum_8bit,
+            mud_master_dtype=args.cmud_master_dtype,
         )
     optimizer.init(model.trainable_parameters())
     trainer_state = {
@@ -781,6 +791,17 @@ def main() -> None:
             validation = evaluate(model, validation_batches)
             if args.profile_phases and validation:
                 validation["profile_validation_seconds"] = time.perf_counter() - validation_started
+            if validation:
+                validation_row = {
+                    **validation,
+                    "step": step,
+                    "tokens_processed": trainer_state["tokens_processed"],
+                    "time": time.time(),
+                    "active_loops": active_loops,
+                    "active_blocks": active_blocks,
+                }
+                with metrics_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(validation_row, sort_keys=True) + "\n")
             print(" | ".join(f"{key}={value}" for key, value in validation.items()))
             if validation and validation["val_loss"] < trainer_state["best_val_loss"]:
                 trainer_state["best_val_loss"] = validation["val_loss"]

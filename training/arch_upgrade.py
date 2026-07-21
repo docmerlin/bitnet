@@ -1,4 +1,4 @@
-"""Helpers for soft architecture upgrades at checkpoint resume."""
+"""Helpers for FFN square-mid identity init (fresh start + soft resume)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,32 @@ def is_ffn_mid_key(key: str) -> bool:
 
 def filter_ffn_mid_keys(keys: Iterable[str]) -> List[str]:
     return [k for k in keys if is_ffn_mid_key(k)]
+
+
+@torch.no_grad()
+def copy_square_identity_(weight: torch.Tensor) -> bool:
+    """In-place set a square 2D master weight to ``I``. Returns whether applied."""
+    if weight.ndim != 2 or weight.size(0) != weight.size(1):
+        return False
+    weight.copy_(torch.eye(weight.size(0), device=weight.device, dtype=weight.dtype))
+    return True
+
+
+@torch.no_grad()
+def init_all_ffn_mid_identity(model: nn.Module) -> List[str]:
+    """Set every square FFN mid master weight on ``model`` to identity.
+
+    Used for cold starts so 3-mat FFN begins near the classic 2-mat path:
+    ``silu(I @ h)`` is a mild pointwise nonlinearity on the expanded features
+    (before ternary/Hadamard). Non-square mid tensors are left unchanged.
+    """
+    upgraded: List[str] = []
+    for name, param in model.named_parameters():
+        if not is_ffn_mid_key(name):
+            continue
+        if copy_square_identity_(param):
+            upgraded.append(name)
+    return upgraded
 
 
 @torch.no_grad()
@@ -43,8 +69,6 @@ def init_missing_ffn_mid_identity(
     for name, param in model.named_parameters():
         if name not in mid_missing:
             continue
-        if param.ndim != 2 or param.size(0) != param.size(1):
-            continue
-        param.copy_(torch.eye(param.size(0), device=param.device, dtype=param.dtype))
-        upgraded.append(name)
+        if copy_square_identity_(param):
+            upgraded.append(name)
     return upgraded

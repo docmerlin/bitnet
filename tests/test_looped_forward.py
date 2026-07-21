@@ -34,11 +34,11 @@ def _tiny_looped(
 def test_default_config_is_looped_structure() -> bool:
     cfg = TernaryConfig()
     assert cfg.num_prelude_layers == 8
-    assert cfg.num_recurrent_layers == 48
+    assert cfg.num_recurrent_layers == 32
     assert cfg.num_coda_layers == 8
     assert cfg.num_loops == 4
-    assert cfg.num_hidden_layers == 64
-    assert cfg.effective_depth == 8 + 48 * 4 + 8
+    assert cfg.num_hidden_layers == 48
+    assert cfg.effective_depth == 8 + 32 * 4 + 8
     print("Default looped TernaryConfig structure tests passed")
     return True
 

@@ -60,6 +60,10 @@ def test_blt_forward_shapes() -> bool:
     for mlp, h in ((enc_mlp, local_hidden), (glob_mlp, global_hidden), (dec_mlp, decoder_hidden)):
         assert hasattr(mlp, "mid_proj"), "TernaryMLP missing mid_proj"
         assert mlp.mid_proj.weight.shape == (h, h), mlp.mid_proj.weight.shape
+        eye = torch.eye(h, dtype=mlp.mid_proj.weight.dtype)
+        assert torch.allclose(mlp.mid_proj.weight.detach().cpu(), eye, atol=1e-5), (
+            "mid_proj must cold-start as identity"
+        )
 
     # Mid participates in backward (not dead/unused).
     model.train()

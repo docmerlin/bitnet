@@ -84,6 +84,11 @@ def _path_triangular_solve_vjp(primals, cotangent, output):
     return grad_matrix, grad_rhs
 
 
+def path_triangular_solve_transpose(matrix: mx.array, rhs: mx.array) -> mx.array:
+    """Solve ``L^T X = B`` for lower-triangular ``L`` (inference last-row path)."""
+    return _run_kernel(_UPPER_TRANSPOSE_SOLVE, matrix, rhs)
+
+
 def reference_triangular_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
     """Differentiable MLX fallback used for parity tests."""
     rows = []
@@ -95,3 +100,21 @@ def reference_triangular_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
         row = row / matrix[..., index : index + 1, index : index + 1]
         rows.append(mx.squeeze(row, axis=-2))
     return mx.stack(rows, axis=-2)
+
+
+def reference_triangular_solve_transpose(matrix: mx.array, rhs: mx.array) -> mx.array:
+    """Solve ``L^T X = B`` with a pure-MLX fallback."""
+    size = matrix.shape[-1]
+    columns = []
+    for column in range(rhs.shape[-1]):
+        rows = [None] * size
+        for index in range(size - 1, -1, -1):
+            row = rhs[..., index, column : column + 1]
+            if index + 1 < size:
+                tail = matrix[..., index + 1 :, index : index + 1]
+                previous = mx.stack([rows[inner] for inner in range(index + 1, size)], axis=-2)
+                row = row - mx.matmul(tail.swapaxes(-1, -2), previous).reshape(row.shape)
+            row = row / matrix[..., index : index + 1, index]
+            rows[index] = row
+        columns.append(mx.stack(rows, axis=-2))
+    return mx.concatenate(columns, axis=-1)

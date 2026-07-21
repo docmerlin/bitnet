@@ -109,6 +109,7 @@ def test_mlx_training_step_is_finite() -> None:
         reuse_recurrent_weights=False,
         recurrent_quantized_matmul=False,
         cmud_momentum_8bit=False,
+        cmud_master_dtype="float32",
         gradient_checkpoint_scope="none",
         profile_phases=True,
     )
@@ -139,6 +140,7 @@ def test_mlx_training_defaults_use_fast_local_batch() -> None:
     assert args.mtp_depth == 4
     assert args.recurrent_quantized_matmul
     assert args.cmud_momentum_8bit
+    assert args.cmud_master_dtype == "bfloat16"
     assert args.loop_curriculum_start_ratio == 0.0
     assert args.loop_curriculum_ratio == 0.2
     args.loop_curriculum_start_ratio = 0.3
@@ -841,3 +843,119 @@ def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> Non
     checkpoint.with_name(f"{checkpoint.stem}.optimizer.safetensors").unlink()
     with pytest.raises(FileNotFoundError, match="Missing optimizer checkpoint"):
         load_checkpoint(checkpoint, restored, restored_optimizer)
+
+
+def test_ternary_fused_linear_m1_matches_dense_effective() -> None:
+    from mlx_ternary_kernel import (
+        pack_ternary_weight,
+        ternary_effective_weight,
+        ternary_fused_linear_m1,
+    )
+
+    mx.random.seed(0)
+    weight = mx.random.normal((96, 128)).astype(mx.float32)
+    x = mx.random.normal((1, 1, 128)).astype(mx.float32)
+    packed, scales, group_size = pack_ternary_weight(weight)
+    expected = x @ ternary_effective_weight(weight).T
+    actual = ternary_fused_linear_m1(
+        x,
+        packed,
+        scales,
+        in_dim=128,
+        out_dim=96,
+        group_size=group_size,
+        quantize_acts=False,
+    )
+    # with act quant
+    levels = 7.0
+    amax = mx.maximum(mx.max(mx.abs(x), axis=-1, keepdims=True), 1e-5)
+    scale = amax / levels
+    xq = mx.clip(mx.round(x / scale), -(levels + 1), levels) * scale
+    expected_q = xq @ ternary_effective_weight(weight).T
+    actual_q = ternary_fused_linear_m1(
+        x,
+        packed,
+        scales,
+        in_dim=128,
+        out_dim=96,
+        group_size=group_size,
+        quantize_acts=True,
+        act_levels=levels,
+    )
+    mx.eval(expected, actual, expected_q, actual_q)
+    assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-4).item()
+    assert mx.allclose(actual_q, expected_q, rtol=1e-4, atol=1e-4).item()
+
+
+def test_ternary_fused_ffn_m1_matches_dense_reference() -> None:
+    from mlx_ternary_kernel import pack_ternary_weight, ternary_effective_weight, ternary_fused_ffn_m1
+
+    mx.random.seed(1)
+    hidden, inter = 64, 128
+    x = mx.random.normal((1, 1, hidden)).astype(mx.float32)
+    w_up = mx.random.normal((inter * 2, hidden)).astype(mx.float32)
+    w_mid = mx.random.normal((inter, inter)).astype(mx.float32)
+    w_down = mx.random.normal((hidden, inter)).astype(mx.float32)
+
+    def quant(t, levels=7.0):
+        amax = mx.maximum(mx.max(mx.abs(t), axis=-1, keepdims=True), 1e-5)
+        scale = amax / levels
+        return mx.clip(mx.round(t / scale), -(levels + 1), levels) * scale
+
+    u = quant(x) @ ternary_effective_weight(w_up).T
+    gate, value = mx.split(u, 2, axis=-1)
+    h = nn.silu(gate) * value
+    h = quant(h) @ ternary_effective_weight(w_mid).T
+    h = nn.silu(h)
+    expected = quant(h) @ ternary_effective_weight(w_down).T
+    up_p, mid_p, down_p = pack_ternary_weight(w_up), pack_ternary_weight(w_mid), pack_ternary_weight(w_down)
+    actual = ternary_fused_ffn_m1(
+        x,
+        up_p[0],
+        up_p[1],
+        mid_p[0],
+        mid_p[1],
+        down_p[0],
+        down_p[1],
+        hidden=hidden,
+        intermediate=inter,
+        quantize_acts=True,
+        act_levels=7.0,
+    )
+    mx.eval(expected, actual)
+    assert mx.allclose(actual, expected, rtol=1e-3, atol=1e-3).item()
+
+
+def test_hbitlinear_m1_uses_fused_ternary_path() -> None:
+    """M=1 decode path should match dense ternary effective weights."""
+    config = MLXBitNetConfig(
+        vocab_size=32,
+        hidden_size=64,
+        num_attention_heads=4,
+        intermediate_size=128,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        use_hadamard=False,
+        use_4bit_activations=True,
+    )
+    layer = MLXHBitLinear(64, 128, config)
+    layer.set_quantization_state(1.0, 1.0, 4)
+    from mlx_model import _recurrent_quantized_matmul
+
+    token = _recurrent_quantized_matmul.set(True)
+    try:
+        layer.pin_inference_weight(mx.float32, prefer_packed=True)
+    finally:
+        _recurrent_quantized_matmul.reset(token)
+    assert layer._pinned_packed is not None
+    x = mx.random.normal((1, 1, 64)).astype(mx.float32)
+    # dense reference with same prepare semantics (full act quant)
+    xq = layer.prepare_input(x)
+    from mlx_ternary_kernel import ternary_effective_weight
+
+    expected = xq @ ternary_effective_weight(layer.weight).astype(mx.float32).T
+    actual = layer(x)
+    mx.eval(expected, actual)
+    assert mx.allclose(actual, expected, rtol=1e-3, atol=1e-3).item()

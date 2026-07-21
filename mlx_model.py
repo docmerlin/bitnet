@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
@@ -13,9 +14,19 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import checkpoint as activation_checkpoint
 
-from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
+from mlx_path_kernel import (
+    path_triangular_solve,
+    path_triangular_solve_transpose,
+    reference_triangular_solve,
+    reference_triangular_solve_transpose,
+)
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
-from mlx_ternary_kernel import pack_ternary_weight, ternary_quantized_linear
+from mlx_ternary_kernel import (
+    pack_ternary_weight,
+    ternary_fused_ffn_m1,
+    ternary_fused_linear_m1,
+    ternary_quantized_linear,
+)
 
 
 _effective_weight_cache: ContextVar[dict[tuple[object, str], object] | None] = ContextVar(
@@ -23,6 +34,8 @@ _effective_weight_cache: ContextVar[dict[tuple[object, str], object] | None] = C
     default=None,
 )
 _recurrent_quantized_matmul: ContextVar[bool] = ContextVar("recurrent_quantized_matmul", default=False)
+# "last" = last-query PaTH decode (default); "recompute" = full open-chunk path_chunk baseline.
+_path_decode_mode: ContextVar[str] = ContextVar("path_decode_mode", default="last")
 
 
 @lru_cache(maxsize=32)
@@ -69,6 +82,8 @@ class MLXBitNetConfig:
     rfmoe_theta: float = 0.01
     rfmoe_backend: str = "auto"
     mtp_depth: int = 0
+    # Dense FFN: SwiGLU up/down plus optional square mid (I→I). False = classic 2-mat SwiGLU.
+    use_ffn_mid: bool = True
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads:
@@ -113,6 +128,11 @@ class MLXHBitLinear(nn.Module):
         self.activation_mix = mx.array(1.0)
         self.activation_levels = mx.array(float((2 ** (config.activation_bits - 1)) - 1))
         self.freeze(keys=["weight_mix", "activation_mix", "activation_levels"], recurse=False)
+        # Pinned inference weights: set by pin_inference_weights(); avoid per-token rematerialization.
+        self._pinned_dense: mx.array | None = None
+        self._pinned_packed: tuple | None = None
+        self._full_activation_quant = False
+        self._act_levels_f = float((2 ** (config.activation_bits - 1)) - 1)
 
     def prepare_input(self, x: mx.array) -> mx.array:
         if self.config.use_hadamard and self.input_dims & (self.input_dims - 1) == 0:
@@ -122,6 +142,8 @@ class MLXHBitLinear(nn.Module):
             negative_levels = levels + 1
             activation_scale = mx.maximum(mx.max(mx.abs(x), axis=-1, keepdims=True), 1e-5) / levels
             quantized_x = mx.clip(mx.round(x / activation_scale), -negative_levels, levels) * activation_scale
+            if self._full_activation_quant:
+                return quantized_x
             x = x + self.activation_mix * mx.stop_gradient(quantized_x - x)
         return x
 
@@ -131,7 +153,10 @@ class MLXHBitLinear(nn.Module):
         weight: mx.array | None = None,
         cache_key: object | None = None,
     ) -> mx.array:
+        if self._pinned_dense is not None and weight is None:
+            return self._pinned_dense
         cache = _effective_weight_cache.get()
+        key = None
         if cache is not None:
             key = (id(self) if weight is None else cache_key, str(dtype))
             if key[0] is not None and key in cache:
@@ -142,20 +167,95 @@ class MLXHBitLinear(nn.Module):
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
         quantized_weight = ternary * weight_scale
         effective = (weight + self.weight_mix * mx.stop_gradient(quantized_weight - weight)).astype(dtype)
-        if cache is not None and key[0] is not None:
+        if cache is not None and key is not None and key[0] is not None:
             cache[key] = effective
         return effective
 
-    def __call__(self, x: mx.array) -> mx.array:
-        x = self.prepare_input(x)
-        if _recurrent_quantized_matmul.get() and min(self.weight.shape) >= 512:
-            cache = _effective_weight_cache.get()
-            key = (id(self), f"packed-{x.dtype}")
-            packed_weight = cache.get(key) if cache is not None else None
-            if packed_weight is None:
+    def pin_inference_weight(self, dtype, *, prefer_packed: bool = True) -> None:
+        """Materialize one effective/packed weight for the whole generation lifetime."""
+        self._pinned_dense = None
+        self._pinned_packed = None
+        can_pack = (
+            prefer_packed
+            and _recurrent_quantized_matmul.get()
+            and self.weight.shape[-1] % 32 == 0
+            # Prefer packed ternary GEMV whenever packing is valid (decode M=1 path uses fused kernel).
+            and min(self.weight.shape) >= 32
+        )
+        if can_pack:
+            try:
+                self._pinned_packed = pack_ternary_weight(self.weight)
+                return
+            except ValueError:
+                self._pinned_packed = None
+        self._pinned_dense = self.effective_weight(dtype)
+
+    def clear_pinned_inference_weight(self) -> None:
+        self._pinned_dense = None
+        self._pinned_packed = None
+
+    def _packed_weight(self, x: mx.array):
+        """Return (packed, scales, group_size) from pin or generation weight cache."""
+        if self._pinned_packed is not None:
+            return self._pinned_packed
+        if not (_recurrent_quantized_matmul.get() and self.weight.shape[-1] % 32 == 0):
+            return None
+        cache = _effective_weight_cache.get()
+        key = (id(self), f"packed-{x.dtype}")
+        packed_weight = cache.get(key) if cache is not None else None
+        if packed_weight is None:
+            try:
                 packed_weight = pack_ternary_weight(self.weight)
-                if cache is not None:
-                    cache[key] = packed_weight
+            except ValueError:
+                return None
+            if cache is not None:
+                cache[key] = packed_weight
+        return packed_weight
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Decode fast path: M=1 fused act-quant + ternary add/sub GEMV (one Metal dispatch).
+        in_dim = int(self.weight.shape[1])
+        out_dim = int(self.weight.shape[0])
+        tokens = int(x.size // max(in_dim, 1))
+        # Custom ternary M=1 kernel helps small/medium shapes (launch-bound + fused act quant).
+        # At 1B widths (K/N ~1024+) mx.quantized_matmul is faster — skip the custom GEMV.
+        use_fused_m1 = (
+            tokens == 1
+            and in_dim <= 512
+            and out_dim <= 1024
+            and in_dim % 32 == 0
+        )
+        if use_fused_m1:
+            packed_weight = self._packed_weight(x)
+            if packed_weight is not None:
+                packed, scales, group_size = packed_weight
+                if self.config.use_hadamard and in_dim & (in_dim - 1) == 0:
+                    x = mx.hadamard_transform(x)
+                if self.config.use_4bit_activations and not self._full_activation_quant:
+                    # Partial quant mix (training): keep STE prepare + generic quantized matmul.
+                    x = self.prepare_input(x)
+                    return ternary_quantized_linear(x, self.weight, packed, scales)
+                quantize_acts = bool(self.config.use_4bit_activations and self._full_activation_quant)
+                return ternary_fused_linear_m1(
+                    x,
+                    packed,
+                    scales,
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    group_size=int(group_size),
+                    quantize_acts=quantize_acts,
+                    act_levels=self._act_levels_f,
+                    dtype=x.dtype,
+                )
+
+        x = self.prepare_input(x)
+        if self._pinned_packed is not None:
+            packed, scales, _ = self._pinned_packed
+            return ternary_quantized_linear(x, self.weight, packed, scales)
+        if self._pinned_dense is not None:
+            return x @ self._pinned_dense.T
+        packed_weight = self._packed_weight(x)
+        if packed_weight is not None:
             packed, scales, _ = packed_weight
             return ternary_quantized_linear(x, self.weight, packed, scales)
         return x @ self.effective_weight(x.dtype).T
@@ -163,7 +263,11 @@ class MLXHBitLinear(nn.Module):
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
         self.weight_mix = mx.array(weight_mix)
         self.activation_mix = mx.array(activation_mix)
-        self.activation_levels = mx.array(float((2 ** (max(bits, 2) - 1)) - 1))
+        levels = float((2 ** (max(bits, 2) - 1)) - 1)
+        self.activation_levels = mx.array(levels)
+        self._act_levels_f = levels
+        self._full_activation_quant = activation_mix >= 1.0
+        self.clear_pinned_inference_weight()
 
 
 class MLXEngram(nn.Module):
@@ -313,13 +417,20 @@ class MLXEngram(nn.Module):
             ids = mx.concatenate((padding, ids), axis=1)
         value, normalized = self._values(hidden_states, ids, None, 1)
         history = cache.normalized
-        convolved = normalized * self.short_conv_weight[:, -1]
-        for lag in range(1, self.config.engram_kernel_size):
+        kernel = self.config.engram_kernel_size
+        convolved = normalized * self.short_conv_weight[:, kernel - 1]
+        for lag in range(1, kernel):
             if history is not None and history.shape[1] >= lag:
                 index = history.shape[1] - lag
-                convolved = convolved + history[:, index : index + 1] * self.short_conv_weight[:, -1 - lag]
-        cache.normalized = normalized if history is None else mx.concatenate((history, normalized), axis=1)
-        cache.normalized = cache.normalized[:, -(self.config.engram_kernel_size - 1) :]
+                convolved = convolved + history[:, index : index + 1] * self.short_conv_weight[:, kernel - 1 - lag]
+        if history is None:
+            cache.normalized = normalized
+        else:
+            cache.normalized = mx.concatenate((history, normalized), axis=1)
+        keep = self.config.engram_kernel_size - 1
+        if cache.normalized.shape[1] > keep:
+            start = cache.normalized.shape[1] - keep
+            cache.normalized = cache.normalized[:, start : start + keep]
         return value + nn.silu(convolved)
 
 
@@ -339,6 +450,8 @@ class MLXRFMoEExpert(nn.Module):
         self.b_gate = MLXHBitLinear(rank, expert_dim, config)
         self.w_up = MLXHBitLinear(hidden, expert_dim, config)
         self.w_mid = MLXHBitLinear(expert_dim, expert_dim, config)
+        # Cold start: identity mid ≈ classic 2-mat expert body.
+        self.w_mid.weight = mx.eye(expert_dim, dtype=self.w_mid.weight.dtype)
         self.w_down = MLXHBitLinear(expert_dim, hidden, config)
         self.bias = mx.array([1e-6])
 
@@ -777,13 +890,16 @@ class MLXPaTHAttention(nn.Module):
 
         projected = self.path_up(self.path_down(x))
         convolved = projected * self.path_conv_weight[:, 2]
-        if cache.path_projected is not None:
+        if cache.path_projected is not None and cache.path_projected.shape[1] > 0:
             history = cache.path_projected
-            if history.shape[1] >= 1:
-                convolved = convolved + history[:, -1:] * self.path_conv_weight[:, 1]
-            if history.shape[1] >= 2:
-                convolved = convolved + history[:, -2:-1] * self.path_conv_weight[:, 0]
-            cache.path_projected = mx.concatenate((history, projected), axis=1)[:, -2:]
+            hist_len = history.shape[1]
+            if hist_len >= 1:
+                convolved = convolved + history[:, hist_len - 1 : hist_len] * self.path_conv_weight[:, 1]
+            if hist_len >= 2:
+                convolved = convolved + history[:, hist_len - 2 : hist_len - 1] * self.path_conv_weight[:, 0]
+            combined = mx.concatenate((history, projected), axis=1)
+            clen = combined.shape[1]
+            cache.path_projected = combined if clen <= 2 else combined[:, clen - 2 : clen]
         else:
             cache.path_projected = projected
         w = nn.silu(convolved.astype(mx.float32)).reshape(
@@ -794,17 +910,31 @@ class MLXPaTHAttention(nn.Module):
         forget_logits = self.path_forget(x).astype(mx.float32)
         log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
 
-        cache.q = q if cache.q is None else mx.concatenate((cache.q, q), axis=2)
-        cache.k = k if cache.k is None else mx.concatenate((cache.k, k), axis=2)
-        cache.v = v if cache.v is None else mx.concatenate((cache.v, v), axis=2)
-        cache.w = w if cache.w is None else mx.concatenate((cache.w, w), axis=1)
-        cache.beta = beta if cache.beta is None else mx.concatenate((cache.beta, beta), axis=1)
-        cache.log_forget = (
-            log_forget if cache.log_forget is None else mx.concatenate((cache.log_forget, log_forget), axis=1)
-        )
+        if cache.q is None or cache.open_len == 0:
+            cache.q, cache.k, cache.v = q, k, v
+            cache.w, cache.beta, cache.log_forget = w, beta, log_forget
+            cache.open_len = 1
+            cache.t_inverse = None
+        else:
+            cache.q = mx.concatenate((cache.q, q), axis=2)
+            cache.k = mx.concatenate((cache.k, k), axis=2)
+            cache.v = mx.concatenate((cache.v, v), axis=2)
+            cache.w = mx.concatenate((cache.w, w), axis=1)
+            cache.beta = mx.concatenate((cache.beta, beta), axis=1)
+            cache.log_forget = mx.concatenate((cache.log_forget, log_forget), axis=1)
+            cache.open_len = cache.open_len + 1
 
-        local = self.path_chunk(cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, None)
-        local = local[:, :, -1:]
+        if _path_decode_mode.get() == "recompute":
+            full = self.path_chunk(cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, None)
+            last = cache.open_len - 1
+            local = full[:, :, last : last + 1]
+            # Keep running T in sync for mixed-mode / branch clones.
+            cache.t_inverse = self.path_system_t_inverse(cache.w, cache.beta)
+        else:
+            cache.t_inverse = self.path_border_update_t(cache.t_inverse, cache.w, cache.beta)
+            local = self.path_chunk_last_with_t(
+                cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, cache.t_inverse, None
+            )
         scores = q.astype(mx.float32) @ cache.memory_k.swapaxes(-1, -2)
         scores = scores * self.head_dim**-0.5
         memory_context = mx.softmax(scores, axis=-1).astype(v.dtype) @ cache.memory_v.astype(v.dtype)
@@ -814,7 +944,7 @@ class MLXPaTHAttention(nn.Module):
         context = local.transpose(0, 2, 1, 3).reshape(batch, 1, hidden)
 
         chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
-        if cache.q.shape[2] == chunk_width:
+        if cache.open_len == chunk_width:
             if update_memory:
                 cache.memory_k, cache.memory_v, cache.memory_initialized = self._next_memory(
                     cache.k,
@@ -886,6 +1016,8 @@ class MLXPaTHAttention(nn.Module):
             else:
                 cache.q, cache.k, cache.v = chunk_q, chunk_k, chunk_v
                 cache.w, cache.beta, cache.log_forget = chunk_w, chunk_beta, chunk_forget
+                cache.open_len = chunk_q.shape[2]
+                cache.t_inverse = self.path_system_t_inverse(cache.w, cache.beta)
             offset += take
         context = mx.concatenate(outputs, axis=2).transpose(0, 2, 1, 3).reshape(batch, length, hidden)
         return self.out(context)
@@ -934,10 +1066,22 @@ class MLXPaTHAttention(nn.Module):
                 cache.w = w[:, start:end]
                 cache.beta = beta[:, start:end]
                 cache.log_forget = log_forget[:, start:end]
+                cache.open_len = end - start
+                cache.t_inverse = self.path_system_t_inverse(cache.w, cache.beta)
             chunks.append(local)
-        cache.path_projected = projected[:, -2:]
+        plen = projected.shape[1]
+        cache.path_projected = projected if plen <= 2 else projected[:, plen - 2 : plen]
         context = mx.concatenate(chunks, axis=2).transpose(0, 2, 1, 3).reshape(batch, length, hidden)
         return self.out(context)
+
+    def _path_solve(self, system: mx.array, diagonal: mx.array, *, compile_friendly: bool = False) -> mx.array:
+        """Triangular solve. Raw Metal is compile-friendly; custom_function keeps train VJP."""
+        if self.config.use_path_kernel:
+            if compile_friendly:
+                from mlx_path_kernel import _run_kernel, _LOWER_SOLVE
+                return _run_kernel(_LOWER_SOLVE, system, diagonal)
+            return path_triangular_solve(system, diagonal)
+        return reference_triangular_solve(system, diagonal)
 
     def path_chunk(
         self,
@@ -957,8 +1101,7 @@ class MLXPaTHAttention(nn.Module):
         eye = mx.eye(length, dtype=mx.float32)
         system = eye + mx.tril(beta[..., None] * gram, k=-1)
         diagonal = eye * beta[..., :, None]
-        solve = path_triangular_solve if self.config.use_path_kernel else reference_triangular_solve
-        t_inverse = solve(system, diagonal)
+        t_inverse = self._path_solve(system, diagonal, compile_friendly=False)
         qk = qf @ kf.transpose(0, 1, 3, 2)
         qw = mx.tril(qf @ wf.transpose(0, 1, 3, 2))
         wk = mx.tril(wf @ kf.transpose(0, 1, 3, 2), k=-1)
@@ -970,6 +1113,92 @@ class MLXPaTHAttention(nn.Module):
             keep = keep & (segment_ids[:, None, :, None] == segment_ids[:, None, None, :])
         logits = mx.where(keep, logits, -1e9)
         return mx.softmax(logits, axis=-1).astype(v.dtype) @ v
+
+    def path_system_t_inverse(self, w: mx.array, beta: mx.array) -> mx.array:
+        """Full open-chunk T = S^{-1} D (used to seed running state after prefill/extend)."""
+        length = w.shape[1]
+        wf = w.transpose(0, 2, 1, 3).astype(mx.float32)
+        beta_h = beta.transpose(0, 2, 1).astype(mx.float32)
+        gram = wf @ wf.transpose(0, 1, 3, 2)
+        eye = mx.eye(length, dtype=mx.float32)
+        system = eye + mx.tril(beta_h[..., None] * gram, k=-1)
+        diagonal = eye * beta_h[..., :, None]
+        return self._path_solve(system, diagonal, compile_friendly=True)
+
+    def path_border_update_t(
+        self,
+        t_prev: mx.array | None,
+        w: mx.array,
+        beta: mx.array,
+    ) -> mx.array:
+        """Grow T by one token via lower-triangular border update (O(L^2), not O(L^3)).
+
+        For S = [[S_prev, 0], [s^T, 1]] and D = diag(beta):
+        T = [[T_prev, 0], [-s^T T_prev, beta_new]] with s_j = beta_new (w_new · w_j).
+        """
+        length = w.shape[1]
+        batch = w.shape[0]
+        heads = self.config.num_attention_heads
+        beta_h = beta.transpose(0, 2, 1).astype(mx.float32)  # B,H,L
+        beta_new = beta_h[:, :, length - 1]  # B,H
+        if length == 1 or t_prev is None:
+            return beta_new[:, :, None, None]
+        wf = w.transpose(0, 2, 1, 3).astype(mx.float32)  # B,H,L,D
+        w_new = wf[:, :, length - 1 : length, :]  # B,H,1,D
+        w_prev = wf[:, :, : length - 1, :]  # B,H,L-1,D
+        # s_j = beta_new * (w_new · w_j)
+        dots = mx.sum(w_new * w_prev, axis=-1)  # B,H,L-1
+        s = beta_new[:, :, None] * dots  # B,H,L-1
+        # t_row = -s @ T_prev  -> (B,H,L-1)
+        t_row = -mx.sum(s[:, :, :, None] * t_prev, axis=2)
+        zeros_col = mx.zeros((batch, heads, length - 1, 1), dtype=mx.float32)
+        top = mx.concatenate((t_prev, zeros_col), axis=-1)
+        bottom = mx.concatenate((t_row[:, :, None, :], beta_new[:, :, None, None]), axis=-1)
+        return mx.concatenate((top, bottom), axis=2)
+
+    def path_chunk_last_with_t(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        w: mx.array,
+        beta: mx.array,
+        log_forget: mx.array,
+        t_inverse: mx.array,
+        segment_ids: mx.array | None = None,
+    ) -> mx.array:
+        """Last-query PaTH using a provided running T (no system rebuild or re-solve)."""
+        length = q.shape[2]
+        qf, kf = q.astype(mx.float32), k.astype(mx.float32)
+        wf = w.transpose(0, 2, 1, 3).astype(mx.float32)
+        q_last = qf[:, :, length - 1 : length]
+        qk = q_last @ kf.transpose(0, 1, 3, 2)
+        qw_last = q_last @ wf.transpose(0, 1, 3, 2)
+        wk = mx.tril(wf @ kf.transpose(0, 1, 3, 2), k=-1)
+        corrected = (qw_last @ t_inverse) @ wk
+        logits = (qk - corrected) * self.head_dim**-0.5
+        prefix = mx.cumsum(log_forget.transpose(0, 2, 1).astype(mx.float32), axis=-1)
+        logits = logits + prefix[:, :, length - 1 : length, None] - prefix[:, :, None, :]
+        if segment_ids is not None:
+            keep = segment_ids[:, None, length - 1 : length, None] == segment_ids[:, None, None, :]
+            logits = mx.where(keep, logits, -1e9)
+        return mx.softmax(logits, axis=-1).astype(v.dtype) @ v
+
+    def path_chunk_last(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        w: mx.array,
+        beta: mx.array,
+        log_forget: mx.array,
+        segment_ids: mx.array | None,
+        t_inverse: mx.array | None = None,
+    ) -> mx.array:
+        """Last-query PaTH; uses running T when provided, else seeds T then attends."""
+        if t_inverse is None:
+            t_inverse = self.path_system_t_inverse(w, beta)
+        return self.path_chunk_last_with_t(q, k, v, w, beta, log_forget, t_inverse, segment_ids)
 
     def forward_arrays(
         self,
@@ -1060,9 +1289,14 @@ class MLXPaTHInferenceCache:
     w: mx.array | None = None
     beta: mx.array | None = None
     log_forget: mx.array | None = None
+    # Running S^{-1} D for the open chunk; border-updated O(L^2) per decode token.
+    t_inverse: mx.array | None = None
+    open_len: int = 0
 
     def clear_open_chunk(self) -> None:
         self.q = self.k = self.v = self.w = self.beta = self.log_forget = None
+        self.t_inverse = None
+        self.open_len = 0
 
     def clone(self) -> "MLXPaTHInferenceCache":
         return MLXPaTHInferenceCache(
@@ -1076,6 +1310,8 @@ class MLXPaTHInferenceCache:
             self.w,
             self.beta,
             self.log_forget,
+            self.t_inverse,
+            self.open_len,
         )
 
     def arrays(self) -> list[mx.array]:
@@ -1092,6 +1328,7 @@ class MLXPaTHInferenceCache:
                 self.w,
                 self.beta,
                 self.log_forget,
+                self.t_inverse,
             )
             if value is not None
         ]
@@ -1111,15 +1348,60 @@ class MLXHybridBlock(nn.Module):
         self.moe = MLXRFMoE(config) if config.use_rfmoe else None
         if self.moe is None:
             self.up = MLXHBitLinear(hidden, intermediate * 2, config)
-            self.mid = MLXHBitLinear(intermediate, intermediate, config)
+            self.mid = (
+                MLXHBitLinear(intermediate, intermediate, config)
+                if config.use_ffn_mid
+                else None
+            )
+            # Cold start: identity mid ≈ classic 2-mat path (silu pass-through on expand).
+            if self.mid is not None:
+                self.mid.weight = mx.eye(intermediate, dtype=self.mid.weight.dtype)
             self.down = MLXHBitLinear(intermediate, hidden, config)
             self.down.weight = self.down.weight * 0.01
         self.mlp_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.mlp_scale = mx.array([0.1])
 
     def _dense_mlp(self, x: mx.array) -> mx.array:
+        # Decode M=1: one Metal dispatch for up + mid + down ternary FFN.
+        hidden = int(x.shape[-1])
+        tokens = int(x.size // max(hidden, 1))
+        inter = int(self.mid.weight.shape[0]) if self.mid is not None else 0
+        # Fused FFN shared-memory kernel is for small/medium widths; 1B (h=1024, I=2048) uses qmm.
+        if (
+            self.mid is not None
+            and tokens == 1
+            and hidden <= 512
+            and inter <= 1024
+            and self.up._full_activation_quant
+            and self.mid._full_activation_quant
+            and self.down._full_activation_quant
+        ):
+            up_p = self.up._packed_weight(x)
+            mid_p = self.mid._packed_weight(x)
+            down_p = self.down._packed_weight(x)
+            if up_p is not None and mid_p is not None and down_p is not None:
+                try:
+                    return ternary_fused_ffn_m1(
+                        x,
+                        up_p[0],
+                        up_p[1],
+                        mid_p[0],
+                        mid_p[1],
+                        down_p[0],
+                        down_p[1],
+                        hidden=hidden,
+                        intermediate=inter,
+                        quantize_acts=bool(self.up.config.use_4bit_activations),
+                        act_levels=self.up._act_levels_f,
+                        dtype=x.dtype,
+                    )
+                except ValueError:
+                    pass
         gate, value = mx.split(self.up(x), 2, axis=-1)
-        return self.down(nn.silu(self.mid(nn.silu(gate) * value)))
+        hidden_act = nn.silu(gate) * value
+        if self.mid is not None:
+            hidden_act = nn.silu(self.mid(hidden_act))
+        return self.down(hidden_act)
 
     def new_inference_cache(self, batch_size: int) -> "MLXBlockInferenceCache":
         return MLXBlockInferenceCache(
@@ -1231,14 +1513,16 @@ class MLXInferenceCache:
     layers: list[MLXBlockInferenceCache]
     token_history: mx.array
     num_loops: int
+    weight_cache: dict[tuple[object, str], object]
     position: int = 0
 
     def clone(self) -> "MLXInferenceCache":
         return MLXInferenceCache(
-            [layer.clone() for layer in self.layers],
-            self.token_history,
-            self.num_loops,
-            self.position,
+            layers=[layer.clone() for layer in self.layers],
+            token_history=self.token_history,
+            num_loops=self.num_loops,
+            weight_cache=self.weight_cache,
+            position=self.position,
         )
 
     def arrays(self) -> list[mx.array]:
@@ -1259,6 +1543,8 @@ class MLXBitNet(nn.Module):
         self.config = config
         self.reuse_recurrent_weights = reuse_recurrent_weights
         self.recurrent_quantized_matmul = recurrent_quantized_matmul
+        self.path_decode_mode = "last"
+        self._compiled_inference_step = None
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.subln = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.blocks = [MLXHybridBlock(config, layer_id) for layer_id in range(config.num_hidden_layers)]
@@ -1291,6 +1577,38 @@ class MLXBitNet(nn.Module):
         for block in self.blocks:
             block.attn.fixed_block_width = width
 
+    def pin_inference_weights(self, dtype=None, *, prefer_packed: bool = True) -> None:
+        """Pin one effective/packed weight per HBitLinear for the generation lifetime."""
+        if dtype is None:
+            sample = self.embedding.weight
+            dtype = sample.dtype
+        token = _recurrent_quantized_matmul.set(self.recurrent_quantized_matmul)
+        try:
+            def pin(_, module):
+                if isinstance(module, MLXHBitLinear):
+                    module.pin_inference_weight(dtype, prefer_packed=prefer_packed)
+
+            self.apply_to_modules(pin)
+            pinned = [
+                module._pinned_dense
+                for _, module in self.named_modules()
+                if isinstance(module, MLXHBitLinear) and module._pinned_dense is not None
+            ]
+            packed = [
+                module._pinned_packed[0]
+                for _, module in self.named_modules()
+                if isinstance(module, MLXHBitLinear) and module._pinned_packed is not None
+            ]
+            if pinned or packed:
+                mx.eval(*(pinned + packed))
+        finally:
+            _recurrent_quantized_matmul.reset(token)
+
+    def set_path_decode_mode(self, mode: str) -> None:
+        if mode not in {"last", "recompute"}:
+            raise ValueError("path decode mode must be 'last' or 'recompute'")
+        self.path_decode_mode = mode
+
     def new_inference_cache(self, batch_size: int = 1, num_loops: int | None = None) -> MLXInferenceCache:
         loops = self.config.num_loops if num_loops is None else num_loops
         prelude_end = self.config.num_prelude_layers
@@ -1301,12 +1619,228 @@ class MLXBitNet(nn.Module):
             *self.blocks[recurrent_end:],
         ]
         return MLXInferenceCache(
-            [block.new_inference_cache(batch_size) for block in execution],
-            mx.zeros((batch_size, 0), dtype=mx.int32),
-            loops,
+            layers=[block.new_inference_cache(batch_size) for block in execution],
+            token_history=mx.zeros((batch_size, 0), dtype=mx.int32),
+            num_loops=loops,
+            weight_cache={},
         )
 
+    @contextmanager
+    def _inference_weight_context(self, cache: MLXInferenceCache):
+        weight_token = _effective_weight_cache.set(cache.weight_cache if self.reuse_recurrent_weights else None)
+        quantized_token = _recurrent_quantized_matmul.set(self.recurrent_quantized_matmul)
+        mode = getattr(self, "path_decode_mode", "last")
+        path_token = _path_decode_mode.set(mode)
+        try:
+            yield
+        finally:
+            _effective_weight_cache.reset(weight_token)
+            _recurrent_quantized_matmul.reset(quantized_token)
+            _path_decode_mode.reset(path_token)
+
     def inference_step(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
+        with self._inference_weight_context(cache):
+            step = getattr(self, "_compiled_inference_step", None)
+            if step is not None:
+                return step(tokens, cache)
+            return self._inference_step(tokens, cache)
+
+    def _cache_layout(self, cache: MLXInferenceCache) -> list[bool]:
+        return [layer.engram is not None for layer in cache.layers]
+
+    def _flatten_inference_cache(self, cache: MLXInferenceCache) -> list[mx.array]:
+        batch = cache.token_history.shape[0]
+        hidden = self.config.hidden_size
+        heads = self.config.num_attention_heads
+        head_dim = hidden // heads
+        dtype = self.embedding.weight.dtype
+        arrays: list[mx.array] = [cache.token_history]
+        for layer in cache.layers:
+            att = layer.attention
+            arrays.extend([att.memory_k, att.memory_v, att.memory_initialized])
+            arrays.append(
+                att.path_projected
+                if att.path_projected is not None
+                else mx.zeros((batch, 0, hidden), dtype=dtype)
+            )
+            arrays.append(att.q if att.q is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
+            arrays.append(att.k if att.k is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
+            arrays.append(att.v if att.v is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
+            arrays.append(att.w if att.w is not None else mx.zeros((batch, 0, heads, head_dim), dtype=dtype))
+            arrays.append(att.beta if att.beta is not None else mx.zeros((batch, 0, heads), dtype=mx.float32))
+            arrays.append(
+                att.log_forget if att.log_forget is not None else mx.zeros((batch, 0, heads), dtype=mx.float32)
+            )
+            open_len = 0 if att.q is None else att.q.shape[2]
+            if att.t_inverse is not None:
+                arrays.append(att.t_inverse)
+            else:
+                arrays.append(mx.zeros((batch, heads, open_len, open_len), dtype=mx.float32))
+            if layer.engram is not None:
+                eng = layer.engram.normalized
+                if eng is None:
+                    eng_dim = self.config.engram_num_heads * self.config.engram_head_dim
+                    eng = mx.zeros((batch, 0, eng_dim), dtype=dtype)
+                arrays.append(eng)
+        return arrays
+
+    def _unflatten_inference_cache(
+        self,
+        arrays: list[mx.array],
+        layout: list[bool],
+        num_loops: int,
+        weight_cache: dict,
+        position: int,
+    ) -> MLXInferenceCache:
+        idx = 0
+        token_history = arrays[idx]
+        idx += 1
+        layers: list[MLXBlockInferenceCache] = []
+
+        def nonempty(array: mx.array, axis: int):
+            return None if array.shape[axis] == 0 else array
+
+        for has_engram in layout:
+            memory_k, memory_v, memory_initialized = arrays[idx], arrays[idx + 1], arrays[idx + 2]
+            idx += 3
+            path_projected = arrays[idx]
+            idx += 1
+            q, k, v, w, beta, log_forget = arrays[idx : idx + 6]
+            idx += 6
+            q_arr = nonempty(q, 2)
+            t_inv = arrays[idx]
+            idx += 1
+            open_len = 0 if q_arr is None else int(q_arr.shape[2])
+            attention = MLXPaTHInferenceCache(
+                memory_k,
+                memory_v,
+                memory_initialized,
+                nonempty(path_projected, 1),
+                q_arr,
+                nonempty(k, 2),
+                nonempty(v, 2),
+                nonempty(w, 1),
+                nonempty(beta, 1),
+                nonempty(log_forget, 1),
+                t_inverse=None if open_len == 0 else t_inv,
+                open_len=open_len,
+            )
+            engram = None
+            if has_engram:
+                eng = arrays[idx]
+                idx += 1
+                engram = MLXEngramInferenceCache(nonempty(eng, 1))
+            layers.append(MLXBlockInferenceCache(attention, engram))
+        return MLXInferenceCache(layers, token_history, num_loops, weight_cache, position)
+
+    def _apply_flat_to_inference_cache(self, cache: MLXInferenceCache, arrays: list[mx.array]) -> None:
+        """Write functionalized step outputs back into an existing cache (no realloc of layer list)."""
+        idx = 0
+        cache.token_history = arrays[idx]
+        idx += 1
+        for layer in cache.layers:
+            att = layer.attention
+            att.memory_k = arrays[idx]
+            att.memory_v = arrays[idx + 1]
+            att.memory_initialized = arrays[idx + 2]
+            idx += 3
+            pp = arrays[idx]
+            idx += 1
+            q, k, v, w, beta, log_forget = arrays[idx : idx + 6]
+            idx += 6
+            t_inv = arrays[idx]
+            idx += 1
+            att.path_projected = None if pp.shape[1] == 0 else pp
+            att.q = None if q.shape[2] == 0 else q
+            att.k = None if k.shape[2] == 0 else k
+            att.v = None if v.shape[2] == 0 else v
+            att.w = None if w.shape[1] == 0 else w
+            att.beta = None if beta.shape[1] == 0 else beta
+            att.log_forget = None if log_forget.shape[1] == 0 else log_forget
+            att.open_len = 0 if att.q is None else att.q.shape[2]
+            att.t_inverse = None if att.open_len == 0 else t_inv
+            if layer.engram is not None:
+                eng = arrays[idx]
+                idx += 1
+                layer.engram.normalized = None if eng.shape[1] == 0 else eng
+
+    def enable_compiled_inference(self) -> bool:
+
+        """Enable functionalized compiled steps specialized lazily by open-chunk length."""
+        self._compiled_inference_step = None
+        self._compiled_by_open_len = None
+        try:
+            # Dense pins avoid custom quantized transforms that break mx.compile.
+            for _, module in self.named_modules():
+                if isinstance(module, MLXHBitLinear):
+                    module.pin_inference_weight(self.embedding.weight.dtype, prefer_packed=False)
+            loops = getattr(self, "inference_num_loops", self.config.num_loops)
+            width = max(1, int(self.blocks[0].attn.fixed_block_width or self.config.path_window_size))
+            width = min(width, self.config.path_window_size)
+            probe = self.new_inference_cache(num_loops=loops)
+            layout = self._cache_layout(probe)
+            weight_cache = probe.weight_cache
+            compiled: dict[int, object] = {}
+
+            def compile_open_before(open_before: int):
+                if open_before in compiled:
+                    return compiled[open_before]
+
+                def pure_step(step_tokens: mx.array, *flat: mx.array):
+                    cache = self._unflatten_inference_cache(
+                        list(flat), layout, loops, weight_cache, position=1
+                    )
+                    for layer in cache.layers:
+                        layer.attention.open_len = (
+                            0 if layer.attention.q is None else layer.attention.q.shape[2]
+                        )
+                    with self._inference_weight_context(cache):
+                        hidden = self._inference_step(step_tokens, cache)
+                    return (hidden, *self._flatten_inference_cache(cache))
+
+                warm = self.new_inference_cache(num_loops=loops)
+                if open_before:
+                    pref = mx.array([list(range(1, open_before + 1))], dtype=mx.int32)
+                    with self._inference_weight_context(warm):
+                        states = self._prefill(pref, warm)
+                        mx.eval(states, *warm.arrays())
+                for layer in warm.layers:
+                    layer.attention.open_len = 0 if layer.attention.q is None else layer.attention.q.shape[2]
+                compiled_fn = mx.compile(pure_step)
+                flat = self._flatten_inference_cache(warm)
+                out = compiled_fn(mx.array([[10_000 + open_before]], dtype=mx.int32), *flat)
+                mx.eval(out[0])
+                compiled[open_before] = compiled_fn
+                return compiled_fn
+
+            # Eagerly specialize every open length so decode does not pay first-use compile cost.
+            for open_before in range(width):
+                compile_open_before(open_before)
+
+            def step(tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
+                open_before = 0 if cache.layers[0].attention.q is None else cache.layers[0].attention.q.shape[2]
+                open_before = int(open_before)
+                if open_before < 0 or open_before >= width:
+                    return self._inference_step(tokens, cache)
+                fn = compile_open_before(open_before)
+                flat_in = self._flatten_inference_cache(cache)
+                result = fn(tokens, *flat_in)
+                mx.eval(result)
+                hidden = result[0]
+                self._apply_flat_to_inference_cache(cache, list(result[1:]))
+                cache.position += 1
+                return hidden
+
+            self._compiled_inference_step = step
+            self._compiled_by_open_len = compiled
+            return True
+        except Exception:
+            self._compiled_inference_step = None
+            self._compiled_by_open_len = None
+            return False
+
+
+    def _inference_step(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
         if tokens.ndim != 2 or tokens.shape[1] != 1:
             raise ValueError("inference_step requires one token per batch row")
         x = self.subln(self.embedding(tokens))
@@ -1336,13 +1870,21 @@ class MLXBitNet(nn.Module):
         for block in self.blocks[recurrent_end:]:
             x = block.incremental(x, tokens, cache.token_history, cache.layers[cache_index], True)
             cache_index += 1
-        cache.token_history = mx.concatenate((cache.token_history, tokens), axis=1)[
-            :, -(self.config.engram_max_ngram_size - 1) :
-        ]
+        history_keep = self.config.engram_max_ngram_size - 1
+        combined_history = mx.concatenate((cache.token_history, tokens), axis=1)
+        if combined_history.shape[1] > history_keep:
+            start = combined_history.shape[1] - history_keep
+            cache.token_history = combined_history[:, start : start + history_keep]
+        else:
+            cache.token_history = combined_history
         cache.position += 1
         return self.norm(x)
 
     def inference_extend(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
+        with self._inference_weight_context(cache):
+            return self._inference_extend(tokens, cache)
+
+    def _inference_extend(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
         if tokens.ndim != 2 or tokens.shape[1] < 1:
             raise ValueError("inference_extend requires a non-empty rank-2 token array")
         x = self.subln(self.embedding(tokens))
@@ -1379,6 +1921,10 @@ class MLXBitNet(nn.Module):
         return self.norm(x)
 
     def prefill(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
+        with self._inference_weight_context(cache):
+            return self._prefill(tokens, cache)
+
+    def _prefill(self, tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
         if tokens.ndim != 2 or tokens.shape[1] < 1:
             raise ValueError("prefill requires a non-empty rank-2 token array")
         if cache.position:

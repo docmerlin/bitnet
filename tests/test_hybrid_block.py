@@ -103,6 +103,10 @@ def test_hybrid_block():
     assert block.ffn_up.weight.shape == (inter * 2, d), block.ffn_up.weight.shape
     assert block.ffn_mid.weight.shape == (inter, inter), block.ffn_mid.weight.shape
     assert block.ffn_down.weight.shape == (d, inter), block.ffn_down.weight.shape
+    eye = torch.eye(inter, dtype=block.ffn_mid.weight.dtype)
+    assert torch.allclose(block.ffn_mid.weight.detach().cpu(), eye, atol=1e-5), (
+        "ffn_mid must cold-start as identity"
+    )
 
     # Test 3: Learned gate is between 0 and 1
     gate_value = torch.sigmoid(block.gate)
