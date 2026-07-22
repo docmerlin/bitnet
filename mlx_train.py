@@ -49,6 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Dense FFN square mid (3-mat). --no-use-ffn-mid = classic 2-mat SwiGLU.",
     )
+    parser.add_argument(
+        "--attn-res-mode",
+        choices=("kimi", "sandwich"),
+        default="kimi",
+        help="Residual path: kimi Block AttnRes (default) or legacy sandwich.",
+    )
+    parser.add_argument(
+        "--attn-res-group-size",
+        type=int,
+        default=None,
+        help="Transformer layers per AttnRes depth-block (default: unique_layers//8).",
+    )
     parser.add_argument("--num-prelude-layers", type=int, default=2)
     parser.add_argument("--num-recurrent-layers", type=int, default=4)
     parser.add_argument("--num-coda-layers", type=int, default=2)
@@ -86,7 +98,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
     parser.add_argument("--engram", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--engram-layer-ids", default="1,15")
-    parser.add_argument("--engram-vocab-size", type=int, default=4093)
+    parser.add_argument(
+        "--engram-vocab-size",
+        type=int,
+        default=None,
+        help="Engram table slots; default auto-sizes to ~engram-param-fraction of body.",
+    )
+    parser.add_argument(
+        "--engram-param-fraction",
+        type=float,
+        default=0.05,
+        help="When engram-vocab-size is omitted, target Engram/body params (default 0.05).",
+    )
     parser.add_argument("--use-rfmoe", action="store_true")
     parser.add_argument("--rfmoe-num-experts", type=int, default=8)
     parser.add_argument("--rfmoe-expert-dim", type=int, default=None)
@@ -504,6 +527,7 @@ def main() -> None:
             use_engram=args.engram,
             engram_layer_ids=tuple(int(value) for value in args.engram_layer_ids.split(",") if value),
             engram_vocab_size=args.engram_vocab_size,
+            engram_param_fraction=args.engram_param_fraction,
             use_rfmoe=args.use_rfmoe,
             rfmoe_num_experts=args.rfmoe_num_experts,
             rfmoe_expert_dim=args.rfmoe_expert_dim,
@@ -512,6 +536,8 @@ def main() -> None:
             rfmoe_backend=args.rfmoe_backend,
             mtp_depth=args.mtp_depth,
             use_ffn_mid=args.use_ffn_mid,
+            attn_res_mode=args.attn_res_mode,
+            attn_res_group_size=args.attn_res_group_size,
         )
     if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
         print(

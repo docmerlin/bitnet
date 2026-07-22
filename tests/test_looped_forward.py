@@ -71,9 +71,13 @@ def test_looped_forward_shapes_and_override() -> bool:
     with torch.no_grad():
         for layer in model.layers:
             layer.infini_attn.o_proj.weight.mul_(50.0)
-            layer.ffn_down.weight.mul_(50.0)
-            layer.attn_res.scale.fill_(1.0)
-            layer.mlp_res.scale.fill_(1.0)
+            if hasattr(layer, "ffn_down"):
+                layer.ffn_down.weight.mul_(50.0)
+            # Sandwich mode residual scales (kimi mode has no .scale).
+            if layer.attn_res is not None:
+                layer.attn_res.scale.fill_(1.0)
+            if layer.mlp_res is not None:
+                layer.mlp_res.scale.fill_(1.0)
     model.eval()
     input_ids = torch.randint(0, config.vocab_size, (2, 8))
 

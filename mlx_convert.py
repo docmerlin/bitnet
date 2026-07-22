@@ -44,6 +44,7 @@ def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
         use_engram=source.use_engram,
         engram_layer_ids=source.engram_layer_ids,
         engram_vocab_size=source.engram_vocab_size,
+        engram_param_fraction=getattr(source, "engram_param_fraction", 0.05),
         engram_max_ngram_size=source.engram_max_ngram_size,
         engram_num_heads=source.engram_num_heads,
         engram_head_dim=source.engram_head_dim,
@@ -56,6 +57,9 @@ def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
         rfmoe_rank=source.rfmoe_rank,
         rfmoe_theta=source.rfmoe_theta,
         mtp_depth=source.mtp_depth,
+        use_ffn_mid=getattr(source, "use_ffn_mid", True),
+        attn_res_mode=getattr(source, "attn_res_mode", "kimi"),
+        attn_res_group_size=getattr(source, "attn_res_group_size", None),
     )
 
 
@@ -89,6 +93,10 @@ def map_pytorch_key(key: str) -> tuple[str | None, bool]:
         "attn_res.norm.weight": "attn_post.weight",
         "mlp_res.scale": "mlp_scale",
         "mlp_res.norm.weight": "mlp_post.weight",
+        "attn_res_mix.proj.weight": "attn_res_mix.proj.weight",
+        "attn_res_mix.norm.weight": "attn_res_mix.norm.weight",
+        "mlp_res_mix.proj.weight": "mlp_res_mix.proj.weight",
+        "mlp_res_mix.norm.weight": "mlp_res_mix.norm.weight",
         "ffn_up.weight": "up.weight",
         "ffn_mid.weight": "mid.weight",
         "ffn_down.weight": "down.weight",

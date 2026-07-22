@@ -52,6 +52,8 @@ def test_small_sublayer_output_init() -> bool:
         head_dim=16,
         intermediate_size=128,
         use_hadamard=False,
+        use_engram=False,
+        attn_res_mode="sandwich",
     )
     # Reference kaiming magnitude vs post-scale.
     ref = HBitLinear(64, 64, bias=False, config=cfg)

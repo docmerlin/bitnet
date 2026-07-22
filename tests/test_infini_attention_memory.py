@@ -23,6 +23,10 @@ def build_block() -> HybridTransformerBlock:
         block_size=4,
         infini_memory_dim=8,
         attn_res_init_scale=0.1,
+        attn_res_mode="sandwich",
+        use_engram=False,
+        use_hadamard=False,
+        use_4bit_activations=False,
     )
     return HybridTransformerBlock(config)
 

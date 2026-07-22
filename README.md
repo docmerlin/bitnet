@@ -27,9 +27,9 @@ Original path, around:
 Key properties:
 
 - ternary linear layers via `HBitLinear`
-- compact DeepSeek Engram conditional memory at layers 1 and 15 by default:
-  deterministic hashed bigram/trigram lookup, hidden-state gating, causal short convolution
-  (`--no-engram` disables it; table capacity via `--engram-vocab-size`)
+- compact DeepSeek Engram conditional memory (default injects e.g. layers 1 and 15 when in range):
+  hashed bigram/trigram lookup; table size auto-scales to **~5% of body params**
+  (`--engram-param-fraction`, or force `--engram-vocab-size`; `--no-engram` disables)
 - unified hybrid block every layer (`layers/hybrid_block.py`)
 - each block combines:
   - PaTH-FoX data-dependent positional attention in bounded local windows
@@ -38,7 +38,9 @@ Key properties:
     `--path-window-size` (default 64); no full-sequence attention matrix
   - **Sandwich RMSNorm** residual: `post(x + scale * sublayer(pre(x)))` on attn and FFN
     (pre-norm + residual-stream post-norm; stabilizes looped unrolls)
-  - Attention Residuals (learned scale on each residual branch)
+  - **Kimi Block AttnRes** (default): depth softmax over residual block history
+    (`attn_res_mode=kimi`); legacy sandwich scale via `attn_res_mode=sandwich`.
+    AttnRes stream **resets at each Hyperloop boundary** (HC mixes across loops).
 - **looped / recurrent-depth** layout (default): 8 prelude + 32 unique recurrent × `R` loops + 8 coda
   - same 48 unique params as a flat 48-layer stack; effective depth = `8 + 32R + 8` (default `R=4` → 144)
   - CLI: `--num-prelude-layers`, `--num-recurrent-layers`, `--num-coda-layers`, `--num-loops`

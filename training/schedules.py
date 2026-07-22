@@ -146,14 +146,22 @@ def collect_loop_train_metrics(model: nn.Module, *, active_loops: int) -> Dict[s
     """Cheap scalars for deep/looped training health (logged every log interval)."""
     metrics: Dict[str, float] = {"active_loops": float(active_loops)}
 
-    # Attention residual scales (should stay modest early if identity-friendly).
+    # Residual health: sandwich scales or Kimi AttnRes pseudo-query norms.
     scales: List[float] = []
+    kimi_norms: List[float] = []
     for module in model.modules():
-        if isinstance(module, HybridTransformerBlock):
+        if not isinstance(module, HybridTransformerBlock):
+            continue
+        if module.attn_res is not None and module.mlp_res is not None:
             scales.append(float(module.attn_res.scale.detach().abs().mean()))
             scales.append(float(module.mlp_res.scale.detach().abs().mean()))
+        if module.attn_res_mix is not None and module.mlp_res_mix is not None:
+            kimi_norms.append(float(module.attn_res_mix.proj.weight.detach().norm()))
+            kimi_norms.append(float(module.mlp_res_mix.proj.weight.detach().norm()))
     if scales:
         metrics["attn_res_scale_mean"] = sum(scales) / len(scales)
+    if kimi_norms:
+        metrics["attn_res_query_norm_mean"] = sum(kimi_norms) / len(kimi_norms)
 
     loop_hc = getattr(model, "loop_hc", None)
     if loop_hc is not None:

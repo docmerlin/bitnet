@@ -68,7 +68,8 @@ class MLXBitNetConfig:
     rms_norm_eps: float = 1e-5
     use_engram: bool = True
     engram_layer_ids: tuple[int, ...] = (1, 15)
-    engram_vocab_size: int = 4093
+    engram_vocab_size: int | None = None  # None → ~engram_param_fraction of body
+    engram_param_fraction: float = 0.05
     engram_max_ngram_size: int = 3
     engram_num_heads: int = 4
     engram_head_dim: int = 16
@@ -84,6 +85,10 @@ class MLXBitNetConfig:
     mtp_depth: int = 0
     # Dense FFN: SwiGLU up/down plus optional square mid (I→I). False = classic 2-mat SwiGLU.
     use_ffn_mid: bool = True
+    # Residual path: "kimi" = Block AttnRes (arXiv:2603.15031); "sandwich" = legacy scale residual.
+    attn_res_mode: str = "kimi"
+    # Transformer layers per AttnRes depth-block (None → max(1, unique_layers // 8)).
+    attn_res_group_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads:
@@ -98,12 +103,55 @@ class MLXBitNetConfig:
             raise ValueError("block_size and infini_memory_dim must be positive")
         if self.activation_bits < 2:
             raise ValueError("activation_bits must be at least 2")
-        if self.engram_vocab_size < 1 or self.engram_max_ngram_size < 2:
+        if self.engram_max_ngram_size < 2:
             raise ValueError("invalid Engram table or N-gram size")
         if self.rfmoe_num_experts < 1:
             raise ValueError("rfmoe_num_experts must be positive")
         if self.rfmoe_backend not in {"auto", "metal", "hybrid", "host"}:
             raise ValueError("rfmoe_backend must be auto, metal, hybrid, or host")
+        if not 0.0 <= float(self.engram_param_fraction) <= 1.0:
+            raise ValueError("engram_param_fraction must be in [0, 1]")
+        mode = str(self.attn_res_mode).lower()
+        if mode not in {"kimi", "sandwich"}:
+            raise ValueError("attn_res_mode must be 'kimi' or 'sandwich'")
+        object.__setattr__(self, "attn_res_mode", mode)
+        if self.attn_res_group_size is None:
+            object.__setattr__(
+                self, "attn_res_group_size", max(1, self.num_hidden_layers // 8)
+            )
+        elif int(self.attn_res_group_size) < 1:
+            raise ValueError("attn_res_group_size must be >= 1")
+        else:
+            object.__setattr__(self, "attn_res_group_size", int(self.attn_res_group_size))
+
+        # Filter Engram injects to unique stack; auto table size ~fraction of body.
+        L = self.num_hidden_layers
+        ids = tuple(int(i) for i in self.engram_layer_ids if 0 <= int(i) < L)
+        if self.use_engram and not ids:
+            ids = (0,) if L == 1 else tuple(dict.fromkeys((min(1, L - 1), L // 2)))
+        object.__setattr__(self, "engram_layer_ids", ids)
+        if self.engram_vocab_size is not None:
+            if int(self.engram_vocab_size) < 1:
+                raise ValueError("engram_vocab_size must be positive")
+            object.__setattr__(self, "engram_vocab_size", int(self.engram_vocab_size))
+        elif self.use_engram and ids:
+            from config import _nearest_odd_table_size
+
+            H = self.hidden_size
+            I = self.intermediate_size
+            emb = self.vocab_size * H
+            ffn = H * (2 * I) + I * I + I * H
+            per_layer = 6 * H * H + ffn + 10 * H + (4 * H if mode == "kimi" else 2 * H)
+            body = emb + L * per_layer + 4 * 4 * H
+            target = float(self.engram_param_fraction) * max(1, body)
+            num_tables = max(1, (self.engram_max_ngram_size - 1) * self.engram_num_heads)
+            hd = self.engram_head_dim
+            fixed = 2 * num_tables * hd * H + H * self.engram_kernel_size + 3 * H
+            budget = max(0.0, target / len(ids) - fixed)
+            raw_v = int(budget / (num_tables * hd)) if num_tables * hd else 17
+            object.__setattr__(self, "engram_vocab_size", _nearest_odd_table_size(raw_v))
+        else:
+            object.__setattr__(self, "engram_vocab_size", 4093)
 
     @property
     def num_hidden_layers(self) -> int:
@@ -112,6 +160,90 @@ class MLXBitNetConfig:
     @property
     def effective_depth(self) -> int:
         return self.num_prelude_layers + self.num_recurrent_layers * self.num_loops + self.num_coda_layers
+
+
+class MLXDepthAttnMix(nn.Module):
+    """Kimi AttnRes depth mix: h = softmax(wᵀ RMSNorm(V)) · V over depth axis."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-5):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, 1, bias=False)
+        self.norm = nn.RMSNorm(hidden_size, eps=eps)
+        self.proj.weight = mx.zeros_like(self.proj.weight)
+
+    def __call__(self, completed: list[mx.array], partial: mx.array) -> mx.array:
+        if not completed:
+            return partial
+        v = mx.stack([*completed, partial], axis=0)  # [N+1, B, T, D]
+        k = self.norm(v)
+        w = mx.reshape(self.proj.weight, (-1,))  # [D]
+        logits = mx.sum(k * w, axis=-1)  # [N+1, B, T]
+        weights = mx.softmax(logits, axis=0)
+        return mx.sum(weights[..., None] * v, axis=0)
+
+
+@dataclass
+class MLXAttnResStream:
+    """Mutable Block AttnRes state for one depth segment (train or decode pass)."""
+
+    completed: list[mx.array]
+    partial: mx.array | None
+    layers_in_block: int
+    group_size: int
+    last_hidden: mx.array
+    attn_mix: MLXDepthAttnMix
+    mlp_mix: MLXDepthAttnMix
+
+    @classmethod
+    def start(
+        cls,
+        seed: mx.array,
+        *,
+        group_size: int,
+        attn_mix: MLXDepthAttnMix,
+        mlp_mix: MLXDepthAttnMix,
+    ) -> "MLXAttnResStream":
+        if group_size < 1:
+            raise ValueError("attn_res_group_size must be >= 1")
+        return cls(
+            completed=[seed],
+            partial=seed,
+            layers_in_block=0,
+            group_size=int(group_size),
+            last_hidden=seed,
+            attn_mix=attn_mix,
+            mlp_mix=mlp_mix,
+        )
+
+    def mix_attn(self) -> mx.array:
+        partial = self.partial if self.partial is not None else self.completed[-1]
+        h = self.attn_mix(self.completed, partial)
+        self.last_hidden = h
+        return h
+
+    def mix_mlp(self) -> mx.array:
+        partial = self.partial if self.partial is not None else self.completed[-1]
+        h = self.mlp_mix(self.completed, partial)
+        self.last_hidden = h
+        return h
+
+    def add_sublayer(self, delta: mx.array) -> None:
+        self.partial = delta if self.partial is None else self.partial + delta
+
+    def close_layer(self) -> None:
+        self.layers_in_block += 1
+        if self.layers_in_block < self.group_size:
+            return
+        if self.partial is None:
+            raise RuntimeError("MLXAttnResStream.close_layer with empty partial")
+        self.completed.append(self.partial)
+        self.partial = None
+        self.layers_in_block = 0
+
+    def hidden(self) -> mx.array:
+        if self.partial is not None:
+            return self.mlp_mix(self.completed, self.partial)
+        return self.completed[-1]
 
 
 class MLXHBitLinear(nn.Module):
@@ -1338,11 +1470,11 @@ class MLXHybridBlock(nn.Module):
     def __init__(self, config: MLXBitNetConfig, layer_id: int):
         super().__init__()
         hidden, intermediate = config.hidden_size, config.intermediate_size
+        self.config = config
+        self.attn_res_mode = config.attn_res_mode
         self.engram = MLXEngram(config, layer_id) if config.use_engram and layer_id in config.engram_layer_ids else None
         self.attn_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.attn = MLXPaTHAttention(config)
-        self.attn_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
-        self.attn_scale = mx.array([0.1])
         self.attn_gate = mx.array([0.0])
         self.mlp_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.moe = MLXRFMoE(config) if config.use_rfmoe else None
@@ -1358,8 +1490,21 @@ class MLXHybridBlock(nn.Module):
                 self.mid.weight = mx.eye(intermediate, dtype=self.mid.weight.dtype)
             self.down = MLXHBitLinear(intermediate, hidden, config)
             self.down.weight = self.down.weight * 0.01
-        self.mlp_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
-        self.mlp_scale = mx.array([0.1])
+        if self.attn_res_mode == "kimi":
+            self.attn_res_mix = MLXDepthAttnMix(hidden, eps=config.rms_norm_eps)
+            self.mlp_res_mix = MLXDepthAttnMix(hidden, eps=config.rms_norm_eps)
+            # Keep sandwich attrs for convert soft-load / sandwich mode compatibility.
+            self.attn_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.attn_scale = mx.array([0.1])
+            self.mlp_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.mlp_scale = mx.array([0.1])
+        else:
+            self.attn_res_mix = None
+            self.mlp_res_mix = None
+            self.attn_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.attn_scale = mx.array([0.1])
+            self.mlp_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.mlp_scale = mx.array([0.1])
 
     def _dense_mlp(self, x: mx.array) -> mx.array:
         # Decode M=1: one Metal dispatch for up + mid + down ternary FFN.
@@ -1403,60 +1548,26 @@ class MLXHybridBlock(nn.Module):
             hidden_act = nn.silu(self.mid(hidden_act))
         return self.down(hidden_act)
 
+    def _mlp(self, x: mx.array, checkpoint_activations: bool = False) -> mx.array:
+        if self.moe is not None:
+            if checkpoint_activations and self.moe.backend != "hybrid":
+                output, gate_stack, hard_density = activation_checkpoint(
+                    self.moe,
+                    self.moe.forward_arrays,
+                )(x)
+                self.moe.update_stats(gate_stack, hard_density)
+                return output
+            return self.moe(x)
+        run_mlp = activation_checkpoint(self, self._dense_mlp) if checkpoint_activations else self._dense_mlp
+        return run_mlp(x)
+
     def new_inference_cache(self, batch_size: int) -> "MLXBlockInferenceCache":
         return MLXBlockInferenceCache(
             attention=self.attn.new_inference_cache(batch_size),
             engram=MLXEngramInferenceCache() if self.engram is not None else None,
         )
 
-    def incremental(
-        self,
-        x: mx.array,
-        input_ids: mx.array,
-        token_history: mx.array,
-        cache: "MLXBlockInferenceCache",
-        update_memory: bool,
-    ) -> mx.array:
-        if self.engram is not None:
-            x = x + self.engram.incremental(x, input_ids, token_history, cache.engram)
-        attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
-        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
-        normalized = self.mlp_norm(x)
-        output = self.moe(normalized) if self.moe is not None else self._dense_mlp(normalized)
-        return self.mlp_post(x + self.mlp_scale * output)
-
-    def extend(
-        self,
-        x: mx.array,
-        input_ids: mx.array,
-        token_history: mx.array,
-        cache: "MLXBlockInferenceCache",
-        update_memory: bool,
-    ) -> mx.array:
-        if self.engram is not None:
-            x = x + self.engram.extend(x, input_ids, token_history, cache.engram)
-        attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
-        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
-        normalized = self.mlp_norm(x)
-        output = self.moe(normalized) if self.moe is not None else self._dense_mlp(normalized)
-        return self.mlp_post(x + self.mlp_scale * output)
-
-    def prefill(
-        self,
-        x: mx.array,
-        input_ids: mx.array,
-        cache: "MLXBlockInferenceCache",
-        update_memory: bool,
-    ) -> mx.array:
-        if self.engram is not None:
-            x = x + self.engram.prefill(x, input_ids, cache.engram)
-        attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
-        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
-        normalized = self.mlp_norm(x)
-        output = self.moe(normalized) if self.moe is not None else self._dense_mlp(normalized)
-        return self.mlp_post(x + self.mlp_scale * output)
-
-    def __call__(
+    def forward_sandwich(
         self,
         x: mx.array,
         input_ids: mx.array,
@@ -1474,20 +1585,159 @@ class MLXHybridBlock(nn.Module):
             checkpoint_activations,
         )
         x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
-        normalized = self.mlp_norm(x)
-        if self.moe is not None:
-            if checkpoint_activations and self.moe.backend != "hybrid":
-                output, gate_stack, hard_density = activation_checkpoint(
-                    self.moe,
-                    self.moe.forward_arrays,
-                )(normalized)
-                self.moe.update_stats(gate_stack, hard_density)
-            else:
-                output = self.moe(normalized)
-        else:
-            run_mlp = activation_checkpoint(self, self._dense_mlp) if checkpoint_activations else self._dense_mlp
-            output = run_mlp(normalized)
+        output = self._mlp(self.mlp_norm(x), checkpoint_activations)
         return self.mlp_post(x + self.mlp_scale * output)
+
+    def forward_kimi(
+        self,
+        stream: MLXAttnResStream,
+        input_ids: mx.array,
+        segment_ids: mx.array | None = None,
+        update_memory: bool = True,
+        checkpoint_activations: bool = False,
+        *,
+        attn_runner=None,
+        engram_runner=None,
+    ) -> MLXAttnResStream:
+        """Kimi Block AttnRes step. ``attn_runner`` overrides train attn for decode paths."""
+        stream.attn_mix = self.attn_res_mix
+        stream.mlp_mix = self.mlp_res_mix
+
+        h = stream.mix_attn()
+        if self.engram is not None:
+            if engram_runner is not None:
+                h = h + engram_runner(h)
+            else:
+                run_engram = activation_checkpoint(self.engram) if checkpoint_activations else self.engram
+                h = h + run_engram(h, input_ids, segment_ids)
+
+        if attn_runner is not None:
+            attention = attn_runner(self.attn_norm(h))
+        else:
+            attention = self.attn(
+                self.attn_norm(h),
+                segment_ids,
+                update_memory,
+                checkpoint_activations,
+            )
+        stream.add_sublayer(mx.sigmoid(self.attn_gate) * attention)
+
+        h = stream.mix_mlp()
+        stream.add_sublayer(self._mlp(self.mlp_norm(h), checkpoint_activations))
+        stream.close_layer()
+        return stream
+
+    def step_kimi_stream(
+        self,
+        stream: MLXAttnResStream,
+        input_ids: mx.array,
+        token_history: mx.array | None,
+        cache: "MLXBlockInferenceCache",
+        update_memory: bool,
+        mode: str,
+    ) -> MLXAttnResStream:
+        """Apply one block through AttnRes stream for prefill/extend/incremental."""
+
+        def engram_runner(h: mx.array) -> mx.array:
+            if self.engram is None:
+                return mx.zeros_like(h)
+            if mode == "incremental":
+                return self.engram.incremental(h, input_ids, token_history, cache.engram)
+            if mode == "extend":
+                return self.engram.extend(h, input_ids, token_history, cache.engram)
+            return self.engram.prefill(h, input_ids, cache.engram)
+
+        def attn_runner(h_norm: mx.array) -> mx.array:
+            if mode == "incremental":
+                return self.attn.incremental(h_norm, cache.attention, update_memory)
+            if mode == "extend":
+                return self.attn.extend(h_norm, cache.attention, update_memory)
+            return self.attn.prefill(h_norm, cache.attention, update_memory)
+
+        return self.forward_kimi(
+            stream,
+            input_ids,
+            None,
+            update_memory,
+            False,
+            attn_runner=attn_runner,
+            engram_runner=engram_runner if self.engram is not None else None,
+        )
+
+    def incremental(
+        self,
+        x: mx.array,
+        input_ids: mx.array,
+        token_history: mx.array,
+        cache: "MLXBlockInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        if self.attn_res_mode == "kimi":
+            raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
+        if self.engram is not None:
+            x = x + self.engram.incremental(x, input_ids, token_history, cache.engram)
+        attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
+        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
+
+    def extend(
+        self,
+        x: mx.array,
+        input_ids: mx.array,
+        token_history: mx.array,
+        cache: "MLXBlockInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        if self.attn_res_mode == "kimi":
+            raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
+        if self.engram is not None:
+            x = x + self.engram.extend(x, input_ids, token_history, cache.engram)
+        attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
+        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
+
+    def prefill(
+        self,
+        x: mx.array,
+        input_ids: mx.array,
+        cache: "MLXBlockInferenceCache",
+        update_memory: bool,
+    ) -> mx.array:
+        if self.attn_res_mode == "kimi":
+            raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
+        if self.engram is not None:
+            x = x + self.engram.prefill(x, input_ids, cache.engram)
+        attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
+        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
+
+    def __call__(
+        self,
+        x: mx.array | MLXAttnResStream,
+        input_ids: mx.array,
+        segment_ids: mx.array | None = None,
+        update_memory: bool = True,
+        checkpoint_activations: bool = False,
+    ) -> mx.array | MLXAttnResStream:
+        if self.attn_res_mode == "kimi":
+            if not isinstance(x, MLXAttnResStream):
+                raise TypeError("kimi AttnRes mode requires MLXAttnResStream input")
+            return self.forward_kimi(
+                x,
+                input_ids,
+                segment_ids,
+                update_memory,
+                checkpoint_activations,
+            )
+        if isinstance(x, MLXAttnResStream):
+            raise TypeError("sandwich mode expects a hidden array, not MLXAttnResStream")
+        return self.forward_sandwich(
+            x,
+            input_ids,
+            segment_ids,
+            update_memory,
+            checkpoint_activations,
+        )
 
 
 @dataclass
@@ -1847,29 +2097,47 @@ class MLXBitNet(nn.Module):
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
         cache_index = 0
-        for block in self.blocks[:prelude_end]:
-            x = block.incremental(x, tokens, cache.token_history, cache.layers[cache_index], True)
-            cache_index += 1
+        n_pre = prelude_end
+        x = self._run_decode_stack(
+            self.blocks[:prelude_end],
+            x,
+            tokens,
+            cache.token_history,
+            cache.layers[cache_index : cache_index + n_pre],
+            [True] * n_pre,
+            "incremental",
+        )
+        cache_index += n_pre
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
+            n_rec = recurrent_end - prelude_end
             for loop_index in range(cache.num_loops):
                 x, post, residual = self.loop_hc.project_in(streams)
-                for block in self.blocks[prelude_end:recurrent_end]:
-                    x = block.incremental(
-                        x,
-                        tokens,
-                        cache.token_history,
-                        cache.layers[cache_index],
-                        loop_index == cache.num_loops - 1,
-                    )
-                    cache_index += 1
+                # Fresh AttnRes history each loop (matches train).
+                x = self._run_decode_stack(
+                    self.blocks[prelude_end:recurrent_end],
+                    x,
+                    tokens,
+                    cache.token_history,
+                    cache.layers[cache_index : cache_index + n_rec],
+                    [loop_index == cache.num_loops - 1] * n_rec,
+                    "incremental",
+                )
+                cache_index += n_rec
                 embedding_index = min(loop_index, 63)
                 output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
                 streams = self.loop_hc.write_back(streams, output, post, residual)
             x = self.loop_hc.fold(streams)
-        for block in self.blocks[recurrent_end:]:
-            x = block.incremental(x, tokens, cache.token_history, cache.layers[cache_index], True)
-            cache_index += 1
+        n_coda = len(self.blocks) - recurrent_end
+        x = self._run_decode_stack(
+            self.blocks[recurrent_end:],
+            x,
+            tokens,
+            cache.token_history,
+            cache.layers[cache_index : cache_index + n_coda],
+            [True] * n_coda,
+            "incremental",
+        )
         history_keep = self.config.engram_max_ngram_size - 1
         combined_history = mx.concatenate((cache.token_history, tokens), axis=1)
         if combined_history.shape[1] > history_keep:
@@ -1891,29 +2159,46 @@ class MLXBitNet(nn.Module):
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
         cache_index = 0
-        for block in self.blocks[:prelude_end]:
-            x = block.extend(x, tokens, cache.token_history, cache.layers[cache_index], True)
-            cache_index += 1
+        n_pre = prelude_end
+        x = self._run_decode_stack(
+            self.blocks[:prelude_end],
+            x,
+            tokens,
+            cache.token_history,
+            cache.layers[cache_index : cache_index + n_pre],
+            [True] * n_pre,
+            "extend",
+        )
+        cache_index += n_pre
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
+            n_rec = recurrent_end - prelude_end
             for loop_index in range(cache.num_loops):
                 x, post, residual = self.loop_hc.project_in(streams)
-                for block in self.blocks[prelude_end:recurrent_end]:
-                    x = block.extend(
-                        x,
-                        tokens,
-                        cache.token_history,
-                        cache.layers[cache_index],
-                        loop_index == cache.num_loops - 1,
-                    )
-                    cache_index += 1
+                x = self._run_decode_stack(
+                    self.blocks[prelude_end:recurrent_end],
+                    x,
+                    tokens,
+                    cache.token_history,
+                    cache.layers[cache_index : cache_index + n_rec],
+                    [loop_index == cache.num_loops - 1] * n_rec,
+                    "extend",
+                )
+                cache_index += n_rec
                 embedding_index = min(loop_index, 63)
                 output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
                 streams = self.loop_hc.write_back(streams, output, post, residual)
             x = self.loop_hc.fold(streams)
-        for block in self.blocks[recurrent_end:]:
-            x = block.extend(x, tokens, cache.token_history, cache.layers[cache_index], True)
-            cache_index += 1
+        n_coda = len(self.blocks) - recurrent_end
+        x = self._run_decode_stack(
+            self.blocks[recurrent_end:],
+            x,
+            tokens,
+            cache.token_history,
+            cache.layers[cache_index : cache_index + n_coda],
+            [True] * n_coda,
+            "extend",
+        )
         cache.token_history = mx.concatenate((cache.token_history, tokens), axis=1)[
             :, -(self.config.engram_max_ngram_size - 1) :
         ]
@@ -1933,28 +2218,47 @@ class MLXBitNet(nn.Module):
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
         cache_index = 0
-        for block in self.blocks[:prelude_end]:
-            x = block.prefill(x, tokens, cache.layers[cache_index], True)
-            cache_index += 1
+        n_pre = prelude_end
+        empty_hist = mx.zeros((tokens.shape[0], 0), dtype=mx.int32)
+        x = self._run_decode_stack(
+            self.blocks[:prelude_end],
+            x,
+            tokens,
+            empty_hist,
+            cache.layers[cache_index : cache_index + n_pre],
+            [True] * n_pre,
+            "prefill",
+        )
+        cache_index += n_pre
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
+            n_rec = recurrent_end - prelude_end
             for loop_index in range(cache.num_loops):
                 x, post, residual = self.loop_hc.project_in(streams)
-                for block in self.blocks[prelude_end:recurrent_end]:
-                    x = block.prefill(
-                        x,
-                        tokens,
-                        cache.layers[cache_index],
-                        loop_index == cache.num_loops - 1,
-                    )
-                    cache_index += 1
+                x = self._run_decode_stack(
+                    self.blocks[prelude_end:recurrent_end],
+                    x,
+                    tokens,
+                    empty_hist,
+                    cache.layers[cache_index : cache_index + n_rec],
+                    [loop_index == cache.num_loops - 1] * n_rec,
+                    "prefill",
+                )
+                cache_index += n_rec
                 embedding_index = min(loop_index, 63)
                 output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
                 streams = self.loop_hc.write_back(streams, output, post, residual)
             x = self.loop_hc.fold(streams)
-        for block in self.blocks[recurrent_end:]:
-            x = block.prefill(x, tokens, cache.layers[cache_index], True)
-            cache_index += 1
+        n_coda = len(self.blocks) - recurrent_end
+        x = self._run_decode_stack(
+            self.blocks[recurrent_end:],
+            x,
+            tokens,
+            empty_hist,
+            cache.layers[cache_index : cache_index + n_coda],
+            [True] * n_coda,
+            "prefill",
+        )
         cache.token_history = tokens[:, -(self.config.engram_max_ngram_size - 1) :]
         cache.position = tokens.shape[1]
         return self.norm(x)
@@ -1987,6 +2291,70 @@ class MLXBitNet(nn.Module):
         transformed = mx.concatenate([transform(last) for transform in self.mtp_transforms], axis=1)
         return transformed @ self.embedding.weight.T
 
+    @property
+    def _kimi_mode(self) -> bool:
+        return self.config.attn_res_mode == "kimi"
+
+    def _new_attn_stream(self, seed: mx.array) -> MLXAttnResStream:
+        for block in self.blocks:
+            if block.attn_res_mix is not None and block.mlp_res_mix is not None:
+                return MLXAttnResStream.start(
+                    seed,
+                    group_size=int(self.config.attn_res_group_size),
+                    attn_mix=block.attn_res_mix,
+                    mlp_mix=block.mlp_res_mix,
+                )
+        raise RuntimeError("kimi AttnRes requires hybrid blocks with depth mixes")
+
+    def _run_block_stack(
+        self,
+        blocks: list[MLXHybridBlock],
+        seed: mx.array,
+        tokens: mx.array,
+        segment_ids: mx.array | None,
+        update_memory: bool,
+        checkpoint: bool,
+    ) -> mx.array:
+        """Run a stack of blocks; Kimi mode uses a fresh AttnRes stream from seed."""
+        if not blocks:
+            return seed
+        if not self._kimi_mode:
+            x = seed
+            for block in blocks:
+                x = block(x, tokens, segment_ids, update_memory, checkpoint)
+            return x
+        stream = self._new_attn_stream(seed)
+        for block in blocks:
+            stream = block(stream, tokens, segment_ids, update_memory, checkpoint)
+        return stream.hidden()
+
+    def _run_decode_stack(
+        self,
+        blocks: list[MLXHybridBlock],
+        seed: mx.array,
+        tokens: mx.array,
+        token_history: mx.array,
+        caches: list,
+        update_flags: list[bool],
+        mode: str,
+    ) -> mx.array:
+        if not blocks:
+            return seed
+        if not self._kimi_mode:
+            x = seed
+            for block, cache, upd in zip(blocks, caches, update_flags):
+                if mode == "incremental":
+                    x = block.incremental(x, tokens, token_history, cache, upd)
+                elif mode == "extend":
+                    x = block.extend(x, tokens, token_history, cache, upd)
+                else:
+                    x = block.prefill(x, tokens, cache, upd)
+            return x
+        stream = self._new_attn_stream(seed)
+        for block, cache, upd in zip(blocks, caches, update_flags):
+            stream = block.step_kimi_stream(stream, tokens, token_history, cache, upd, mode)
+        return stream.hidden()
+
     def hidden_states(
         self,
         tokens: mx.array,
@@ -2006,23 +2374,31 @@ class MLXBitNet(nn.Module):
         x = self.subln(self.embedding(tokens))
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
-        for block in self.blocks[:prelude_end]:
-            x = block(x, tokens, segment_ids, True, checkpoint_scope == "all")
+        # Prelude: one AttnRes segment (or sandwich stack).
+        x = self._run_block_stack(
+            self.blocks[:prelude_end],
+            x,
+            tokens,
+            segment_ids,
+            True,
+            checkpoint_scope == "all",
+        )
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
             cache_token = _effective_weight_cache.set({}) if self.reuse_recurrent_weights and loops > 1 else None
             quantized_token = _recurrent_quantized_matmul.set(self.recurrent_quantized_matmul)
             try:
                 for loop_index in range(loops):
+                    # Reset AttnRes history each Hyperloop iteration (HC owns cross-loop mix).
                     x, post, residual = self.loop_hc.project_in(streams)
-                    for block in self.blocks[prelude_end:recurrent_end]:
-                        x = block(
-                            x,
-                            tokens,
-                            segment_ids,
-                            loop_index == loops - 1,
-                            checkpoint_scope in ("recurrent", "all"),
-                        )
+                    x = self._run_block_stack(
+                        self.blocks[prelude_end:recurrent_end],
+                        x,
+                        tokens,
+                        segment_ids,
+                        loop_index == loops - 1,
+                        checkpoint_scope in ("recurrent", "all"),
+                    )
                     embedding_index = min(loop_index, 63)
                     output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
                     streams = self.loop_hc.write_back(streams, output, post, residual)
@@ -2031,8 +2407,15 @@ class MLXBitNet(nn.Module):
                     _effective_weight_cache.reset(cache_token)
                 _recurrent_quantized_matmul.reset(quantized_token)
             x = self.loop_hc.fold(streams)
-        for block in self.blocks[recurrent_end:]:
-            x = block(x, tokens, segment_ids, True, checkpoint_scope == "all")
+        # Coda: fresh AttnRes segment after HC fold.
+        x = self._run_block_stack(
+            self.blocks[recurrent_end:],
+            x,
+            tokens,
+            segment_ids,
+            True,
+            checkpoint_scope == "all",
+        )
         return self.norm(x)
 
     def __call__(

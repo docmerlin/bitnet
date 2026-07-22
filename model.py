@@ -1,7 +1,12 @@
 """Main BitNetDeep model.
 
-Every Transformer layer contains BOTH Infini-Attention and Attention Residuals.
-Depth is looped: unique prelude once, recurrent stack × R, unique coda once.
+Every Transformer layer contains BOTH Infini-Attention and residual path
+(default: Kimi Block AttnRes). Depth is looped: unique prelude once,
+recurrent stack × R, unique coda once.
+
+**AttnRes + loops:** the depth-attention residual stream is **reset at each
+Hyperloop boundary**. Cross-loop mixing is owned by ``LoopHyperConnection``;
+AttnRes only sees depth within the current prelude / one recurrent pass / coda.
 """
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from config import TernaryConfig
+from layers.attn_res import AttnResStream
 from layers.hybrid_block import HybridTransformerBlock
 from layers.loop_mhc import LoopHyperConnection
 
@@ -118,22 +124,46 @@ class BitNetDeep(nn.Module):
                 )
             yield
 
+    @property
+    def _kimi_mode(self) -> bool:
+        return str(self.config.attn_res_mode) == "kimi"
+
+    def _new_stream(self, seed: torch.Tensor) -> AttnResStream:
+        """Start a fresh AttnRes segment (used at embed, each loop, coda seed).
+
+        Uses first layer's mix modules as placeholders; each block swaps its own
+        per-layer pseudo-query modules in ``forward_kimi``.
+        """
+        for layer in self.layers:
+            if layer.attn_res_mix is not None and layer.mlp_res_mix is not None:
+                return AttnResStream.start(
+                    seed,
+                    group_size=int(self.config.attn_res_group_size),
+                    attn_mix=layer.attn_res_mix,
+                    mlp_mix=layer.mlp_res_mix,
+                )
+        raise RuntimeError("kimi AttnRes requires at least one hybrid layer with depth mixes")
+
     def _run_layer(
         self,
         layer: HybridTransformerBlock,
-        x: torch.Tensor,
+        state: Union[torch.Tensor, AttnResStream],
         attention_mask: Optional[torch.Tensor],
         segment_ids: Optional[torch.Tensor],
         input_ids: torch.Tensor,
         *,
         update_memory: Optional[bool] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, AttnResStream]:
         """Run one block. Checkpoint when enabled and granularity is ``layer``."""
         do_ckpt = (
             self.gradient_checkpointing
             and self.training
             and self.checkpoint_granularity == "layer"
         )
+        if do_ckpt:
+            if self._kimi_mode:
+                # Stream carries Python lists — layer ckpt not supported; fall through.
+                do_ckpt = False
         if do_ckpt:
             layer_memory_state = layer.infini_attn.get_memory_state()
             return checkpoint(
@@ -144,7 +174,7 @@ class BitNetDeep(nn.Module):
                     input_ids=input_ids,
                     update_memory=update_memory,
                 ),
-                x,
+                state,
                 use_reentrant=False,
                 context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: (
                     contextlib.nullcontext(),
@@ -154,7 +184,7 @@ class BitNetDeep(nn.Module):
                 ),
             )
         return layer(
-            x,
+            state,
             attention_mask,
             segment_ids=segment_ids,
             input_ids=input_ids,
@@ -164,23 +194,23 @@ class BitNetDeep(nn.Module):
     def _run_stack(
         self,
         layers: Iterable[HybridTransformerBlock],
-        x: torch.Tensor,
+        state: Union[torch.Tensor, AttnResStream],
         attention_mask: Optional[torch.Tensor],
         segment_ids: Optional[torch.Tensor],
         input_ids: torch.Tensor,
         *,
         update_memory: Optional[bool] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, AttnResStream]:
         """Run a sequence of blocks without per-layer checkpointing."""
         for layer in layers:
-            x = layer(
-                x,
+            state = layer(
+                state,
                 attention_mask,
                 segment_ids=segment_ids,
                 input_ids=input_ids,
                 update_memory=update_memory,
             )
-        return x
+        return state
 
     def _run_recurrent_iteration(
         self,
@@ -192,15 +222,32 @@ class BitNetDeep(nn.Module):
         *,
         update_memory: bool,
     ) -> torch.Tensor:
-        """One full middle-stack pass; optional loop-granularity checkpoint."""
+        """One full middle-stack pass; optional loop-granularity checkpoint.
+
+        Kimi mode: **new AttnResStream from ``x``** so depth history does not
+        cross Hyperloop iterations (HC owns cross-loop mixing).
+        """
         use_loop_ckpt = (
             self.gradient_checkpointing
             and self.training
             and self.checkpoint_granularity == "loop"
             and len(recurrent) > 0
+            and not self._kimi_mode  # stream state is not pure Tensor for ckpt
         )
+        if self._kimi_mode:
+            stream = self._new_stream(x)
+            for layer in recurrent:
+                stream = self._run_layer(
+                    layer,
+                    stream,
+                    attention_mask,
+                    segment_ids,
+                    input_ids,
+                    update_memory=update_memory,
+                )
+            return stream.hidden()
+
         if not use_loop_ckpt:
-            # Layer granularity (or ckpt off): each block handled in _run_layer.
             for layer in recurrent:
                 x = self._run_layer(
                     layer,
@@ -212,7 +259,6 @@ class BitNetDeep(nn.Module):
                 )
             return x
 
-        # Checkpoint the entire recurrent stack as one segment (R checkpoints total).
         layers_list = list(recurrent)
         mem_states = self._snapshot_infini_states(layers_list)
 
@@ -265,11 +311,19 @@ class BitNetDeep(nn.Module):
         if loops < 1:
             raise ValueError("num_loops must be >= 1")
 
+        kimi = self._kimi_mode
         # Prelude once (may seed Infini memory; recurrent early loops can read it).
-        for layer in self.layers[:p]:
-            x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
+        if kimi:
+            stream = self._new_stream(x)
+            for layer in self.layers[:p]:
+                stream = self._run_layer(layer, stream, attention_mask, segment_ids, input_ids)
+            x = stream.hidden()
+        else:
+            for layer in self.layers[:p]:
+                x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
 
         # Recurrent × R + Hyperloop HC. Infini B: read all loops, write last only.
+        # Each loop iteration **resets** AttnRes depth history (see module docstring).
         recurrent = self.layers[p : p + r]
         if r > 0:
             y = self.loop_hc.expand(x)  # (B, T, n=4, C)
@@ -290,11 +344,16 @@ class BitNetDeep(nn.Module):
                 u = x_in + e_l
                 y = self.loop_hc.write_back(y, u, h_post, h_res)
             x = self.loop_hc.fold(y)
-        # else: no recurrent core — prelude output flows straight to coda
 
-        # Coda once
-        for layer in self.layers[p + r :]:
-            x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
+        # Coda once (fresh AttnRes segment after HC fold).
+        if kimi:
+            stream = self._new_stream(x)
+            for layer in self.layers[p + r :]:
+                stream = self._run_layer(layer, stream, attention_mask, segment_ids, input_ids)
+            x = stream.hidden()
+        else:
+            for layer in self.layers[p + r :]:
+                x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
 
         x = self.norm(x)
         logits = self.lm_head(x)

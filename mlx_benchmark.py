@@ -97,7 +97,9 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
         use_path_kernel=args.mlx_path_kernel,
         use_engram=False,
         use_rfmoe=False,
-        use_ffn_mid=args.use_ffn_mid,
+        use_ffn_mid=getattr(args, "use_ffn_mid", True),
+        attn_res_mode=getattr(args, "attn_res_mode", "kimi"),
+        attn_res_group_size=getattr(args, "attn_res_group_size", None),
     )
     model = MLXBitNet(
         config,

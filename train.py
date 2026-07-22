@@ -151,6 +151,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-heads", type=int, default=defaults.num_attention_heads)
     parser.add_argument("--intermediate-size", type=int, default=defaults.intermediate_size)
+    parser.add_argument(
+        "--attn-res-mode",
+        choices=("kimi", "sandwich"),
+        default=defaults.attn_res_mode,
+        help="Residual path: kimi Block AttnRes (default) or legacy sandwich scale.",
+    )
+    parser.add_argument(
+        "--attn-res-group-size",
+        type=int,
+        default=None,
+        help="Transformer layers per AttnRes depth-block (default: unique_layers//8).",
+    )
     parser.add_argument("--sequence-length", type=_sequence_length, default=1024)
     parser.add_argument("--path-window-size", type=int, default=defaults.path_window_size)
     parser.add_argument("--disable-hadamard", action="store_true")
@@ -165,7 +177,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=lambda value: tuple(int(item) for item in value.split(",") if item),
         default=defaults.engram_layer_ids,
     )
-    parser.add_argument("--engram-vocab-size", type=int, default=defaults.engram_vocab_size)
+    parser.add_argument(
+        "--engram-vocab-size",
+        type=int,
+        default=None,
+        help="Engram hash table slots. Default: auto-size to ~engram-param-fraction of body.",
+    )
+    parser.add_argument(
+        "--engram-param-fraction",
+        type=float,
+        default=0.05,
+        help="When --engram-vocab-size is omitted, target Engram params / body params (default 0.05).",
+    )
 
     parser.add_argument("--mtp-depth", type=int, default=0)
     parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
