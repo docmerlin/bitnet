@@ -34,8 +34,11 @@ Key properties:
 - each block combines:
   - PaTH-FoX data-dependent positional attention in bounded local windows
   - Infini-Attention style fixed-size memory for context beyond each window
+  - **Mamba-3-style selective SSM** on every 3rd unique layer starting at 0
+    (`layer_id % 3 == 0` → ~1/3 of stack; `--mamba3-layers` / `--no-mamba3-layers`,
+    `--mamba-layer-period`); pure scan on **PyTorch and MLX** (no CUDA `mamba_ssm`)
   - local attention work scales linearly with sequence length at fixed
-    `--path-window-size` (default 64); no full-sequence attention matrix
+    `--path-window-size` (default 1024); no full-sequence attention matrix
   - **Sandwich RMSNorm** residual: `post(x + scale * sublayer(pre(x)))` on attn and FFN
     (pre-norm + residual-stream post-norm; stabilizes looped unrolls)
   - **Kimi Block AttnRes** (default): depth softmax over residual block history

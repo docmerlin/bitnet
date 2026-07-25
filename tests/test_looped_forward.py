@@ -28,6 +28,7 @@ def _tiny_looped(
         num_recurrent_layers=recurrent,
         num_coda_layers=coda,
         num_loops=num_loops,
+        use_mamba3_layers=False,
     )
 
 
@@ -70,7 +71,10 @@ def test_looped_forward_shapes_and_override() -> bool:
     # Amplify sublayer outs so multi-loop dynamics are visible (init is near-identity).
     with torch.no_grad():
         for layer in model.layers:
-            layer.infini_attn.o_proj.weight.mul_(50.0)
+            if layer.infini_attn is not None:
+                layer.infini_attn.o_proj.weight.mul_(50.0)
+            if layer.mamba is not None:
+                layer.mamba.out_proj.weight.mul_(50.0)
             if hasattr(layer, "ffn_down"):
                 layer.ffn_down.weight.mul_(50.0)
             # Sandwich mode residual scales (kimi mode has no .scale).
@@ -157,13 +161,13 @@ def test_infini_memory_write_only_last_loop() -> bool:
 
     # Spy: count real buffer updates (training path).
     writes = {"n": 0}
-    orig = attn._update_memory
+    orig = attn._update_memory_state
 
-    def counting_update(k, v):
+    def counting_update(k, v, memory_m, memory_z):
         writes["n"] += 1
-        return orig(k, v)
+        return orig(k, v, memory_m, memory_z)
 
-    attn._update_memory = counting_update  # type: ignore[method-assign]
+    attn._update_memory_state = counting_update  # type: ignore[method-assign]
 
     with torch.no_grad():
         model(input_ids, reset_memory=True, num_loops=3)
@@ -173,7 +177,7 @@ def test_infini_memory_write_only_last_loop() -> bool:
     assert writes["n"] == expected_writes, (
         f"expected {expected_writes} final-loop chunk writes, got {writes['n']}"
     )
-    assert not torch.allclose(attn.memory_k, torch.zeros_like(attn.memory_k)), (
+    assert not torch.allclose(attn.memory_m, torch.zeros_like(attn.memory_m)), (
         "last loop should leave non-zero Infini memory"
     )
 

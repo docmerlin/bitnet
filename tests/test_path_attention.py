@@ -17,6 +17,9 @@ def _attention() -> InfiniAttention:
         block_size=1,
         path_window_size=4,
         infini_memory_dim=4,
+        use_engram=False,
+        use_hadamard=False,
+        use_4bit_activations=False,
     ))
 
 

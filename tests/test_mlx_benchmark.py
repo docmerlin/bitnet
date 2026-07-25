@@ -188,6 +188,7 @@ def test_mlx_model_preserves_packed_document_boundaries_and_loops() -> None:
         num_coda_layers=0,
         num_loops=2,
         path_window_size=4,
+        use_mamba3_layers=False,
     )
     model = MLXBitNet(config)
     segments = mx.array([[0, 0, 1, 1]])
@@ -212,6 +213,7 @@ def test_mlx_recurrent_loops_reuse_effective_weights(monkeypatch) -> None:
         num_loops=3,
         path_window_size=4,
         use_engram=False,
+        use_mamba3_layers=False,
     )
     reference = MLXBitNet(config, reuse_recurrent_weights=False)
     model = MLXBitNet(config, reuse_recurrent_weights=True)
@@ -343,8 +345,11 @@ def test_mlx_compiled_apply_step_updates_model() -> None:
     assert mx.array_equal(model.embedding.weight, after_update).item()
 
 
-@pytest.mark.parametrize(("length", "memory_dim"), [(4, 2), (2, 4), (3, 2)])
-def test_mlx_infini_pooling_fast_paths_match_reference(length, memory_dim) -> None:
+@pytest.mark.parametrize("use_delta", [True, False])
+def test_mlx_paper_infini_memory_update_matches_formula(use_delta: bool) -> None:
+    """Associative M,z update matches Munkhdalai et al. Linear / Linear+Delta."""
+    from mlx_model import _MEMORY_EPS, _infini_sigma
+
     config = MLXBitNetConfig(
         vocab_size=16,
         hidden_size=8,
@@ -353,36 +358,38 @@ def test_mlx_infini_pooling_fast_paths_match_reference(length, memory_dim) -> No
         num_prelude_layers=1,
         num_recurrent_layers=0,
         num_coda_layers=0,
-        infini_memory_dim=memory_dim,
+        path_window_size=4,
+        infini_delta_rule=use_delta,
         use_engram=False,
+        use_mamba3_layers=False,
     )
     attention = MLXPaTHAttention(config)
-    keys = mx.arange(2 * length * 4, dtype=mx.float32).reshape(1, 2, length, 4)
+    length, d, h = 3, 4, 2
+    keys = mx.arange(h * length * d, dtype=mx.float32).reshape(1, h, length, d)
     values = keys + 1
-    expected_keys = []
-    expected_values = []
-    for index in range(memory_dim):
-        start = index * length // memory_dim
-        end = max(start + 1, ((index + 1) * length + memory_dim - 1) // memory_dim)
-        expected_keys.append(mx.mean(keys[:, :, start:end], axis=2))
-        expected_values.append(mx.mean(values[:, :, start:end], axis=2))
-    expected_keys = 0.01 * mx.stack(expected_keys, axis=2)
-    expected_values = 0.01 * mx.stack(expected_values, axis=2)
-    shape = (1, 2, memory_dim, 4)
+    memory_m = mx.zeros((1, h, d, d), dtype=mx.float32)
+    memory_z = mx.zeros((1, h, d), dtype=mx.float32)
+    sk = _infini_sigma(keys)
+    if use_delta:
+        den = mx.maximum(mx.sum(sk * memory_z[:, :, None, :], axis=-1, keepdims=True), _MEMORY_EPS)
+        retrieved = (sk @ memory_m) / den
+        expected_m = memory_m + sk.swapaxes(-1, -2) @ (values.astype(mx.float32) - retrieved)
+    else:
+        expected_m = memory_m + sk.swapaxes(-1, -2) @ values.astype(mx.float32)
+    expected_z = memory_z + mx.sum(sk, axis=2)
 
-    actual_keys, actual_values, initialized = attention._next_memory(
+    actual_m, actual_z, initialized = attention._next_memory(
         keys,
         values,
         mx.array([True]),
-        mx.zeros(shape),
-        mx.zeros(shape),
+        memory_m,
+        memory_z,
         mx.array([False]),
     )
-    mx.eval(actual_keys, actual_values, initialized)
-
-    assert mx.array_equal(actual_keys, expected_keys).item()
-    assert mx.array_equal(actual_values, expected_values).item()
-    assert initialized.item()
+    mx.eval(actual_m, actual_z, initialized)
+    assert mx.allclose(actual_m, expected_m, rtol=1e-5, atol=1e-6).item()
+    assert mx.allclose(actual_z, expected_z, rtol=1e-5, atol=1e-6).item()
+    assert initialized.tolist() == [True]
 
 
 def test_mlx_compiled_irregular_infini_pooling_fits_metal_argument_buffer() -> None:
@@ -399,6 +406,7 @@ def test_mlx_compiled_irregular_infini_pooling_fits_metal_argument_buffer() -> N
         path_window_size=64,
         infini_memory_dim=64,
         use_engram=False,
+        use_mamba3_layers=False,
     )
     model = MLXBitNet(config)
     gradient_step = create_gradient_step(
@@ -430,6 +438,7 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
         hidden_size=8,
         num_attention_heads=2,
         intermediate_size=16,
+        use_mamba3_layers=False,
         num_prelude_layers=0,
         num_recurrent_layers=1,
         num_coda_layers=0,
@@ -469,9 +478,9 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
     attention = MLXPaTHAttention(config)
     attention.reset_memory(1)
     attention(mx.random.normal((1, 4, 8)), segment_ids=mx.zeros((1, 4), dtype=mx.int32), update_memory=True)
-    mx.eval(attention.memory_initialized, attention.memory_k)
+    mx.eval(attention.memory_initialized, attention.memory_m)
     assert attention.memory_initialized.item()
-    assert mx.count_nonzero(attention.memory_k).item() > 0
+    assert mx.count_nonzero(attention.memory_m).item() > 0
 
     attention.reset_memory(2)
     mixed_segments = mx.array([[0, 0, 0, 0], [0, 0, 1, 1]])
@@ -709,6 +718,7 @@ def test_mlx_activation_checkpointing_preserves_gradients_and_state(
         rfmoe_num_experts=2,
         rfmoe_expert_dim=4,
         rfmoe_rank=2,
+        use_mamba3_layers=False,
     )
     reference = MLXBitNet(config)
     checkpointed = MLXBitNet(config)
@@ -734,8 +744,8 @@ def test_mlx_activation_checkpointing_preserves_gradients_and_state(
     assert actual.keys() == expected.keys()
     assert all(mx.allclose(actual[key], value, rtol=1e-4, atol=1e-5).item() for key, value in expected.items())
     assert mx.allclose(
-        checkpointed.blocks[0].attn.memory_k,
-        reference.blocks[0].attn.memory_k,
+        checkpointed.blocks[0].attn.memory_m,
+        reference.blocks[0].attn.memory_m,
         rtol=1e-5,
         atol=1e-6,
     ).item()
@@ -816,7 +826,10 @@ def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> Non
         {"step": 3, "tokens_processed": 12},
         "test",
     )
-    assert not any(key.endswith((".memory_k", ".memory_v", ".memory_initialized")) for key in mx.load(str(checkpoint)))
+    assert not any(
+        key.endswith((".memory_m", ".memory_z", ".memory_initialized", ".memory_k", ".memory_v"))
+        for key in mx.load(str(checkpoint))
+    )
     expected_optimizer = dict(tree_flatten(optimizer.state))
     expected_random = mx.random.uniform(shape=(4,))
     mx.eval(expected_random)

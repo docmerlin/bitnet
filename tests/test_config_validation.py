@@ -99,16 +99,25 @@ def test_blt_decoder_cross_attention_dimension_is_validated() -> None:
         raise AssertionError("BLT config should reject odd decoder cross-attention head dimensions")
 
 
-def test_train_sequence_length_must_match_infini_memory_dimension() -> None:
-    parser = build_arg_parser()
-    try:
-        parser.parse_args(["--sequence-length", "16"])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("train CLI should reject sequence lengths not divisible by 64")
+def test_train_sequence_length_must_match_path_window() -> None:
+    from train import _validate_sequence_path_window
 
-    assert parser.parse_args(["--sequence-length", "64"]).sequence_length == 64
+    parser = build_arg_parser()
+    defaults = parser.parse_args([])
+    assert defaults.sequence_length == 1024
+    assert defaults.path_window_size == 1024
+
+    bad = parser.parse_args(["--sequence-length", "512", "--path-window-size", "1024"])
+    try:
+        _validate_sequence_path_window(bad)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("train CLI should reject seq not divisible by path_window")
+
+    ok = parser.parse_args(["--sequence-length", "2048", "--path-window-size", "1024"])
+    _validate_sequence_path_window(ok)
+    assert ok.sequence_length == 2048
 
 
 if __name__ == "__main__":

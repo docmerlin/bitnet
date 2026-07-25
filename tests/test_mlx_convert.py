@@ -45,6 +45,8 @@ def test_pytorch_checkpoint_converts_weights_hashes_optimizer_and_outputs(tmp_pa
         rfmoe_expert_dim=4,
         rfmoe_rank=2,
         mtp_depth=1,
+        use_mamba3_layers=False,
+        attn_res_mode="sandwich",
     )
     source_model = BitNetDeep(source_config)
     source_optimizer = build_cmud(

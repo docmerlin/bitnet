@@ -1,8 +1,9 @@
-"""Local PaTH-FoX attention with fixed-size Infini memory.
+"""Local PaTH-FoX attention with paper-style Infini compressive memory.
 
-Pure attention sublayer inside ``HybridTransformerBlock``. The block owns
-pre-norm and AttnRes; this module mixes local block-causal attention with
-compressive memory attention.
+Pure attention sublayer inside ``HybridTransformerBlock``. Local path is
+PaTH-FoX over path windows; long-range path is Infini-attention as in
+Munkhdalai et al. 2024 (associative matrix memory + linear attention retrieve,
+optional delta-rule update), mixed by a per-head gate.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from utils import combine_attention_bias
 
 
 class InfiniAttention(nn.Module):
-    """Attention with compressive memory and per-head gating."""
+    """PaTH-FoX local attention + paper Infini associative memory."""
 
     def __init__(self, config: TernaryConfig) -> None:
         super().__init__()
@@ -32,10 +33,12 @@ class InfiniAttention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.memory_dim = config.infini_memory_dim
         self.config = config
         self.num_blocks = max(1, config.block_size)
         self.path_window_size = config.path_window_size
+        # Paper Linear+Delta by default (arXiv:2404.07143).
+        self.use_delta_rule = bool(getattr(config, "infini_delta_rule", True))
+        self._memory_eps = 1e-6
 
         self.qkv = HBitLinear(hidden_size, hidden_size * 3, bias=False, config=config)
         self.o_proj = HBitLinear(hidden_size, hidden_size, bias=False, config=config)
@@ -52,14 +55,15 @@ class InfiniAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # Paper memory: M ∈ R^{d×d} associative bindings, z ∈ R^{d} key normalizer.
         self.register_buffer(
-            "memory_k",
-            torch.zeros(0, num_heads, self.memory_dim, self.head_dim),
+            "memory_m",
+            torch.zeros(0, num_heads, self.head_dim, self.head_dim),
             persistent=False,
         )
         self.register_buffer(
-            "memory_v",
-            torch.zeros(0, num_heads, self.memory_dim, self.head_dim),
+            "memory_z",
+            torch.zeros(0, num_heads, self.head_dim),
             persistent=False,
         )
         self.register_buffer("memory_initialized", torch.zeros(0, dtype=torch.bool), persistent=False)
@@ -74,10 +78,16 @@ class InfiniAttention(nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        # Older checkpoints may still contain serialized memory buffers.
-        state_dict.pop(f"{prefix}memory_k", None)
-        state_dict.pop(f"{prefix}memory_v", None)
-        state_dict.pop(f"{prefix}memory_initialized", None)
+        # Transient memory and legacy slot-bank keys are never checkpointed.
+        for name in (
+            "memory_m",
+            "memory_z",
+            "memory_k",
+            "memory_v",
+            "memory_initialized",
+            "branch_gates",
+        ):
+            state_dict.pop(f"{prefix}{name}", None)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -89,34 +99,45 @@ class InfiniAttention(nn.Module):
         )
 
     def reset_memory(self) -> None:
-        self.memory_k.zero_()
-        self.memory_v.zero_()
+        self.memory_m.zero_()
+        self.memory_z.zero_()
         self.memory_initialized.fill_(False)
 
     def _ensure_memory_batch(self, batch_size: int) -> None:
-        if self.memory_k.size(0) == batch_size:
+        if self.memory_m.size(0) == batch_size:
             return
-        shape = (batch_size, self.num_heads, self.memory_dim, self.head_dim)
-        self.memory_k = torch.zeros(shape, device=self.qkv.weight.device)
-        self.memory_v = torch.zeros_like(self.memory_k)
-        self.memory_initialized = torch.zeros(batch_size, dtype=torch.bool, device=self.qkv.weight.device)
+        device = self.qkv.weight.device
+        d = self.head_dim
+        h = self.num_heads
+        self.memory_m = torch.zeros(batch_size, h, d, d, device=device)
+        self.memory_z = torch.zeros(batch_size, h, d, device=device)
+        self.memory_initialized = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     def get_memory_state(self) -> dict[str, torch.Tensor]:
         return {
-            "memory_k": self.memory_k.detach().clone(),
-            "memory_v": self.memory_v.detach().clone(),
+            "memory_m": self.memory_m.detach().clone(),
+            "memory_z": self.memory_z.detach().clone(),
             "memory_initialized": self.memory_initialized.detach().clone(),
         }
 
     def load_memory_state(self, state: dict[str, torch.Tensor]) -> None:
-        self.memory_k = state["memory_k"].to(device=self.qkv.weight.device, dtype=self.memory_k.dtype).clone()
-        self.memory_v = state["memory_v"].to(device=self.qkv.weight.device, dtype=self.memory_v.dtype).clone()
+        device = self.qkv.weight.device
+        if "memory_m" in state and "memory_z" in state:
+            self.memory_m = state["memory_m"].to(device=device, dtype=self.memory_m.dtype).clone()
+            self.memory_z = state["memory_z"].to(device=device, dtype=self.memory_z.dtype).clone()
+        else:
+            # Legacy slot-bank state: drop and re-init empty paper memory.
+            batch = int(state.get("memory_k", state.get("memory_v", self.memory_m)).size(0))
+            self._ensure_memory_batch(max(batch, 1))
+            self.reset_memory()
+            if batch != self.memory_m.size(0):
+                self._ensure_memory_batch(batch)
+            return
         initialized = state.get("memory_initialized")
-        self.memory_initialized = (
-            initialized.to(device=self.memory_initialized.device)
-            if initialized is not None
-            else self.memory_v.flatten(1).count_nonzero(dim=1).bool()
-        )
+        if initialized is not None:
+            self.memory_initialized = initialized.to(device=device)
+        else:
+            self.memory_initialized = self.memory_z.flatten(1).count_nonzero(dim=1).bool()
 
     @contextlib.contextmanager
     def use_memory_state(self, state: dict[str, torch.Tensor], *, update_memory_buffers: bool = True):
@@ -134,6 +155,45 @@ class InfiniAttention(nn.Module):
         finally:
             self.update_memory_buffers = previous_update
             self.load_memory_state(previous_state)
+
+    @staticmethod
+    def _sigma(x: torch.Tensor) -> torch.Tensor:
+        """ELU+1 feature map from Linear Transformer / Infini-attention paper."""
+        return F.elu(x) + 1.0
+
+    def _retrieve_memory(
+        self,
+        q: torch.Tensor,
+        memory_m: torch.Tensor,
+        memory_z: torch.Tensor,
+    ) -> torch.Tensor:
+        """A_mem = σ(Q) M / (σ(Q) z). q: (B,H,T,D); M: (B,H,D,D); z: (B,H,D)."""
+        sq = self._sigma(q.float())
+        numerator = torch.matmul(sq, memory_m)
+        denominator = torch.einsum("bhtd,bhd->bht", sq, memory_z).unsqueeze(-1)
+        denominator = denominator.clamp_min(self._memory_eps)
+        return numerator / denominator
+
+    def _update_memory_state(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        memory_m: torch.Tensor,
+        memory_z: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Linear or Linear+Delta associative update (paper eqs. 8–9)."""
+        sk = self._sigma(k.float())
+        vf = v.float()
+        if self.use_delta_rule:
+            denominator = torch.einsum("bhtd,bhd->bht", sk, memory_z).unsqueeze(-1)
+            denominator = denominator.clamp_min(self._memory_eps)
+            retrieved = torch.matmul(sk, memory_m) / denominator
+            delta_v = vf - retrieved
+            memory_m = memory_m + torch.matmul(sk.transpose(-2, -1), delta_v)
+        else:
+            memory_m = memory_m + torch.matmul(sk.transpose(-2, -1), vf)
+        memory_z = memory_z + sk.sum(dim=2)
+        return memory_m, memory_z
 
     def _path_vectors(self, x: torch.Tensor, segment_ids: Optional[torch.Tensor]) -> torch.Tensor:
         """Paper PaTH low-rank projection, causal width-3 depthwise conv, L2 norm."""
@@ -239,6 +299,12 @@ class InfiniAttention(nn.Module):
             memory_safe = memory_safe and attention_mask.ndim == 2 and bool(attention_mask.all())
         if segment_ids is not None:
             memory_safe = memory_safe and bool((segment_ids == segment_ids[:, :1]).all())
+
+        # Carry M,z through path windows (BPTT within the forward; detach on store).
+        memory_m = self.memory_m
+        memory_z = self.memory_z
+        memory_initialized = self.memory_initialized
+
         for start, end in self._chunk_ranges(q.size(2)):
             chunk_mask = self._slice_mask(attention_mask, start, end) if attention_mask is not None else None
             if segment_ids is not None:
@@ -265,43 +331,29 @@ class InfiniAttention(nn.Module):
                 chunk_mask,
             )
             if memory_safe:
-                memory_k = self.memory_k.detach().clone()
-                memory_v = self.memory_v.detach().clone()
-                memory_scores = torch.matmul(
-                    q[:, :, start:end], memory_k.transpose(-2, -1).to(dtype=q.dtype)
-                ) * (self.head_dim ** -0.5)
-                memory_context = torch.matmul(
-                    torch.softmax(memory_scores, dim=-1),
-                    memory_v.to(dtype=v.dtype),
-                )
+                memory_context = self._retrieve_memory(
+                    q[:, :, start:end], memory_m, memory_z
+                ).to(dtype=v.dtype)
                 gate = torch.sigmoid(self.gate).view(1, self.num_heads, 1, 1)
                 mixed_context = (1.0 - gate) * local_context + gate * memory_context
-                initialized = self.memory_initialized.clone().view(-1, 1, 1, 1)
+                initialized = memory_initialized.view(-1, 1, 1, 1)
                 local_context = torch.where(initialized, mixed_context, local_context)
             chunks.append(local_context)
             if memory_safe and update_memory:
-                with torch.no_grad():
-                    self._update_memory(k[:, :, start:end], v[:, :, start:end])
+                memory_m, memory_z = self._update_memory_state(
+                    k[:, :, start:end],
+                    v[:, :, start:end],
+                    memory_m,
+                    memory_z,
+                )
+                memory_initialized = torch.ones_like(memory_initialized)
+
+        if update_memory and memory_safe:
+            # Detach stored state so the next top-level call does not keep this graph.
+            self.memory_m = memory_m.detach()
+            self.memory_z = memory_z.detach()
+            self.memory_initialized = memory_initialized.detach()
         return torch.cat(chunks, dim=2)
-
-    def _update_memory(self, k: torch.Tensor, v: torch.Tensor) -> None:
-        """Compress the current sequence into the fixed-size memory buffers."""
-        batch_size, num_heads, seq_len, head_dim = k.shape
-
-        def pool(values: torch.Tensor) -> torch.Tensor:
-            bins = []
-            for index in range(self.memory_dim):
-                start = index * seq_len // self.memory_dim
-                end = max(start + 1, ((index + 1) * seq_len + self.memory_dim - 1) // self.memory_dim)
-                bins.append(values[:, :, start:end].mean(dim=2))
-            return torch.stack(bins, dim=2)
-
-        pooled_k = pool(k)
-        pooled_v = pool(v)
-
-        self.memory_k.mul_(0.99).add_(0.01 * pooled_k)
-        self.memory_v.mul_(0.99).add_(0.01 * pooled_v)
-        self.memory_initialized.fill_(True)
 
     def forward(
         self,

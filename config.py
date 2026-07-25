@@ -62,8 +62,22 @@ class TernaryConfig:
 
     # Hybrid block parameters (every layer: Infini/PaTH + residual path)
     block_size: int = 8          # Infini local sequence blocks (progressive growth); NOT AttnRes group size
-    path_window_size: int = 64   # Hard cap for PaTH-FoX local attention work
-    infini_memory_dim: int = 64  # Compressive memory dimension per head for Infini-Attention
+    path_window_size: int = 1024  # PaTH-FoX local window; 1024 won quality A/B at free wall
+    # Paper Infini (arXiv:2404.07143): associative M is head_dim×head_dim per head.
+    # infini_memory_dim is legacy/unused (kept for CLI + old configs).
+    infini_memory_dim: int = 64
+    infini_delta_rule: bool = True  # Linear+Delta memory update; False = plain Linear
+    # Hybrid depth: every ``mamba_layer_period``-th unique layer (starting at 0) uses a
+    # Mamba-3-style selective SSM mixer instead of PaTH+Infini. period=3 → ~1/3 layers.
+    use_mamba3_layers: bool = True
+    mamba_layer_period: int = 3
+    mamba_d_state: int = 64
+    mamba_expand: int = 2
+    mamba_headdim: int = 32
+    mamba_d_conv: int = 4
+    mamba_dt_min: float = 0.001
+    mamba_dt_max: float = 0.1
+    mamba_a_floor: float = 1e-4
     # Residual path: "kimi" = Block AttnRes (arXiv:2603.15031); "sandwich" = legacy scalar residual
     attn_res_mode: str = "kimi"
     # Transformer layers per AttnRes depth-block (None → max(1, unique_layers // 8)).
@@ -112,6 +126,14 @@ class TernaryConfig:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.path_window_size < 1:
             raise ValueError("path_window_size must be positive")
+        if int(self.mamba_layer_period) < 1:
+            raise ValueError("mamba_layer_period must be >= 1")
+        self.mamba_layer_period = int(self.mamba_layer_period)
+        self.use_mamba3_layers = bool(self.use_mamba3_layers)
+        if int(self.mamba_d_state) < 1 or int(self.mamba_expand) < 1:
+            raise ValueError("mamba_d_state and mamba_expand must be positive")
+        if int(self.mamba_headdim) < 1 or int(self.mamba_d_conv) < 1:
+            raise ValueError("mamba_headdim and mamba_d_conv must be positive")
         if self.engram_max_ngram_size < 2:
             raise ValueError("engram_max_ngram_size must be >= 2")
         if self.engram_num_heads < 1 or self.engram_head_dim < 1:

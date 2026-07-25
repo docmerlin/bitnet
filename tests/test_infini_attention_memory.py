@@ -1,4 +1,4 @@
-"""Regression tests for Infini-Attention memory buffer updates."""
+"""Regression tests for paper-style Infini-Attention associative memory."""
 
 import contextlib
 
@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from config import TernaryConfig
 from layers.hybrid_block import HybridTransformerBlock
+from layers.infini_attention import InfiniAttention
 from model import BitNetDeep
 
 
@@ -21,12 +22,14 @@ def build_block() -> HybridTransformerBlock:
         head_dim=32,
         intermediate_size=512,
         block_size=4,
-        infini_memory_dim=8,
+        path_window_size=4,
+        infini_delta_rule=True,
         attn_res_init_scale=0.1,
         attn_res_mode="sandwich",
         use_engram=False,
         use_hadamard=False,
         use_4bit_activations=False,
+        use_mamba3_layers=False,
     )
     return HybridTransformerBlock(config)
 
@@ -40,8 +43,10 @@ def build_model() -> BitNetDeep:
         head_dim=32,
         intermediate_size=256,
         block_size=4,
-        infini_memory_dim=8,
+        path_window_size=4,
+        infini_delta_rule=True,
         attn_res_init_scale=0.1,
+        use_mamba3_layers=False,
     )
     return BitNetDeep(config)
 
@@ -55,21 +60,22 @@ def test_infini_attention_memory_updates() -> bool:
     block.infini_attn.reset_memory()
     _ = block(x)
     updated_state = block.infini_attn.get_memory_state()
-    assert torch.count_nonzero(updated_state["memory_k"]), "Training forward should update memory"
-    assert torch.count_nonzero(updated_state["memory_v"]), "Training forward should update memory"
+    assert torch.count_nonzero(updated_state["memory_m"]), "Training forward should update memory M"
+    assert torch.count_nonzero(updated_state["memory_z"]), "Training forward should update memory z"
+    assert bool(updated_state["memory_initialized"].all())
 
-    # Eval may update when allowed (multi-segment). Freeze flag still blocks writes.
+    # Eval may update when allowed. Freeze flag still blocks writes.
     block.eval()
     frozen = block.infini_attn.get_memory_state()
     with block.infini_attn.use_memory_state(frozen, update_memory_buffers=False):
         _ = block(x)
-    assert torch.allclose(frozen["memory_k"], block.infini_attn.memory_k), (
+    assert torch.allclose(frozen["memory_m"], block.infini_attn.memory_m), (
         "Frozen eval path must not mutate memory"
     )
     block.infini_attn.reset_memory()
     _ = block(x)  # default update_memory=None → write allowed in eval
     assert not torch.allclose(
-        block.infini_attn.memory_k, torch.zeros_like(block.infini_attn.memory_k)
+        block.infini_attn.memory_m, torch.zeros_like(block.infini_attn.memory_m)
     ), "Eval forward should update memory when writes are allowed"
 
     print("InfiniAttention memory update gating tests passed")
@@ -86,6 +92,31 @@ def test_empty_memory_does_not_attenuate_local_attention() -> None:
     block.infini_attn.gate.data.fill_(100)
     second = block(x)
     assert torch.equal(first, second)
+
+
+def test_paper_memory_retrieve_matches_linear_formula() -> None:
+    torch.manual_seed(11)
+    attn = InfiniAttention(
+        TernaryConfig(
+            vocab_size=32,
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=8,
+            intermediate_size=32,
+            path_window_size=4,
+            use_engram=False,
+            use_hadamard=False,
+            use_4bit_activations=False,
+            use_mamba3_layers=False,
+        )
+    )
+    q = torch.randn(2, 2, 3, 8)
+    m = torch.randn(2, 2, 8, 8)
+    z = torch.randn(2, 2, 8).abs() + 0.1
+    sq = F.elu(q.float()) + 1.0
+    expected = torch.matmul(sq, m) / torch.einsum("bhtd,bhd->bht", sq, z).unsqueeze(-1).clamp_min(1e-6)
+    actual = attn._retrieve_memory(q, m, z)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_checkpoint_recompute_does_not_double_update_memory() -> bool:
@@ -118,11 +149,11 @@ def test_checkpoint_recompute_does_not_double_update_memory() -> bool:
     checkpoint_output.mean().backward()
     checkpoint_state = checkpoint_block.infini_attn.get_memory_state()
 
-    assert torch.allclose(reference_state["memory_k"], checkpoint_state["memory_k"], atol=1e-6, rtol=1e-5), (
-        "Checkpoint recomputation should not apply a second memory_k update"
+    assert torch.allclose(reference_state["memory_m"], checkpoint_state["memory_m"], atol=1e-5, rtol=1e-4), (
+        "Checkpoint recomputation should not apply a second memory_m update"
     )
-    assert torch.allclose(reference_state["memory_v"], checkpoint_state["memory_v"], atol=1e-6, rtol=1e-5), (
-        "Checkpoint recomputation should not apply a second memory_v update"
+    assert torch.allclose(reference_state["memory_z"], checkpoint_state["memory_z"], atol=1e-5, rtol=1e-4), (
+        "Checkpoint recomputation should not apply a second memory_z update"
     )
 
     print("Checkpoint memory update regression tests passed")
@@ -142,7 +173,7 @@ def test_model_forward_resets_memory_between_calls() -> bool:
     assert torch.allclose(first, second, atol=1e-6, rtol=1e-5), (
         "Top-level model forward should reset InfiniAttention memory between unrelated calls"
     )
-    assert not torch.allclose(first_state["memory_k"], torch.zeros_like(first_state["memory_k"])), (
+    assert not torch.allclose(first_state["memory_m"], torch.zeros_like(first_state["memory_m"])), (
         "Training forward should still populate transient memory during the call"
     )
 
@@ -157,18 +188,20 @@ def test_infini_attention_memory_is_not_serialized() -> bool:
     _ = block(torch.randn(2, 8, block.hidden_size))
 
     state_dict = block.state_dict()
-    assert "infini_attn.memory_k" not in state_dict, "Transient memory_k should not be serialized"
-    assert "infini_attn.memory_v" not in state_dict, "Transient memory_v should not be serialized"
+    assert "infini_attn.memory_m" not in state_dict, "Transient memory_m should not be serialized"
+    assert "infini_attn.memory_z" not in state_dict, "Transient memory_z should not be serialized"
 
-    # Legacy checkpoints may still contain these keys; loading should ignore them.
-    state_dict["infini_attn.memory_k"] = torch.ones_like(block.infini_attn.memory_k)
-    state_dict["infini_attn.memory_v"] = torch.ones_like(block.infini_attn.memory_v)
+    # Legacy slot-bank keys; loading should ignore them.
+    state_dict["infini_attn.memory_k"] = torch.ones(2, 8, 8, 32)
+    state_dict["infini_attn.memory_v"] = torch.ones(2, 8, 8, 32)
+    state_dict["infini_attn.memory_m"] = torch.ones_like(block.infini_attn.memory_m)
+    state_dict["infini_attn.memory_z"] = torch.ones_like(block.infini_attn.memory_z)
 
     restored = build_block()
     restored.load_state_dict(state_dict)
     restored_state = restored.infini_attn.get_memory_state()
-    assert torch.count_nonzero(restored_state["memory_k"]) == 0, "Legacy memory_k should be discarded on load"
-    assert torch.count_nonzero(restored_state["memory_v"]) == 0, "Legacy memory_v should be discarded on load"
+    assert torch.count_nonzero(restored_state["memory_m"]) == 0, "Legacy memory should be discarded on load"
+    assert torch.count_nonzero(restored_state["memory_z"]) == 0, "Legacy memory should be discarded on load"
 
     print("Transient InfiniAttention checkpoint-state tests passed")
     return True
@@ -187,9 +220,11 @@ def _assert_checkpoint_matches_reference(granularity: str) -> None:
         head_dim=16,
         intermediate_size=128,
         block_size=4,
-        infini_memory_dim=8,
+        path_window_size=4,
+        infini_delta_rule=True,
         attn_res_init_scale=0.1,
         use_hadamard=False,
+        use_mamba3_layers=False,
     )
     reference_model = BitNetDeep(config)
     checkpoint_model = BitNetDeep(config)
@@ -249,4 +284,4 @@ if __name__ == "__main__":
     test_training_wrapper_checkpointing_matches_reference_gradients()
     test_loop_granularity_checkpointing_matches_reference_gradients()
     test_infini_attention_memory_is_not_serialized()
-    test_training_wrapper_checkpointing_matches_reference_gradients()
+    test_paper_memory_retrieve_matches_linear_formula()

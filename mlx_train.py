@@ -22,7 +22,7 @@ from mlx_optim import CMUD
 from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
 
 
-_MEMORY_STATE_NAMES = (".memory_k", ".memory_v", ".memory_initialized")
+_MEMORY_STATE_NAMES = (".memory_m", ".memory_z", ".memory_initialized")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,8 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-blocks", type=int, default=8)
     parser.add_argument("--final-blocks", type=int, default=16)
     parser.add_argument("--block-growth-ratio", type=float, default=0.6)
-    parser.add_argument("--sequence-length", type=int, default=512)
-    parser.add_argument("--path-window-size", type=int, default=64)
+    parser.add_argument("--sequence-length", type=int, default=1024)
+    parser.add_argument("--path-window-size", type=int, default=1024)
+    parser.add_argument(
+        "--mamba3-layers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mamba-3-style SSM on every mamba-layer-period-th layer starting at 0.",
+    )
+    parser.add_argument("--mamba-layer-period", type=int, default=3)
+    parser.add_argument("--mamba-d-state", type=int, default=64)
+    parser.add_argument("--mamba-expand", type=int, default=2)
+    parser.add_argument("--mamba-headdim", type=int, default=32)
     parser.add_argument("--micro-batch-size", type=int, default=4)
     parser.add_argument("--grad-accumulation-steps", type=int, default=4)
     parser.add_argument("--total-tokens", type=int, default=10_000_000)
@@ -523,6 +533,11 @@ def main() -> None:
             num_loops=args.num_loops,
             block_size=args.initial_blocks,
             path_window_size=args.path_window_size,
+            use_mamba3_layers=args.mamba3_layers,
+            mamba_layer_period=args.mamba_layer_period,
+            mamba_d_state=args.mamba_d_state,
+            mamba_expand=args.mamba_expand,
+            mamba_headdim=args.mamba_headdim,
             use_path_kernel=args.path_kernel,
             use_engram=args.engram,
             engram_layer_ids=tuple(int(value) for value in args.engram_layer_ids.split(",") if value),

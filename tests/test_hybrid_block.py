@@ -12,8 +12,7 @@ from layers.hybrid_block import HybridTransformerBlock
 
 
 def reset_memory(block: HybridTransformerBlock) -> None:
-    block.infini_attn.memory_k.zero_()
-    block.infini_attn.memory_v.zero_()
+    block.infini_attn.reset_memory()
 
 
 def test_hybrid_block():
@@ -32,6 +31,7 @@ def test_hybrid_block():
         use_engram=False,
         use_hadamard=False,
         use_4bit_activations=False,
+        use_mamba3_layers=False,
     )
 
     block = HybridTransformerBlock(config, layer_id=0)

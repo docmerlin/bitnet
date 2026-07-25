@@ -141,7 +141,7 @@ def load_model(
     expected = {
         key
         for key in parameters
-        if not key.endswith((".memory_k", ".memory_v", ".memory_initialized"))
+        if not key.endswith((".memory_m", ".memory_z", ".memory_initialized", ".memory_k", ".memory_v"))
     }
     if expected != loaded.keys():
         raise ValueError(

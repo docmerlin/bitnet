@@ -38,6 +38,13 @@ def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
         block_size=source.block_size,
         path_window_size=source.path_window_size,
         infini_memory_dim=source.infini_memory_dim,
+        infini_delta_rule=bool(getattr(source, "infini_delta_rule", True)),
+        use_mamba3_layers=getattr(source, "use_mamba3_layers", True),
+        mamba_layer_period=getattr(source, "mamba_layer_period", 3),
+        mamba_d_state=getattr(source, "mamba_d_state", 64),
+        mamba_expand=getattr(source, "mamba_expand", 2),
+        mamba_headdim=getattr(source, "mamba_headdim", 32),
+        mamba_d_conv=getattr(source, "mamba_d_conv", 4),
         use_4bit_activations=source.use_4bit_activations,
         use_hadamard=source.use_hadamard,
         rms_norm_eps=source.rms_norm_eps,
@@ -119,6 +126,20 @@ def map_pytorch_key(key: str) -> tuple[str | None, bool]:
             "gate": "memory_gate",
         }
         return prefix + "attn." + attention_names.get(attention_suffix, attention_suffix), False
+    if suffix.startswith("mamba."):
+        mamba_suffix = suffix.removeprefix("mamba.")
+        # Conv1d weight layout differs (torch OIHW vs MLX); map name and convert separately if needed.
+        mamba_names = {
+            "out_proj.weight": "out_proj.weight",
+            "in_proj.weight": "in_proj.weight",
+            "conv1d.weight": "conv1d.weight",
+            "conv1d.bias": "conv1d.bias",
+            "dt_bias": "dt_bias",
+            "B_bias": "B_bias",
+            "C_bias": "C_bias",
+            "D": "D",
+        }
+        return prefix + "mamba." + mamba_names.get(mamba_suffix, mamba_suffix), False
     raise ValueError(f"Unsupported PyTorch model key: {key}")
 
 

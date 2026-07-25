@@ -20,6 +20,7 @@ from layers.attn_res import AttentionResidual, AttnResStream, SandwichResidual
 from layers.engram import Engram
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
+from layers.mamba3 import Mamba3Mixer, is_mamba3_layer
 from layers.rfmoe import RFMoE
 
 # Near-identity residual under deep unrolls; still nonzero for grad flow.
@@ -55,7 +56,17 @@ class HybridTransformerBlock(nn.Module):
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=eps)
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=eps)
 
-        self.infini_attn = InfiniAttention(config)
+        # Mixer: every mamba_layer_period-th layer (from 0) is Mamba-3-style SSM.
+        period = int(getattr(config, "mamba_layer_period", 3))
+        self.use_mamba3 = bool(getattr(config, "use_mamba3_layers", False)) and is_mamba3_layer(
+            layer_id, period
+        )
+        if self.use_mamba3:
+            self.mamba = Mamba3Mixer(config)
+            self.infini_attn = None
+        else:
+            self.mamba = None
+            self.infini_attn = InfiniAttention(config)
 
         if self.attn_res_mode == "sandwich":
             self.attn_res = SandwichResidual(
@@ -111,9 +122,36 @@ class HybridTransformerBlock(nn.Module):
 
     def _scale_sublayer_outputs(self, scale: float) -> None:
         with torch.no_grad():
-            self.infini_attn.o_proj.weight.mul_(scale)
+            if self.infini_attn is not None:
+                self.infini_attn.o_proj.weight.mul_(scale)
+            if self.mamba is not None:
+                self.mamba.out_proj.weight.mul_(scale)
             if not self.use_rfmoe:
                 self.ffn_down.weight.mul_(scale)
+
+    def _mixer(
+        self,
+        x_norm: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        attn_bias: Optional[torch.Tensor] = None,
+        query_valid: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
+        update_memory: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if self.use_mamba3:
+            assert self.mamba is not None
+            return self.mamba(x_norm)
+        assert self.infini_attn is not None
+        self.infini_attn.num_blocks = self.num_blocks
+        return self.infini_attn(
+            x_norm,
+            attention_mask,
+            attn_bias=attn_bias,
+            query_valid=query_valid,
+            segment_ids=segment_ids,
+            update_memory=update_memory,
+        )
 
     def _dense_mlp(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, value = self.ffn_up(x).chunk(2, dim=-1)
@@ -150,8 +188,7 @@ class HybridTransformerBlock(nn.Module):
 
         residual = x
         x_norm = self.attn_norm(x)
-        self.infini_attn.num_blocks = self.num_blocks
-        infini_out = self.infini_attn(
+        mixer_out = self._mixer(
             x_norm,
             attention_mask,
             attn_bias=attn_bias,
@@ -159,7 +196,7 @@ class HybridTransformerBlock(nn.Module):
             segment_ids=segment_ids,
             update_memory=update_memory,
         )
-        x = self.attn_res(residual, torch.sigmoid(self.gate) * infini_out)
+        x = self.attn_res(residual, torch.sigmoid(self.gate) * mixer_out)
 
         residual = x
         x_norm = self.mlp_norm(x)
@@ -193,8 +230,7 @@ class HybridTransformerBlock(nn.Module):
                 segment_ids=segment_ids,
             )
 
-        self.infini_attn.num_blocks = self.num_blocks
-        attn_out = self.infini_attn(
+        attn_out = self._mixer(
             self.attn_norm(h),
             attention_mask,
             attn_bias=attn_bias,
