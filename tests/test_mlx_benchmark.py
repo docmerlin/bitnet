@@ -477,14 +477,24 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
 
     attention = MLXPaTHAttention(config)
     attention.reset_memory(1)
-    attention(mx.random.normal((1, 4, 8)), segment_ids=mx.zeros((1, 4), dtype=mx.int32), update_memory=True)
+    attention(
+        mx.random.normal((1, 4, 8)),
+        segment_ids=mx.zeros((1, 4), dtype=mx.int32),
+        update_memory=True,
+        persist_memory=True,
+    )
     mx.eval(attention.memory_initialized, attention.memory_m)
     assert attention.memory_initialized.item()
     assert mx.count_nonzero(attention.memory_m).item() > 0
 
     attention.reset_memory(2)
     mixed_segments = mx.array([[0, 0, 0, 0], [0, 0, 1, 1]])
-    attention(mx.random.normal((2, 4, 8)), segment_ids=mixed_segments, update_memory=True)
+    attention(
+        mx.random.normal((2, 4, 8)),
+        segment_ids=mixed_segments,
+        update_memory=True,
+        persist_memory=True,
+    )
     mx.eval(attention.memory_initialized)
     assert attention.memory_initialized.tolist() == [True, False]
 

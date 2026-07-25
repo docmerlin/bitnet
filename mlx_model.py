@@ -919,7 +919,13 @@ class MLXPaTHAttention(nn.Module):
         memory_m: mx.array,
         memory_z: mx.array,
     ) -> mx.array:
-        """A_mem = σ(Q) M / (σ(Q) z)."""
+        """A_mem = σ(Q) M / (σ(Q) z).
+
+        M and z are compressive buffers, not autodiff state — detach so multi-window
+        carries stay outside the training graph (required for mx.compile).
+        """
+        memory_m = mx.stop_gradient(memory_m)
+        memory_z = mx.stop_gradient(memory_z)
         sq = _infini_sigma(q.astype(mx.float32))
         numerator = sq @ memory_m
         denominator = mx.sum(sq * memory_z[:, :, None, :], axis=-1, keepdims=True)
@@ -935,9 +941,16 @@ class MLXPaTHAttention(nn.Module):
         memory_z: mx.array,
         memory_initialized: mx.array,
     ):
-        """Paper Linear or Linear+Delta update; rows masks batch items that may write."""
-        sk = _infini_sigma(keys.astype(mx.float32))
-        vf = values.astype(mx.float32)
+        """Paper Linear or Linear+Delta update; rows masks batch items that may write.
+
+        Memory banks are frozen buffers (not trainable parameters). Fully detach the
+        next state so multi-window carries do not build a BPTT chain that breaks
+        mx.compile when block_size > 1 (same idea as the prior EMA slot bank).
+        """
+        memory_m = mx.stop_gradient(memory_m)
+        memory_z = mx.stop_gradient(memory_z)
+        sk = _infini_sigma(mx.stop_gradient(keys.astype(mx.float32)))
+        vf = mx.stop_gradient(values.astype(mx.float32))
         if self.config.infini_delta_rule:
             den = mx.sum(sk * memory_z[:, :, None, :], axis=-1, keepdims=True)
             den = mx.maximum(den, _MEMORY_EPS)
@@ -951,7 +964,12 @@ class MLXPaTHAttention(nn.Module):
         rows_z = rows[:, None, None]
         next_m = mx.where(rows_m, memory_m + m_update, memory_m)
         next_z = mx.where(rows_z, memory_z + z_update, memory_z)
-        return next_m, next_z, memory_initialized | rows
+        # Detach stored carry; next top-level call also resets via reset_memory.
+        return (
+            mx.stop_gradient(next_m),
+            mx.stop_gradient(next_z),
+            mx.stop_gradient(memory_initialized | rows),
+        )
 
     @staticmethod
     def _shift(projected: mx.array, segment_ids: mx.array | None, offset: int) -> mx.array:
@@ -1406,7 +1424,20 @@ class MLXPaTHAttention(nn.Module):
         segment_ids: mx.array | None = None,
         update_memory: bool = True,
         checkpoint_activations: bool = False,
+        *,
+        persist_memory: bool = False,
     ) -> mx.array:
+        """PaTH+Infini forward.
+
+        Within-sequence memory carries through local tensors in ``forward_arrays``.
+        Persisting updated banks onto ``self.memory_*`` is opt-in
+        (``persist_memory=True``) for eager inspection; default is off because
+        writing multi-block carries into ``model.state`` under ``mx.compile``
+        fails for ``block_size >= 7``. Training resets memory each forward;
+        decode uses ``MLXPaTHInferenceCache``.
+        """
+        if self.memory_m.shape[0] != x.shape[0]:
+            self.reset_memory(x.shape[0])
         memory = (self.memory_m, self.memory_z, self.memory_initialized)
         if checkpoint_activations:
             run = activation_checkpoint(self, self.forward_arrays)
@@ -1418,9 +1449,12 @@ class MLXPaTHAttention(nn.Module):
             *memory,
             update_memory,
         )
-        if update_memory:
-            self.memory_m = memory_m
-            self.memory_z = memory_z
+        # Default: do not write new memory tensors into Module state. Callers that
+        # need inspectable buffers (unit tests, eager single-layer use) pass
+        # persist_memory=True. Inference decode uses MLXPaTHInferenceCache.
+        if update_memory and persist_memory:
+            self.memory_m = mx.stop_gradient(memory_m)
+            self.memory_z = mx.stop_gradient(memory_z)
             self.memory_initialized = memory_initialized
         return output
 
