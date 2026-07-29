@@ -14,12 +14,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import checkpoint as activation_checkpoint
 
-from mlx_path_kernel import (
-    path_triangular_solve,
-    path_triangular_solve_transpose,
-    reference_triangular_solve,
-    reference_triangular_solve_transpose,
-)
+from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
 from mlx_ternary_kernel import (
     pack_ternary_weight,
@@ -60,7 +55,13 @@ class MLXBitNetConfig:
     path_window_size: int = 1024
     # Legacy unused slot count (paper Infini uses head_dim×head_dim associative M).
     infini_memory_dim: int = 64
+    infini_memory_expand: int = 0  # Infini key-feature width; 0 = head_dim. See config.py.
+    infini_feature_map: str = "elu"  # "elu" (paper) or "favor" (exp kernel). See config.py.
     infini_delta_rule: bool = True
+    # Optional block-granular top-k retrieval branch (training only). See config.py.
+    use_topk_blocks: bool = False
+    topk_blocks: int = 4
+    topk_block_size: int = 64
     # Mamba-3-style SSM on every mamba_layer_period-th layer starting at 0 (~1/3).
     use_mamba3_layers: bool = True
     mamba_layer_period: int = 3
@@ -887,12 +888,25 @@ class MLXPaTHAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.memory_gate = mx.zeros((config.num_attention_heads,))
+        if config.use_topk_blocks:
+            # -2.0 (sigmoid ~0.12) so retrieval starts as a nudge the model can grow
+            # into. The memory gate's 0.0 init puts half the output into an untrained
+            # branch, which measurably costs perplexity before it learns its way out.
+            # Only registered when enabled, so existing checkpoints still resume.
+            self.topk_gate = mx.full((config.num_attention_heads,), -2.0)
         self.out.weight = self.out.weight * 0.01
-        # Paper Infini: M (B,H,d,d), z (B,H,d)
+        # Paper Infini: M (B,H,Dm,Dv), z (B,H,Dm). Dm is the key-feature dim and is
+        # what bounds capacity — M holds Dm*Dv numbers per head, so it stores the
+        # window losslessly once Dm >= tokens-per-reset. Dv stays head_dim.
+        self.memory_dim = int(config.infini_memory_expand) or self.head_dim
+        if self.memory_dim != self.head_dim:
+            # Shared across heads on purpose: capacity belongs in the per-head M,
+            # not in the projection, so widening Dm costs ~no extra parameters.
+            self.memory_proj = nn.Linear(self.head_dim, self.memory_dim, bias=False)
         d = self.head_dim
         h = config.num_attention_heads
-        self.memory_m = mx.zeros((0, h, d, d), dtype=mx.float32)
-        self.memory_z = mx.zeros((0, h, d), dtype=mx.float32)
+        self.memory_m = mx.zeros((0, h, self.memory_dim, d), dtype=mx.float32)
+        self.memory_z = mx.zeros((0, h, self.memory_dim), dtype=mx.float32)
         self.memory_initialized = mx.zeros((0,), dtype=mx.bool_)
         self.freeze(keys=["memory_m", "memory_z", "memory_initialized"], recurse=False)
 
@@ -900,18 +914,38 @@ class MLXPaTHAttention(nn.Module):
         batch_size = self.memory_m.shape[0] if batch_size is None else batch_size
         d = self.head_dim
         h = self.config.num_attention_heads
-        self.memory_m = mx.zeros((batch_size, h, d, d), dtype=mx.float32)
-        self.memory_z = mx.zeros((batch_size, h, d), dtype=mx.float32)
+        self.memory_m = mx.zeros((batch_size, h, self.memory_dim, d), dtype=mx.float32)
+        self.memory_z = mx.zeros((batch_size, h, self.memory_dim), dtype=mx.float32)
         self.memory_initialized = mx.zeros((batch_size,), dtype=mx.bool_)
 
     def new_inference_cache(self, batch_size: int) -> "MLXPaTHInferenceCache":
+        if self.config.use_topk_blocks:
+            raise NotImplementedError(
+                "use_topk_blocks is a training-only A/B branch: the decode cache keeps "
+                "only the open chunk and the Infini banks, so past blocks are not "
+                "retrievable. Train with it to compare perplexity, then disable it to "
+                "generate."
+            )
         d = self.head_dim
         h = self.config.num_attention_heads
         return MLXPaTHInferenceCache(
-            memory_m=mx.zeros((batch_size, h, d, d), dtype=mx.float32),
-            memory_z=mx.zeros((batch_size, h, d), dtype=mx.float32),
+            memory_m=mx.zeros((batch_size, h, self.memory_dim, d), dtype=mx.float32),
+            memory_z=mx.zeros((batch_size, h, self.memory_dim), dtype=mx.float32),
             memory_initialized=mx.zeros((batch_size,), dtype=mx.bool_),
         )
+
+    def _memory_features(self, x: mx.array) -> mx.array:
+        """phi() of the key/query features, widened to ``memory_dim`` when asked."""
+        projected = self.memory_proj(x) if self.memory_dim != self.head_dim else x
+        if self.config.infini_feature_map == "favor":
+            # exp kernel: phi(q).phi(k) approximates exp(q.k), the kernel softmax
+            # attention uses. ELU+1's constant baseline makes the weights nearly
+            # uniform, so every query reads back the same vector regardless of how
+            # big M is. Row max is subtracted for overflow safety.
+            norm = mx.sum(x * x, axis=-1, keepdims=True) / 2
+            shift = mx.max(projected, axis=-1, keepdims=True)
+            return mx.exp(projected - norm - shift)
+        return _infini_sigma(projected)
 
     def _retrieve_memory(
         self,
@@ -921,12 +955,12 @@ class MLXPaTHAttention(nn.Module):
     ) -> mx.array:
         """A_mem = σ(Q) M / (σ(Q) z).
 
-        M and z are compressive buffers, not autodiff state — detach so multi-window
-        carries stay outside the training graph (required for mx.compile).
+        M and z stay in the graph so gradient reaches whatever wrote them. Detaching
+        here leaves only σ(Q) trainable, which turns the memory into a fixed
+        content-free blur worth ~0 perplexity. ``_next_memory`` bounds how far back
+        that gradient runs.
         """
-        memory_m = mx.stop_gradient(memory_m)
-        memory_z = mx.stop_gradient(memory_z)
-        sq = _infini_sigma(q.astype(mx.float32))
+        sq = self._memory_features(q.astype(mx.float32))
         numerator = sq @ memory_m
         denominator = mx.sum(sq * memory_z[:, :, None, :], axis=-1, keepdims=True)
         denominator = mx.maximum(denominator, _MEMORY_EPS)
@@ -943,14 +977,16 @@ class MLXPaTHAttention(nn.Module):
     ):
         """Paper Linear or Linear+Delta update; rows masks batch items that may write.
 
-        Memory banks are frozen buffers (not trainable parameters). Fully detach the
-        next state so multi-window carries do not build a BPTT chain that breaks
-        mx.compile when block_size > 1 (same idea as the prior EMA slot bank).
+        Truncated BPTT, window 1: prior history is detached but this chunk's K/V stay
+        live, so the next chunk's read still teaches the model *what* to store. Full
+        BPTT across every chunk would be the textbook version, but the chain grows
+        with block_size and mx.compile dies on it ("unordered_map::at: key not found")
+        at block_size >= 7 under kimi AttnRes. Depth here is constant in block_size.
         """
         memory_m = mx.stop_gradient(memory_m)
         memory_z = mx.stop_gradient(memory_z)
-        sk = _infini_sigma(mx.stop_gradient(keys.astype(mx.float32)))
-        vf = mx.stop_gradient(values.astype(mx.float32))
+        sk = self._memory_features(keys.astype(mx.float32))
+        vf = values.astype(mx.float32)
         if self.config.infini_delta_rule:
             den = mx.sum(sk * memory_z[:, :, None, :], axis=-1, keepdims=True)
             den = mx.maximum(den, _MEMORY_EPS)
@@ -964,12 +1000,42 @@ class MLXPaTHAttention(nn.Module):
         rows_z = rows[:, None, None]
         next_m = mx.where(rows_m, memory_m + m_update, memory_m)
         next_z = mx.where(rows_z, memory_z + z_update, memory_z)
-        # Detach stored carry; next top-level call also resets via reset_memory.
-        return (
-            mx.stop_gradient(next_m),
-            mx.stop_gradient(next_z),
-            mx.stop_gradient(memory_initialized | rows),
+        return next_m, next_z, memory_initialized | rows
+
+    def _topk_context(
+        self, q_chunk: mx.array, keys: mx.array, values: mx.array, start: int
+    ) -> mx.array | None:
+        """Softmax attention over the top-k most similar whole blocks before ``start``.
+
+        Past tokens are split into ``topk_block_size`` blocks scored by mean-key
+        against the chunk's mean query; the best ``topk_blocks`` are attended in
+        full. Every selected token precedes the chunk, so causality needs no mask.
+        Returns None when no whole block has accumulated yet.
+        """
+        block = self.config.topk_block_size
+        num_blocks = start // block
+        if num_blocks == 0:
+            return None
+        take = min(self.config.topk_blocks, num_blocks)
+        batch, heads, _, dim = keys.shape
+        shape = (batch, heads, num_blocks, block, dim)
+        key_blocks = keys[:, :, : num_blocks * block].reshape(shape)
+        value_blocks = values[:, :, : num_blocks * block].reshape(shape)
+
+        summary = mx.mean(key_blocks.astype(mx.float32), axis=3)
+        probe = mx.mean(q_chunk.astype(mx.float32), axis=2, keepdims=True)
+        scores = mx.sum(summary * probe, axis=-1)
+        chosen = mx.argpartition(-scores, kth=take - 1, axis=-1)[..., :take]
+        chosen = chosen[:, :, :, None, None]
+        selected_k = mx.take_along_axis(key_blocks, chosen, axis=2).reshape(
+            batch, heads, take * block, dim
         )
+        selected_v = mx.take_along_axis(value_blocks, chosen, axis=2).reshape(
+            batch, heads, take * block, dim
+        )
+        logits = (q_chunk @ selected_k.swapaxes(-1, -2)) * self.head_dim**-0.5
+        weights = mx.softmax(logits.astype(mx.float32), axis=-1).astype(values.dtype)
+        return weights @ selected_v
 
     @staticmethod
     def _shift(projected: mx.array, segment_ids: mx.array | None, offset: int) -> mx.array:
@@ -1241,7 +1307,15 @@ class MLXPaTHAttention(nn.Module):
         return self.out(context)
 
     def _path_solve(self, system: mx.array, diagonal: mx.array, *, compile_friendly: bool = False) -> mx.array:
-        """Triangular solve. Raw Metal is compile-friendly; custom_function keeps train VJP."""
+        """Solve ``S T = diag(beta)`` by forward substitution.
+
+        Do not "optimize" this into a Neumann series (T = prod_i (I + (-L)^(2^i))).
+        It is algebraically exact for nilpotent L and benchmarks ~2.7x faster, but
+        it is not backward stable: once the learned path vectors align, entries of
+        L approach beta ~ 2 and the intermediate powers M^16 / M^32 overflow into
+        the cancellation that produces the small true inverse. Training NaNs on
+        step 1 (grad norm 3456 vs 70). Random-unit-vector tests do not catch it.
+        """
         if self.config.use_path_kernel:
             if compile_friendly:
                 from mlx_path_kernel import _run_kernel, _LOWER_SOLVE
@@ -1266,8 +1340,7 @@ class MLXPaTHAttention(nn.Module):
         gram = wf @ wf.transpose(0, 1, 3, 2)
         eye = mx.eye(length, dtype=mx.float32)
         system = eye + mx.tril(beta[..., None] * gram, k=-1)
-        diagonal = eye * beta[..., :, None]
-        t_inverse = self._path_solve(system, diagonal, compile_friendly=False)
+        t_inverse = self._path_solve(system, eye * beta[..., :, None], compile_friendly=False)
         qk = qf @ kf.transpose(0, 1, 3, 2)
         qw = mx.tril(qf @ wf.transpose(0, 1, 3, 2))
         wk = mx.tril(wf @ kf.transpose(0, 1, 3, 2), k=-1)
@@ -1288,8 +1361,7 @@ class MLXPaTHAttention(nn.Module):
         gram = wf @ wf.transpose(0, 1, 3, 2)
         eye = mx.eye(length, dtype=mx.float32)
         system = eye + mx.tril(beta_h[..., None] * gram, k=-1)
-        diagonal = eye * beta_h[..., :, None]
-        return self._path_solve(system, diagonal, compile_friendly=True)
+        return self._path_solve(system, eye * beta_h[..., :, None], compile_friendly=True)
 
     def path_border_update_t(
         self,
@@ -1366,6 +1438,46 @@ class MLXPaTHAttention(nn.Module):
             t_inverse = self.path_system_t_inverse(w, beta)
         return self.path_chunk_last_with_t(q, k, v, w, beta, log_forget, t_inverse, segment_ids)
 
+    def _chunk_bounds(self, length: int) -> list[tuple[int, int]]:
+        """Half-open [start, end) spans of each local-attention chunk."""
+        block_width = self.fixed_block_width or (length + self.num_blocks - 1) // self.num_blocks
+        bounds = []
+        for block_start in range(0, length, block_width):
+            block_end = min(block_start + block_width, length)
+            for start in range(block_start, block_end, self.config.path_window_size):
+                bounds.append((start, min(start + self.config.path_window_size, block_end)))
+        return bounds
+
+    def _batched_path_chunks(self, q, k, v, w, beta, log_forget, segment_ids, count):
+        """Run all equal-width chunks through ``path_chunk`` as one batched call.
+
+        A single 64x64 chunk nowhere near saturates the GPU — the triangular solve
+        gets one thread per column — so the loop was launch-bound rather than
+        FLOP-bound. Stacking chunks onto the batch axis is the same arithmetic with
+        ``count`` times the parallelism. Returns (batch, count, heads, width, dim).
+        """
+        batch, heads, length, dim = q.shape
+        width = length // count
+        merged = batch * count
+
+        def fold(t):  # (B, H, count*width, D) -> (B*count, H, width, D)
+            return (
+                t.reshape(batch, heads, count, width, dim)
+                .transpose(0, 2, 1, 3, 4)
+                .reshape(merged, heads, width, dim)
+            )
+
+        stacked = self.path_chunk(
+            fold(q),
+            fold(k),
+            fold(v),
+            w.reshape(merged, width, heads, dim),
+            beta.reshape(merged, width, heads),
+            log_forget.reshape(merged, width, heads),
+            None if segment_ids is None else segment_ids.reshape(merged, width),
+        )
+        return stacked.reshape(batch, count, heads, width, dim)
+
     def forward_arrays(
         self,
         x: mx.array,
@@ -1378,16 +1490,22 @@ class MLXPaTHAttention(nn.Module):
         batch, length, hidden = x.shape
         q, k, v, w, beta, log_forget, _ = self._project(x, segment_ids)
         chunks = []
-        block_width = self.fixed_block_width or (length + self.num_blocks - 1) // self.num_blocks
+        bounds = self._chunk_bounds(length)
         memory_safe = (
             mx.ones((batch,), dtype=mx.bool_)
             if segment_ids is None
             else mx.all(segment_ids == segment_ids[:, :1], axis=1)
         )
-        for block_start in range(0, length, block_width):
-            block_end = min(block_start + block_width, length)
-            for start in range(block_start, block_end, self.config.path_window_size):
-                end = min(start + self.config.path_window_size, block_end)
+        # Local attention is chunk-independent, so run every chunk in one batched
+        # call; only the Infini carry below has to stay sequential.
+        widths = {end - start for start, end in bounds}
+        stacked = (
+            self._batched_path_chunks(q, k, v, w, beta, log_forget, segment_ids, len(bounds))
+            if len(widths) == 1 and len(bounds) > 1
+            else None
+        )
+        for index, (start, end) in enumerate(bounds):
+            if stacked is None:
                 chunk_segments = segment_ids[:, start:end] if segment_ids is not None else None
                 local = self.path_chunk(
                     q[:, :, start:end],
@@ -1398,23 +1516,32 @@ class MLXPaTHAttention(nn.Module):
                     log_forget[:, start:end],
                     chunk_segments,
                 )
-                memory_context = self._retrieve_memory(
-                    q[:, :, start:end], memory_m, memory_z
-                ).astype(v.dtype)
-                gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
-                mixed = (1.0 - gate) * local + gate * memory_context
-                use_memory = memory_initialized & memory_safe
-                local = mx.where(use_memory[:, None, None, None], mixed, local)
-                if update_memory:
-                    memory_m, memory_z, memory_initialized = self._next_memory(
-                        k[:, :, start:end],
-                        v[:, :, start:end],
-                        memory_safe,
-                        memory_m,
-                        memory_z,
-                        memory_initialized,
-                    )
-                chunks.append(local)
+            else:
+                local = stacked[:, index]
+            memory_context = self._retrieve_memory(
+                q[:, :, start:end], memory_m, memory_z
+            ).astype(v.dtype)
+            gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
+            mixed = (1.0 - gate) * local + gate * memory_context
+            use_memory = memory_initialized & memory_safe
+            local = mx.where(use_memory[:, None, None, None], mixed, local)
+            if self.config.use_topk_blocks:
+                retrieved = self._topk_context(q[:, :, start:end], k, v, start)
+                if retrieved is not None:
+                    topk_gate = mx.sigmoid(self.topk_gate)[None, :, None, None]
+                    blended = (1.0 - topk_gate) * local + topk_gate * retrieved
+                    # Cross-block retrieval would leak across packed documents.
+                    local = mx.where(memory_safe[:, None, None, None], blended, local)
+            if update_memory:
+                memory_m, memory_z, memory_initialized = self._next_memory(
+                    k[:, :, start:end],
+                    v[:, :, start:end],
+                    memory_safe,
+                    memory_m,
+                    memory_z,
+                    memory_initialized,
+                )
+            chunks.append(local)
         context = mx.concatenate(chunks, axis=2).transpose(0, 2, 1, 3).reshape(batch, length, hidden)
         return self.out(context), memory_m, memory_z, memory_initialized
 
@@ -1438,7 +1565,16 @@ class MLXPaTHAttention(nn.Module):
         """
         if self.memory_m.shape[0] != x.shape[0]:
             self.reset_memory(x.shape[0])
-        memory = (self.memory_m, self.memory_z, self.memory_initialized)
+        # Detach only where memory enters from module state. These banks are frozen
+        # buffers inside mx.compile's `inputs=model.state`; leaving them in the graph
+        # makes autodiff look for a gradient slot they do not have ("key not found").
+        # The chunk-to-chunk carry built in forward_arrays stays differentiable, which
+        # is what lets gradient reach the K/V that wrote the memory.
+        memory = (
+            mx.stop_gradient(self.memory_m),
+            mx.stop_gradient(self.memory_z),
+            self.memory_initialized,
+        )
         if checkpoint_activations:
             run = activation_checkpoint(self, self.forward_arrays)
         else:

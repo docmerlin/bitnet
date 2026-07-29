@@ -50,7 +50,19 @@ class InfiniAttention(nn.Module):
         self.path_forget = nn.Linear(hidden_size, num_heads)
         nn.init.normal_(self.path_conv_weight, std=config.initializer_range)
         self.gate = nn.Parameter(torch.zeros(num_heads))
+        self.use_topk_blocks = bool(getattr(config, "use_topk_blocks", False))
+        if self.use_topk_blocks:
+            # -2.0 (sigmoid ~0.12): start retrieval as a nudge, not half the output.
+            # Only registered when enabled, so checkpoints without the branch stay
+            # loadable and no dead parameter shows up in gradient checks.
+            self.topk_gate = nn.Parameter(torch.full((num_heads,), -2.0))
         self.update_memory_buffers = True
+
+        # Infini memory capacity is memory_dim * head_dim per head; memory_dim is the
+        # only knob that changes how much it can hold. Shared across heads on purpose.
+        self.memory_dim = int(getattr(config, "infini_memory_expand", 0)) or self.head_dim
+        if self.memory_dim != self.head_dim:
+            self.memory_proj = nn.Linear(self.head_dim, self.memory_dim, bias=False)
 
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -58,12 +70,12 @@ class InfiniAttention(nn.Module):
         # Paper memory: M ∈ R^{d×d} associative bindings, z ∈ R^{d} key normalizer.
         self.register_buffer(
             "memory_m",
-            torch.zeros(0, num_heads, self.head_dim, self.head_dim),
+            torch.zeros(0, num_heads, self.memory_dim, self.head_dim),
             persistent=False,
         )
         self.register_buffer(
             "memory_z",
-            torch.zeros(0, num_heads, self.head_dim),
+            torch.zeros(0, num_heads, self.memory_dim),
             persistent=False,
         )
         self.register_buffer("memory_initialized", torch.zeros(0, dtype=torch.bool), persistent=False)
@@ -109,8 +121,8 @@ class InfiniAttention(nn.Module):
         device = self.qkv.weight.device
         d = self.head_dim
         h = self.num_heads
-        self.memory_m = torch.zeros(batch_size, h, d, d, device=device)
-        self.memory_z = torch.zeros(batch_size, h, d, device=device)
+        self.memory_m = torch.zeros(batch_size, h, self.memory_dim, d, device=device)
+        self.memory_z = torch.zeros(batch_size, h, self.memory_dim, device=device)
         self.memory_initialized = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     def get_memory_state(self) -> dict[str, torch.Tensor]:
@@ -156,10 +168,14 @@ class InfiniAttention(nn.Module):
             self.update_memory_buffers = previous_update
             self.load_memory_state(previous_state)
 
-    @staticmethod
-    def _sigma(x: torch.Tensor) -> torch.Tensor:
-        """ELU+1 feature map from Linear Transformer / Infini-attention paper."""
-        return F.elu(x) + 1.0
+    def _sigma(self, x: torch.Tensor) -> torch.Tensor:
+        """phi() of the key/query features; see mlx_model.MLXPaTHAttention._memory_features."""
+        projected = self.memory_proj(x) if self.memory_dim != self.head_dim else x
+        if getattr(self.config, "infini_feature_map", "elu") == "favor":
+            norm = x.pow(2).sum(dim=-1, keepdim=True) / 2
+            shift = projected.max(dim=-1, keepdim=True).values
+            return torch.exp(projected - norm - shift)
+        return F.elu(projected) + 1.0
 
     def _retrieve_memory(
         self,
@@ -181,7 +197,14 @@ class InfiniAttention(nn.Module):
         memory_m: torch.Tensor,
         memory_z: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Linear or Linear+Delta associative update (paper eqs. 8–9)."""
+        """Linear or Linear+Delta associative update (paper eqs. 8–9).
+
+        Truncated BPTT, window 1: history is detached, this chunk's K/V stay live.
+        Keeps gradient on the write path while matching the MLX port, which cannot
+        afford full BPTT here (see ``mlx_model.MLXPaTHAttention._next_memory``).
+        """
+        memory_m = memory_m.detach()
+        memory_z = memory_z.detach()
         sk = self._sigma(k.float())
         vf = v.float()
         if self.use_delta_rule:
@@ -194,6 +217,37 @@ class InfiniAttention(nn.Module):
             memory_m = memory_m + torch.matmul(sk.transpose(-2, -1), vf)
         memory_z = memory_z + sk.sum(dim=2)
         return memory_m, memory_z
+
+    def _topk_context(
+        self, q_chunk: torch.Tensor, k: torch.Tensor, v: torch.Tensor, start: int
+    ) -> Optional[torch.Tensor]:
+        """Softmax attention over the top-k most similar whole blocks before ``start``.
+
+        Mirrors ``mlx_model.MLXPaTHAttention._topk_context``: past tokens are split
+        into ``topk_block_size`` blocks, scored by mean-key against the chunk's mean
+        query, and the best ``topk_blocks`` are attended in full. Selected tokens all
+        precede the chunk, so causality needs no mask.
+        """
+        block = int(self.config.topk_block_size)
+        num_blocks = start // block
+        if num_blocks == 0:
+            return None
+        take = min(int(self.config.topk_blocks), num_blocks)
+        batch, heads, _, dim = k.shape
+        shape = (batch, heads, num_blocks, block, dim)
+        key_blocks = k[:, :, : num_blocks * block].reshape(shape)
+        value_blocks = v[:, :, : num_blocks * block].reshape(shape)
+
+        summary = key_blocks.float().mean(dim=3)
+        probe = q_chunk.float().mean(dim=2, keepdim=True)
+        scores = (summary * probe).sum(dim=-1)
+        chosen = scores.topk(take, dim=-1).indices[..., None, None]
+        chosen = chosen.expand(-1, -1, -1, block, dim)
+        selected_k = key_blocks.gather(2, chosen).reshape(batch, heads, take * block, dim)
+        selected_v = value_blocks.gather(2, chosen).reshape(batch, heads, take * block, dim)
+        logits = torch.matmul(q_chunk, selected_k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        weights = torch.softmax(logits.float(), dim=-1).to(dtype=v.dtype)
+        return torch.matmul(weights, selected_v)
 
     def _path_vectors(self, x: torch.Tensor, segment_ids: Optional[torch.Tensor]) -> torch.Tensor:
         """Paper PaTH low-rank projection, causal width-3 depthwise conv, L2 norm."""
@@ -338,6 +392,15 @@ class InfiniAttention(nn.Module):
                 mixed_context = (1.0 - gate) * local_context + gate * memory_context
                 initialized = memory_initialized.view(-1, 1, 1, 1)
                 local_context = torch.where(initialized, mixed_context, local_context)
+            if self.use_topk_blocks and memory_safe:
+                # memory_safe already rules out packed documents, which cross-block
+                # retrieval would leak across.
+                retrieved = self._topk_context(q[:, :, start:end], k, v, start)
+                if retrieved is not None:
+                    topk_gate = torch.sigmoid(self.topk_gate).view(1, self.num_heads, 1, 1)
+                    local_context = (
+                        1.0 - topk_gate
+                    ) * local_context + topk_gate * retrieved.to(dtype=local_context.dtype)
             chunks.append(local_context)
             if memory_safe and update_memory:
                 memory_m, memory_z = self._update_memory_state(

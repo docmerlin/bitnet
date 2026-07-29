@@ -3,6 +3,19 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 
+def effective_path_window(
+    *, path_window_size: int, block_size: int, sequence_length: int
+) -> int:
+    """Chunk width PaTH local attention actually uses.
+
+    ``block_size`` partitions the sequence first and ``path_window_size`` only
+    caps each block, so a window wider than ``sequence_length / block_size``
+    never binds. At seq 1024 with 16 blocks every window >= 64 is identical.
+    """
+    block_width = (sequence_length + block_size - 1) // block_size
+    return min(int(path_window_size), block_width)
+
+
 def _nearest_odd_table_size(target: int) -> int:
     """Pick an odd table size near ``target`` (hash-friendly; avoid tiny tables)."""
     n = max(17, int(target) | 1)  # odd, at least 17
@@ -66,7 +79,26 @@ class TernaryConfig:
     # Paper Infini (arXiv:2404.07143): associative M is head_dim×head_dim per head.
     # infini_memory_dim is legacy/unused (kept for CLI + old configs).
     infini_memory_dim: int = 64
+    # Key-feature width of the Infini memory. M holds infini_memory_expand * head_dim
+    # numbers per head, so this is the only knob that changes how much the memory can
+    # actually hold; 0 keeps the paper's head_dim. Useful ceiling is the number of
+    # tokens between memory resets (one sequence in training) — past that you are
+    # paying for capacity the horizon never fills.
+    infini_memory_expand: int = 0
+    # Feature map phi() behind the associative memory. "elu" is the paper's ELU+1;
+    # its near-constant baseline makes phi(q).phi(k) nearly uniform, so every query
+    # reads back roughly the same vector no matter how large the memory is. "favor"
+    # uses the exp kernel (Performer FAVOR+), which approximates softmax attention
+    # and makes reads content-dependent. Needs infini_memory_expand > 0 to have
+    # random features to project onto.
+    infini_feature_map: str = "elu"
     infini_delta_rule: bool = True  # Linear+Delta memory update; False = plain Linear
+    # Optional third attention branch: block-granular top-k retrieval over past
+    # tokens, alongside the local PaTH window and the Infini memory. Training only
+    # (decode caches keep no full history). Off by default; A/B with --topk-blocks.
+    use_topk_blocks: bool = False
+    topk_blocks: int = 4        # past blocks retrieved per query chunk
+    topk_block_size: int = 64   # tokens per retrievable block
     # Hybrid depth: every ``mamba_layer_period``-th unique layer (starting at 0) uses a
     # Mamba-3-style selective SSM mixer instead of PaTH+Infini. period=3 → ~1/3 layers.
     use_mamba3_layers: bool = True
@@ -126,6 +158,13 @@ class TernaryConfig:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.path_window_size < 1:
             raise ValueError("path_window_size must be positive")
+        if int(self.infini_memory_expand) < 0:
+            raise ValueError("infini_memory_expand must be non-negative (0 = head_dim)")
+        if self.infini_feature_map not in ("elu", "favor"):
+            raise ValueError("infini_feature_map must be 'elu' or 'favor'")
+        self.use_topk_blocks = bool(self.use_topk_blocks)
+        if min(int(self.topk_blocks), int(self.topk_block_size)) < 1:
+            raise ValueError("topk_blocks and topk_block_size must be positive")
         if int(self.mamba_layer_period) < 1:
             raise ValueError("mamba_layer_period must be >= 1")
         self.mamba_layer_period = int(self.mamba_layer_period)

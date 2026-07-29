@@ -15,6 +15,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
+from config import effective_path_window
 from data.presets import parse_mixture
 from data.streams import build_batch_stream
 from mlx_model import MLXBitNet, MLXBitNetConfig
@@ -73,6 +74,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-growth-ratio", type=float, default=0.6)
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--path-window-size", type=int, default=1024)
+    parser.add_argument(
+        "--topk-blocks-branch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add a block-granular top-k retrieval branch alongside local PaTH and "
+        "Infini memory. Training only — decode raises if this is on.",
+    )
+    parser.add_argument(
+        "--infini-memory-expand",
+        type=int,
+        default=0,
+        help="Infini memory key-feature width (0 = head_dim). Capacity is this times "
+        "head_dim per head; useful ceiling is tokens-per-reset (one sequence).",
+    )
+    parser.add_argument(
+        "--infini-feature-map",
+        choices=("elu", "favor"),
+        default="elu",
+        help="Infini memory kernel: elu (paper) or favor (exp kernel, content-dependent reads).",
+    )
+    parser.add_argument("--topk-blocks", type=int, default=4)
+    parser.add_argument("--topk-block-size", type=int, default=64)
     parser.add_argument(
         "--mamba3-layers",
         action=argparse.BooleanOptionalAction,
@@ -173,17 +196,26 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("loop curriculum must satisfy 0 <= start <= end <= 1")
 
 
+def _compile_supported(config: MLXBitNetConfig) -> bool:
+    """Whether mx.compile can build this model's graph at all.
+
+    RFMoE's non-metal backends compact dynamically. The top-k retrieval branch
+    emits a data-dependent gather per chunk over a growing history, which overflows
+    the compiler ("unordered_map::at: key not found") once block_size >= 7 under
+    kimi AttnRes — the same wall that caps the Infini carry to one-step BPTT.
+    """
+    if config.use_topk_blocks:
+        return False
+    return not config.use_rfmoe or config.rfmoe_backend == "metal"
+
+
 def _gradient_compile_safe(
     config: MLXBitNetConfig,
     requested: bool,
     sequence_length: int,
     active_blocks: int,
 ) -> bool:
-    return (
-        requested
-        and sequence_length % active_blocks == 0
-        and (not config.use_rfmoe or config.rfmoe_backend == "metal")
-    )
+    return requested and sequence_length % active_blocks == 0 and _compile_supported(config)
 
 
 def _masked_ce(logits, targets, valid):
@@ -272,13 +304,13 @@ def create_gradient_step(
         return loss
 
     gradient_step = nn.value_and_grad(model, loss_fn)
-    if compile_step and (not model.config.use_rfmoe or model.config.rfmoe_backend == "metal"):
+    if compile_step and _compile_supported(model.config):
         gradient_step = partial(mx.compile, inputs=model.state, outputs=model.state)(gradient_step)
     return gradient_step
 
 
 def create_train_step(model: MLXBitNet, optimizer: optim.Optimizer, *, compile_step: bool = True):
-    compile_step = compile_step and (not model.config.use_rfmoe or model.config.rfmoe_backend == "metal")
+    compile_step = compile_step and _compile_supported(model.config)
     optimizer.init(model.trainable_parameters())
     gradient_step = create_gradient_step(
         model,
@@ -533,6 +565,11 @@ def main() -> None:
             num_loops=args.num_loops,
             block_size=args.initial_blocks,
             path_window_size=args.path_window_size,
+            infini_memory_expand=args.infini_memory_expand,
+            infini_feature_map=args.infini_feature_map,
+            use_topk_blocks=args.topk_blocks_branch,
+            topk_blocks=args.topk_blocks,
+            topk_block_size=args.topk_block_size,
             use_mamba3_layers=args.mamba3_layers,
             mamba_layer_period=args.mamba_layer_period,
             mamba_d_state=args.mamba_d_state,
@@ -640,6 +677,32 @@ def main() -> None:
     print(f"Device: {mx.device_info()['device_name']}")
     print(f"Model parameters: {parameters / 1e6:.2f}M")
     print(f"Effective depth: {config.effective_depth}")
+    window_start, window_end = (
+        effective_path_window(
+            path_window_size=config.path_window_size,
+            block_size=blocks,
+            sequence_length=args.sequence_length,
+        )
+        for blocks in (args.initial_blocks, args.final_blocks)
+    )
+    print(
+        f"PaTH local window: {window_start} -> {window_end} tokens "
+        f"(path_window_size={config.path_window_size}, blocks {args.initial_blocks} -> {args.final_blocks})"
+    )
+    if config.path_window_size > max(window_start, window_end):
+        print(
+            f"Warning: path_window_size={config.path_window_size} never binds at "
+            f"sequence-length={args.sequence_length}; block_size caps the window at "
+            f"{max(window_start, window_end)}. Lower --final-blocks to widen it.",
+            flush=True,
+        )
+    if config.use_topk_blocks:
+        print(
+            f"Top-k retrieval branch: on ({config.topk_blocks} blocks of "
+            f"{config.topk_block_size} tokens). mx.compile is disabled for this run, "
+            "so compare wall-clock only against another top-k run.",
+            flush=True,
+        )
     print(f"Early training mixture: {early_spec}")
     if late_stream is not None:
         print(f"Late training mixture: {args.late_train_mixture}")
