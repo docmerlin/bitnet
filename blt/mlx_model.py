@@ -235,12 +235,20 @@ class MLXLocalDecoder(nn.Module):
 
 
 class MLXTernaryBLTModel(nn.Module):
-    def __init__(self, config: TernaryBLTConfig) -> None:
+    def __init__(self, config: TernaryBLTConfig, *, global_transformer: nn.Module | None = None) -> None:
+        """``global_transformer`` swaps the patch-level backbone.
+
+        Defaults to BLT's own plain stack. Pass
+        :class:`blt.mlx_global.MLXBitNetGlobalTransformer` to run the BitNet
+        model -- PaTH, Infini, RFMoE, Mamba-3 -- over the patch latents instead.
+        Anything with a ``(patch_states, attention_mask=...) -> latents``
+        signature works.
+        """
         super().__init__()
         self.config = config
         self.byte_embeddings = nn.Embedding(config.vocab_size, config.local_dim)
         self.local_encoder = MLXLocalEncoder(config)
-        self.global_transformer = MLXGlobalTransformer(config)
+        self.global_transformer = global_transformer or MLXGlobalTransformer(config)
         self.local_decoder = MLXLocalDecoder(config)
         self.output_head = MLXHBitLinear(config.decoder_dim, config.vocab_size, config=config)
         self.patch_size = config.patch_size

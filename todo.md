@@ -211,6 +211,37 @@ Priority order after current cache/MTP inference work:
   are unavailable for now. Single M1 Max estimates are roughly 30–60 tok/s at 1B scale;
   revisit PyTorch/CUDA or distributed benchmarking when hardware access changes.
 
+### BLT as the main model
+
+- [ ] **Resolve the CMUD/BitNet-global NaN.** `blt/mlx_global.py` wires MLXBitNet in as
+  BLT's global transformer, and it trains under AdamW (loss 5.592 -> 4.899 on a README
+  corpus). Under CMUD it reaches NaN by the third step (5.592, 5.561, nan) on the same
+  seed and data. It is not a single-step MUD failure: whitening every 2D gradient at step
+  0 stays finite, so it takes two updates for the parameters to reach a state MUD cannot
+  handle. Until this is understood the trainer prints a warning and callers should pass
+  AdamW explicitly. Pure-BLT training with CMUD is unaffected.
+- [ ] **Padding is not inert for the BitNet backbone.** Zero-length patches perturb it:
+  measured drift 0.0 / 1.4e-3 / 2.2e-1 at 1 / 2 / 8 layers, the last a relative error of
+  1.0. It does not grow with the amount of padding, so a small perturbation is being
+  amplified through depth by the 4-bit activation quantisation (a step function -- one
+  flipped bucket cascades). Fixing the PaTH block width does not help, so the cause is
+  elsewhere in the block, most likely the AttnRes stream mixing across layers. Worked
+  around by patching to a fixed count (`patches_per_sequence`) so no padding exists;
+  worth finding the real cause, since it also means the backbone's output depends on
+  sequence length in a way it probably should not.
+- [ ] **Hash n-gram embeddings in the local encoder.** Engram cannot follow BLT into the
+  global model -- it hashes token n-grams and patches have no ids. Meta's BLT puts hash
+  n-gram embeddings in the local *encoder*, over bytes, which is the level at which
+  n-grams exist, and this repo has none. Closest existing code is `MLXEngram`.
+- [ ] **Deduplicate HBitLinear.** Three implementations: `layers/h_bitlinear.py` (torch),
+  `mlx_model.py` (BitNet MLX), `blt/mlx_layers.py` (BLT MLX). The two MLX ones use
+  identical quantisation maths -- verified numerically -- but BitNet's adds weight
+  pinning, packed ternary kernels and quantisation-state ramping that BLT's lacks. BLT
+  should adopt it and inherit the fast paths; the blocker is that it takes an
+  `MLXBitNetConfig` and reads `activation_bits`, which `TernaryBLTConfig` has no field
+  for. The two MLX transformer blocks are *not* redundant: BLT's plain SwiGLU block is
+  right for the local encoder/decoder, where PaTH and Infini would not be.
+
 ### BLT generation performance
 
 - [ ] **Deferred: evaluate BLT-S self-speculation once a BLT student is trained.** BLT-S

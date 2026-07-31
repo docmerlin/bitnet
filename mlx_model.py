@@ -2063,6 +2063,11 @@ class MLXBitNet(nn.Module):
             if block.attn is not None:
                 block.attn.reset_memory(batch_size)
 
+    @property
+    def uses_engram(self) -> bool:
+        """Whether any block hashes token n-grams, the one thing needing ids."""
+        return any(block.engram is not None for block in self.blocks)
+
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
         def update(_, module):
             if isinstance(module, MLXHBitLinear):
@@ -2658,21 +2663,41 @@ class MLXBitNet(nn.Module):
 
     def hidden_states(
         self,
-        tokens: mx.array,
+        tokens: mx.array | None = None,
         segment_ids: mx.array | None = None,
         num_loops: int | None = None,
         reset_memory: bool = True,
         checkpoint_activations: bool | str = False,
+        *,
+        inputs_embeds: mx.array | None = None,
     ) -> mx.array:
+        """Run the block stack, from token ids or from embeddings already computed.
+
+        ``inputs_embeds`` lets this stack serve as BLT's global transformer,
+        which operates on pooled patch latents rather than a token sequence.
+        Nothing in the stack needs discrete ids except Engram, whose n-gram
+        hashing is defined over a vocabulary -- everything else (PaTH, Infini,
+        Mamba-3, RFMoE) reads hidden states only. So ``tokens`` stays required
+        exactly when Engram is active and is otherwise optional.
+        """
+        if (tokens is None) == (inputs_embeds is None):
+            raise ValueError("pass exactly one of tokens or inputs_embeds")
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
         checkpoint_scope = "all" if checkpoint_activations is True else checkpoint_activations or "none"
         if checkpoint_scope not in ("none", "recurrent", "all"):
             raise ValueError("checkpoint_activations must be none, recurrent, or all")
+
+        if inputs_embeds is not None and self.uses_engram:
+            raise ValueError(
+                "Engram hashes token n-grams and cannot run on embeddings alone; "
+                "disable it (use_engram=False) to drive this stack from inputs_embeds"
+            )
+        batch_size = tokens.shape[0] if tokens is not None else inputs_embeds.shape[0]
         if reset_memory:
-            self.reset_memory(tokens.shape[0])
-        x = self.subln(self.embedding(tokens))
+            self.reset_memory(batch_size)
+        x = self.subln(self.embedding(tokens) if inputs_embeds is None else inputs_embeds)
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
         # Prelude: one AttnRes segment (or sandwich stack).

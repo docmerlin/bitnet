@@ -84,7 +84,12 @@ class TrainingConfig:
     mud_block_size: int = MUD_BLOCK_SIZE
     compile_step: bool = True
     # Patch-count bucket for compiled runs; see pad_patch_lengths_to_bucket.
+    # Ignored when patches_per_sequence is set, and unsafe with the BitNet
+    # global backbone -- see blt.mlx_global.
     patch_bucket: int = 32
+    # Fixed patches per sequence. Gives stable shapes without any padding, which
+    # is what the BitNet global backbone needs to run compiled.
+    patches_per_sequence: int | None = None
 
 
 def learning_rate_at(step: int, config: TrainingConfig) -> float:
@@ -146,6 +151,20 @@ class MLXBLTTrainer:
         if self.weights.hard_ce <= 0.0 and not self.has_teacher:
             raise ValueError("training from a raw corpus needs hard_ce > 0")
 
+        if optimizer is None and not getattr(model.global_transformer, "accepts_padding", True):
+            # Measured: with the BitNet global backbone, CMUD reaches NaN by the
+            # third step (5.592, 5.561, nan) while AdamW trains normally on the
+            # same seed and data (5.592 -> 4.899). It is not a single-step MUD
+            # failure -- whitening every gradient at step 0 stays finite -- so
+            # the interaction is unresolved. Warn loudly rather than default a
+            # configuration that silently diverges; pass an optimizer explicitly
+            # to choose either way.
+            print(
+                "warning: CMUD diverges to NaN within a few steps against the "
+                "BitNet global backbone (unresolved). Pass optimizer=AdamW(...) "
+                "until that is fixed.",
+                flush=True,
+            )
         self.optimizer = optimizer or BLTCMUD(
             mud_learning_rate=config.learning_rate,
             fallback_learning_rate=config.fallback_learning_rate,
@@ -154,6 +173,20 @@ class MLXBLTTrainer:
         )
         self._rng = np.random.default_rng(config.seed)
         self._loss_and_grad = nn.value_and_grad(self.model, self._loss)
+        # Config-time rather than per-batch: detecting padding means reading the
+        # mask, which forces a sync and blocks compilation.
+        if (
+            not getattr(model.global_transformer, "accepts_padding", True)
+            and config.patches_per_sequence is None
+            and config.patch_bucket > 0
+            and patcher is not None
+        ):
+            raise ValueError(
+                "this global backbone cannot take padded patches, but entropy "
+                "patching with patch_bucket > 0 produces them. Set "
+                "patches_per_sequence for stable shapes without padding, or "
+                "patch_bucket=0 to accept recompiles."
+            )
         if config.compile_step:
             # The forward validates its attention mask by reading it, which
             # forces a sync and makes compilation impossible. Batches here are
@@ -161,6 +194,8 @@ class MLXBLTTrainer:
             # the check has nothing to catch and is turned off rather than
             # working around.
             self.model.validate_inputs = False
+            if hasattr(self.model.global_transformer, "validate_inputs"):
+                self.model.global_transformer.validate_inputs = False
             self._loss_and_grad = mx.compile(
                 self._loss_and_grad, inputs=[self.model.state], outputs=[self.model.state]
             )
@@ -207,9 +242,21 @@ class MLXBLTTrainer:
             return build_uniform_patch_lengths(
                 tokens.shape[0], tokens.shape[1], self.model.config.patch_size
             )
+        # A fixed count already yields one shape, so no padding is needed --
+        # the only option the BitNet global backbone can use, since padding
+        # perturbs it (see blt.mlx_global).
+        if self.config.patches_per_sequence is not None:
+            return mx.stop_gradient(
+                self.patcher.predict_patch_lengths(
+                    tokens, num_patches=self.config.patches_per_sequence
+                )
+            )
         lengths = mx.stop_gradient(self.patcher.predict_patch_lengths(tokens))
-        # Entropy patching changes the patch count almost every batch, which
-        # would make a compiled step recompile continuously.
+        # Otherwise entropy patching changes the patch count almost every batch,
+        # which would make a compiled step recompile continuously. patch_bucket=0
+        # opts out.
+        if self.config.patch_bucket <= 0:
+            return lengths
         return pad_patch_lengths_to_bucket(lengths, self.config.patch_bucket)
 
     def sample_batch(self) -> dict[str, mx.array]:
