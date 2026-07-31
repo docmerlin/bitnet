@@ -39,6 +39,17 @@ class TernaryBLTConfig:
     n_heads_local_decoder: int = 4
     n_heads_cross: int = 4
 
+    # Key/value slots each patch presents to the decoder's cross-attention.
+    #
+    # A byte belongs to exactly one patch, so at k=1 the cross-attention mask is
+    # one-hot, softmax over its single permitted key is a constant 1, and the
+    # query/key projections cannot affect the output -- they take exactly zero
+    # gradient. Meta's BLT defaults to 2 for this reason: the patch latent is
+    # projected to k vectors, the byte attends across them, and the choice
+    # becomes real. k=1 is still supported and takes a cheaper gather path that
+    # skips the inert projections entirely.
+    cross_attn_k: int = 2
+
     ffn_multiplier_local: float = 4.0
     ffn_multiplier_global: float = 4.0
     ffn_multiplier_decoder: float = 4.0
@@ -47,7 +58,10 @@ class TernaryBLTConfig:
     dropout: float = 0.0
     rope_theta: float = 10000.0
 
-    patch_size: int = 6
+    # Meta's teacher averages ~4.5 bytes per patch and the BLT paper's entropy
+    # patcher runs finer still; 4 keeps the uniform fallback in that range rather
+    # than handing the global model a 6x-compressed sequence it was not tuned for.
+    patch_size: int = 4
     max_patch_length: int = 32
 
     use_hadamard: bool = True
@@ -66,6 +80,8 @@ class TernaryBLTConfig:
             raise ValueError("max_patch_length must be positive")
         if self.distill_temperature <= 0:
             raise ValueError("distill_temperature must be positive")
+        if self.cross_attn_k <= 0:
+            raise ValueError("cross_attn_k must be positive")
         if self.pad_id < -1:
             raise ValueError("pad_id must be -1 or a non-negative token id")
         if 0 <= self.pad_id < self.offset + self.byte_vocab_size:

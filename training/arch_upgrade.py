@@ -10,6 +10,14 @@ import torch.nn as nn
 
 FFN_MID_KEY_TOKENS = ("ffn_mid", "w_mid", "mid_proj")
 
+# The BLT local decoder's cross-attention had a one-hot mask by construction --
+# every byte reads exactly the patch it belongs to -- so softmax over its single
+# permitted key was a constant 1 and these three could not affect the output.
+# They received exactly zero gradient. TernaryPatchGather replaced the module
+# with the gather it always was; checkpoints written before that still carry
+# these tensors and must be allowed to load past them.
+RETIRED_DECODER_CROSS_ATTN_TOKENS = ("query_norm", "q_proj", "k_proj")
+
 
 def is_ffn_mid_key(key: str) -> bool:
     """True for the 3-stage FFN mid mats (dense / RFMoE / BLT)."""
@@ -18,6 +26,17 @@ def is_ffn_mid_key(key: str) -> bool:
 
 def filter_ffn_mid_keys(keys: Iterable[str]) -> List[str]:
     return [k for k in keys if is_ffn_mid_key(k)]
+
+
+def is_retired_decoder_cross_attn_key(key: str) -> bool:
+    """True for a query/key tensor of the retired BLT decoder cross-attention."""
+    if "local_decoder.cross_attn_layers" not in key:
+        return False
+    return any(f".{token}." in key for token in RETIRED_DECODER_CROSS_ATTN_TOKENS)
+
+
+def filter_retired_decoder_cross_attn_keys(keys: Iterable[str]) -> List[str]:
+    return [k for k in keys if is_retired_decoder_cross_attn_key(k)]
 
 
 @torch.no_grad()

@@ -593,6 +593,7 @@ def run_distillation(
     if checkpoint is not None:
         from training.arch_upgrade import (
             filter_ffn_mid_keys,
+            filter_retired_decoder_cross_attn_keys,
             init_missing_ffn_mid_identity,
         )
 
@@ -600,10 +601,21 @@ def run_distillation(
         incompatible = student.load_state_dict(checkpoint["model"], strict=False)
         mid_missing = filter_ffn_mid_keys(incompatible.missing_keys)
         unsupported_missing = [key for key in incompatible.missing_keys if key not in mid_missing]
-        if unsupported_missing or incompatible.unexpected_keys:
+        # Checkpoints predating TernaryPatchGather carry decoder cross-attention
+        # query/key tensors that no longer exist. They never influenced the
+        # output, so dropping them loses nothing.
+        retired = filter_retired_decoder_cross_attn_keys(incompatible.unexpected_keys)
+        unsupported_unexpected = [key for key in incompatible.unexpected_keys if key not in retired]
+        if unsupported_missing or unsupported_unexpected:
             raise RuntimeError(
                 "checkpoint model does not match current architecture: "
-                f"missing keys: {unsupported_missing}; unexpected keys: {incompatible.unexpected_keys}"
+                f"missing keys: {unsupported_missing}; unexpected keys: {unsupported_unexpected}"
+            )
+        if retired:
+            print(
+                f"Dropped {len(retired)} retired decoder cross-attention tensors from the "
+                "checkpoint; they were inert (one-hot mask, zero gradient).",
+                flush=True,
             )
         if incompatible.missing_keys:
             print(
@@ -860,7 +872,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-window", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--rope-theta", type=float, default=10000.0)
-    parser.add_argument("--patch-size", type=int, default=6)
+    parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--max-patch-length", type=int, default=32)
     parser.add_argument("--disable-hadamard", action="store_true")
     parser.add_argument("--disable-4bit-activations", action="store_true")

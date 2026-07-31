@@ -211,6 +211,43 @@ Priority order after current cache/MTP inference work:
   are unavailable for now. Single M1 Max estimates are roughly 30–60 tok/s at 1B scale;
   revisit PyTorch/CUDA or distributed benchmarking when hardware access changes.
 
+### BLT generation performance
+
+- [ ] **Deferred: evaluate BLT-S self-speculation once a BLT student is trained.** BLT-S
+  (Kallini et al., *Fast Byte Latent Transformer*, arXiv:2605.08044, §5.1) lets the local
+  decoder draft past patch boundaries against the last available latent; one full forward
+  re-patches the candidate and accepts bytes up to the first mismatch. Under greedy decoding
+  the output is byte-identical to plain autoregressive decoding, so it costs no quality —
+  the paper reports the same BLEU/pass@1 to two decimals at every window k, at both 1B and
+  3B. It is inference-only: no architectural change, no retraining. `blt/generate.py`
+  implements it behind `speculation_window`; `GenerationStats` reports the per-component
+  forward counts needed to judge it. **Blocked on a trained `StudentEntropyModel`, not on
+  code.** The whole saving is skipped global-model passes, and the baseline already runs the
+  global model only once per patch, so the win collapses as patch length grows. With the
+  current 9.38M encoder / 67.12M global / 9.64M decoder split the ceiling is
+  `patch < 1.14·(k+1)`: k=8 can win only below patch 10, k=4 only below 5.7. At the
+  `patch_size=4` default (lowered from 6 on 2026-07-30 to sit nearer Meta's ~4.5-byte
+  teacher) best case at 100% acceptance is 31% for k=8 and 40% for k=16, with break-even
+  acceptance at 66% / 58% against the 91% / 77% the paper measures. Finer still would help:
+  at patch 2 the ceiling is 54% and break-even drops to 40%. So this is worth revisiting
+  only if the trained student patches at roughly 2–4 bytes, BLT's actual design point. Note large patches and BLT-S are substitutes, not complements — both buy speed by
+  running the global model less, and coarser patches pay for it in quality. Measure
+  `GenerationStats.bytes_per_global_pass` and `acceptance_rate` on the trained model rather
+  than assuming these projections hold.
+- [ ] **Add a KV cache to the BLT decode path.** `blt/generate.py` re-runs the encoder and
+  decoder over the whole prefix for every drafted byte, so it is O(L²) and the BLT-S
+  projections above are ceilings it cannot currently reach. Also batch size 1 only:
+  verification accepts a different count per row, so batching needs ragged bookkeeping.
+  Both matter before any wall-clock claim — at ~86M parameters generation is launch-bound
+  rather than memory-bandwidth-bound, so the paper's bandwidth metric may not translate.
+- [ ] **Deferred: BLT-D / BLT-DV block diffusion.** Same paper, §3 and §5.2. Much faster than
+  BLT-S (up to 86% bandwidth reduction at block 16) but requires retraining with a block
+  diffusion objective and costs real quality: at 1B, best-setting D-8 loses 14% BLEU on
+  FR→EN, 20% on DE→EN, and 38–39% pass@1 on HumanEval/MBPP; D-16 loses up to 52%. DV
+  recovers part of it and is not even monotonic (DV-4 scores below D-4 on HumanEval). Table 1
+  shows 3–8 points on the likelihood benchmarks before decoding starts. Not worth it unless
+  generation speed becomes the binding constraint and the quality loss is acceptable.
+
 ---
 
 ## RFMoE design reference

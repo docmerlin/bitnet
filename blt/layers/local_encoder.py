@@ -40,6 +40,27 @@ class LocalEncoder(nn.Module):
             config=config,
         )
 
+    def encode_bytes(
+        self,
+        byte_embeddings: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Byte-level hidden states only, skipping patch pooling and cross-attention.
+
+        Generation drafts bytes against a frozen patch latent, so it needs these
+        states without paying for the patch representations that go on to feed the
+        global model.
+        """
+        hidden = byte_embeddings
+        for block in self.blocks:
+            hidden = block(hidden, attention_mask=attention_mask)
+        hidden = self.output_norm(hidden)
+        if attention_mask is not None:
+            byte_mask = attention_mask[:, : byte_embeddings.size(1)].to(torch.bool)
+            hidden = hidden.masked_fill(~byte_mask.unsqueeze(-1), 0.0)
+        return hidden
+
     def forward(
         self,
         byte_embeddings: torch.Tensor,
@@ -47,17 +68,11 @@ class LocalEncoder(nn.Module):
         *,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden = byte_embeddings
         byte_mask = None
         if attention_mask is not None:
             byte_mask = attention_mask[:, : byte_embeddings.size(1)].to(torch.bool)
 
-        for block in self.blocks:
-            hidden = block(hidden, attention_mask=attention_mask)
-
-        hidden = self.output_norm(hidden)
-        if byte_mask is not None:
-            hidden = hidden.masked_fill(~byte_mask.unsqueeze(-1), 0.0)
+        hidden = self.encode_bytes(byte_embeddings, attention_mask=attention_mask)
         patch_ids = patch_ids_from_lengths(patch_lengths, hidden.size(1))
         if byte_mask is not None:
             patch_ids = patch_ids.masked_fill(~byte_mask, -1)
