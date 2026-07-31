@@ -181,21 +181,7 @@ def test_loss_breakdown_is_available_on_demand(tmp_path):
     assert trainer.step(batch, 1, breakdown=False).keys() == {"loss", "grad_norm", "learning_rate"}
 
 
-@pytest.mark.parametrize(
-    "global_backbone",
-    [
-        False,
-        pytest.param(
-            True,
-            marks=pytest.mark.xfail(
-                reason="4-bit activations stay fragile on the BitNet backbone: finite by "
-                "hand at 32 patches over 128 bytes, still NaN here. The ramp is necessary "
-                "but not sufficient; see todo.md.",
-                strict=False,
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("global_backbone", [False, True])
 def test_training_survives_the_quantisation_ramp(tmp_path, global_backbone):
     # 4-bit activations from a cold start collapse the model to uniform output
     # after one update and NaN on the next. The ramp is what keeps it finite;
@@ -204,6 +190,7 @@ def test_training_survives_the_quantisation_ramp(tmp_path, global_backbone):
 
     config = _config(local_dim=64, global_dim=128, decoder_dim=64, n_layers_global=4)
     corpus = _corpus(tmp_path, size=1 << 15)
+    # 8 patches over SEQ bytes is the ratio that diverged at 4-bit activations.
     mx.random.seed(0)
     backbone = (
         MLXBitNetGlobalTransformer(config, global_config_for(config, block_size=2, path_window_size=32))
@@ -217,7 +204,7 @@ def test_training_survives_the_quantisation_ramp(tmp_path, global_backbone):
         corpus,
         TrainingConfig(
             steps=20, batch_size=2, learning_rate=1e-3, warmup_steps=3,
-            logits_kl=0.0, log_every=0, patches_per_sequence=SEQ // 4,
+            logits_kl=0.0, log_every=0, patches_per_sequence=8,
         ),
     )
     losses = [h["loss"] for h in trainer.train(log=lambda *_: None)]
@@ -237,8 +224,8 @@ def test_quantisation_ramps_from_soft_to_full():
     # Activations must start unquantised -- that is the whole point.
     assert start_a == 0.0
     assert start_w == pytest.approx(0.25)
-    assert start_bits == 8
-    assert (end_w, end_a, end_bits) == (1.0, 1.0, 4)
+    assert start_bits == 16
+    assert (end_w, end_a, end_bits) == (1.0, 1.0, 8)
 
 
 def test_activation_mix_zero_skips_quantisation():
@@ -252,3 +239,23 @@ def test_activation_mix_zero_skips_quantisation():
     layer.set_quantization_state(1.0, 1.0, 4)
     quantised = layer._prepare_input(x)
     assert float(mx.max(mx.abs(unquantised - quantised))) > 1e-4
+
+
+def test_eight_bit_activations_are_the_default():
+    # 4-bit buys no speed -- quantisation here is fake, so the matmul is float x
+    # ternary either way -- and diverges where 8-bit does not. Measured on the
+    # BitNet backbone at 8 patches over 64 bytes: 4-bit reaches NaN, 8-bit
+    # trains. Set 4 only to match a deployment that truly runs 4-bit kernels.
+    from blt.config import TernaryBLTConfig
+    from blt.mlx_layers import MLXHBitLinear
+
+    config = TernaryBLTConfig()
+    assert config.activation_bits == 8
+    assert MLXHBitLinear(64, 64, config=config).activation_bits == 8
+
+
+def test_activation_bits_must_be_representable():
+    from blt.config import TernaryBLTConfig
+
+    with pytest.raises(ValueError, match="activation_bits must be at least 2"):
+        TernaryBLTConfig(activation_bits=1)

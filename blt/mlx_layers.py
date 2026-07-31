@@ -2,8 +2,8 @@
 
 A numerical mirror of :mod:`blt.layers.transformer_block` and
 :mod:`blt.layers.cross_attention`, not of the BitNet stack's ``MLXHBitLinear``.
-The two stacks agree on ternary weight quantization and 4-bit activation
-quantization, and ``mx.hadamard_transform`` matches the torch dense Hadamard
+The two stacks agree on ternary weight quantization and on the activation
+quantization scheme (width from ``config.activation_bits``), and ``mx.hadamard_transform`` matches the torch dense Hadamard
 matmul to float32 precision, but BLT's blocks differ in shape (SwiGLU with an
 identity-initialised ``mid_proj``, cross-attention with a projected residual), so
 these are written against the BLT torch modules and parity-tested against them.
@@ -99,7 +99,7 @@ def combine_attention_bias(
 
 
 class MLXHBitLinear(nn.Module):
-    """Ternary linear with Hadamard-preconditioned, 4-bit-quantized activations.
+    """Ternary linear with Hadamard-preconditioned, fake-quantized activations.
 
     Matches ``layers.h_bitlinear.HBitLinear``: per-output-channel abs-mean weight
     scale, symmetric per-token activation scale, straight-through estimators on
@@ -112,13 +112,13 @@ class MLXHBitLinear(nn.Module):
         self.out_features = out_features
         self.use_hadamard = bool(config.use_hadamard) and in_features & (in_features - 1) == 0
         self.quantize_activations = bool(config.use_4bit_activations)
-        self.activation_bits = 4
+        self.activation_bits = int(config.activation_bits)
         # Quantisation strength, ramped during training rather than fixed.
-        # Starting at full 4-bit activations diverges: measured on the BitNet
-        # backbone, activation_mix=1.0 from step 0 reaches NaN by step 2 while
-        # activation_mix=0.0 trains normally at any weight_mix. Ternary weights
-        # are not the problem; 4-bit activations from a cold start are. These
-        # mirror layers.h_bitlinear.HBitLinear, which has had them all along.
+        # Fully quantised activations from step 0 diverge: at activation_mix=1.0
+        # the model collapses to uniform output after one update and NaNs on the
+        # next, while activation_mix=0.0 trains normally at any weight_mix.
+        # Ternary weights are not the problem. These mirror
+        # layers.h_bitlinear.HBitLinear, which has had them all along.
         self.weight_mix = 1.0
         self.activation_mix = 1.0
 

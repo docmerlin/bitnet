@@ -223,14 +223,20 @@ Priority order after current cache/MTP inference work:
   could not be ramped. Added the knobs to match `layers/h_bitlinear.py`, plus
   `MLXTernaryBLTModel.set_quantization_state` and a ramp in `MLXBLTTrainer`. Both the
   plain and BitNet global backbones now train under CMUD.
-- [ ] **Residual instability at extreme patch ratios.** The ramp fixes the cold-start
-  divergence but not everything: with the BitNet backbone at 8 patches over 64 bytes
-  (8 bytes/patch on a 128-wide global model) training still reaches NaN once the ramp
-  completes, while 16 or 32 patches over the same bytes stay finite at both fast and slow
-  ramp rates, and so does never quantising activations. So 4-bit activations remain
-  fragile in this stack and the ramp is necessary rather than sufficient. Worth finding
-  what actually saturates -- most likely the per-token activation scale collapsing when a
-  patch pools very many bytes.
+- [x] **Resolved by 8-bit activations.** The residual instability was specific to 4-bit.
+  Measured on the BitNet backbone at 8 patches over 64 bytes: 4-bit reaches NaN once the
+  ramp completes, 8-bit trains (5.674 -> 5.561). Costs nothing: activation quantisation
+  here is fake (`x + stop_gradient(q - x)`), the tensor stays float and the matmul is
+  float x ternary regardless, so bit width only sets the rounding grid. Benchmarked at
+  86M, batch 4, sequence 512: 4-bit 354.6ms/step, 8-bit 345.4ms, 16-bit 348.3ms, no
+  quantisation 345.9ms -- and on the forward alone, skipping quantisation entirely is
+  1.29x (110.3ms -> 85.5ms). `TernaryBLTConfig.activation_bits` now defaults to 8.
+- [ ] **Decide the BitNet stack's activation width separately.** `TernaryConfig` still
+  defaults to 4 and `mlx_train.py --final-activation-bits` to 4, unchanged here because
+  that stack has trained checkpoints whose behaviour would shift. The same argument
+  applies -- 4-bit buys no training speed -- so it is worth switching unless inference
+  really runs 4-bit activation kernels (`ternary_fused_linear_m1`, the M=1 decode path,
+  is the only place low-bit activations become real compute).
 - [ ] **Padding is not inert for the BitNet backbone.** Zero-length patches perturb it:
   measured drift 0.0 / 1.4e-3 / 2.2e-1 at 1 / 2 / 8 layers, the last a relative error of
   1.0. It does not grow with the amount of padding, so a small perturbation is being

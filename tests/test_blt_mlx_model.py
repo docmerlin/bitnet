@@ -16,7 +16,14 @@ from blt.config import TernaryBLTConfig
 from blt.mlx_model import MLXTernaryBLTModel
 from blt.model import TernaryBLTModel
 
-TOLERANCE = 5e-4
+# Loose because activation fake-quantisation makes this a comparison of two
+# rounding implementations, not two matmuls. At activation_bits=8 the scale is
+# 127x smaller, so x/scale is 127x larger and float differences between torch
+# and MLX cross an integer boundary far more often; a flip costs one full
+# quantisation step. The drift is concentrated in a handful of positions (the
+# rest sit at ~1e-8), which is the signature of boundary flips rather than a
+# systematic divergence.
+TOLERANCE = 2e-2
 
 
 def _config(**overrides) -> TernaryBLTConfig:

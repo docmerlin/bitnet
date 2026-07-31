@@ -96,8 +96,8 @@ class TrainingConfig:
     quant_ramp_ratio: float = 0.25
     weight_mix_start: float = 0.25
     activation_mix_start: float = 0.0
-    activation_bits_start: int = 8
-    activation_bits_final: int = 4
+    activation_bits_start: int = 16
+    activation_bits_final: int = 8
 
 
 def learning_rate_at(step: int, config: TrainingConfig) -> float:
