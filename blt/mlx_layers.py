@@ -113,28 +113,48 @@ class MLXHBitLinear(nn.Module):
         self.use_hadamard = bool(config.use_hadamard) and in_features & (in_features - 1) == 0
         self.quantize_activations = bool(config.use_4bit_activations)
         self.activation_bits = 4
+        # Quantisation strength, ramped during training rather than fixed.
+        # Starting at full 4-bit activations diverges: measured on the BitNet
+        # backbone, activation_mix=1.0 from step 0 reaches NaN by step 2 while
+        # activation_mix=0.0 trains normally at any weight_mix. Ternary weights
+        # are not the problem; 4-bit activations from a cold start are. These
+        # mirror layers.h_bitlinear.HBitLinear, which has had them all along.
+        self.weight_mix = 1.0
+        self.activation_mix = 1.0
 
         # kaiming_uniform_(a=sqrt(5)) reduces to U(-1/sqrt(fan_in), 1/sqrt(fan_in)).
         bound = 1.0 / math.sqrt(in_features)
         self.weight = mx.random.uniform(low=-bound, high=bound, shape=(out_features, in_features))
 
+    def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
+        """Ramp quantisation strength. 0.0 is full precision, 1.0 fully quantised."""
+        self.weight_mix = float(min(max(weight_mix, 0.0), 1.0))
+        self.activation_mix = float(min(max(activation_mix, 0.0), 1.0))
+        self.activation_bits = max(int(bits), 2)
+
     def _prepare_input(self, x: mx.array) -> mx.array:
         if self.use_hadamard:
             x = mx.hadamard_transform(x)
-        if not self.quantize_activations or self.activation_bits < 2:
+        if not self.quantize_activations or self.activation_bits < 2 or self.activation_mix <= 0.0:
             return x
         positive_levels = (2 ** (self.activation_bits - 1)) - 1
         negative_levels = 2 ** (self.activation_bits - 1)
         scale = mx.maximum(mx.max(mx.abs(x), axis=-1, keepdims=True), 1e-5) / max(positive_levels, 1)
         quantized = mx.clip(mx.round(x / scale), -negative_levels, positive_levels) * scale
-        return x + mx.stop_gradient(quantized - x)
+        if self.activation_mix >= 1.0:
+            return x + mx.stop_gradient(quantized - x)
+        return x + self.activation_mix * mx.stop_gradient(quantized - x)
 
     def effective_weight(self) -> mx.array:
         weight = self.weight
+        if self.weight_mix <= 0.0:
+            return weight
         scale = mx.maximum(mx.mean(mx.abs(mx.stop_gradient(weight)), axis=-1, keepdims=True), 1e-5)
         normalized = weight / scale
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
-        return weight + mx.stop_gradient(ternary * scale - weight)
+        if self.weight_mix >= 1.0:
+            return weight + mx.stop_gradient(ternary * scale - weight)
+        return weight + self.weight_mix * mx.stop_gradient(ternary * scale - weight)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self._prepare_input(x) @ self.effective_weight().T

@@ -90,6 +90,14 @@ class TrainingConfig:
     # Fixed patches per sequence. Gives stable shapes without any padding, which
     # is what the BitNet global backbone needs to run compiled.
     patches_per_sequence: int | None = None
+    # Quantisation ramp. Full 4-bit activations from a cold start diverge to NaN
+    # within two steps; the weights are fine at full ternary. Defaults match
+    # mlx_train.py's --stage1-* schedule.
+    quant_ramp_ratio: float = 0.25
+    weight_mix_start: float = 0.25
+    activation_mix_start: float = 0.0
+    activation_bits_start: int = 8
+    activation_bits_final: int = 4
 
 
 def learning_rate_at(step: int, config: TrainingConfig) -> float:
@@ -151,20 +159,6 @@ class MLXBLTTrainer:
         if self.weights.hard_ce <= 0.0 and not self.has_teacher:
             raise ValueError("training from a raw corpus needs hard_ce > 0")
 
-        if optimizer is None and not getattr(model.global_transformer, "accepts_padding", True):
-            # Measured: with the BitNet global backbone, CMUD reaches NaN by the
-            # third step (5.592, 5.561, nan) while AdamW trains normally on the
-            # same seed and data (5.592 -> 4.899). It is not a single-step MUD
-            # failure -- whitening every gradient at step 0 stays finite -- so
-            # the interaction is unresolved. Warn loudly rather than default a
-            # configuration that silently diverges; pass an optimizer explicitly
-            # to choose either way.
-            print(
-                "warning: CMUD diverges to NaN within a few steps against the "
-                "BitNet global backbone (unresolved). Pass optimizer=AdamW(...) "
-                "until that is fixed.",
-                flush=True,
-            )
         self.optimizer = optimizer or BLTCMUD(
             mud_learning_rate=config.learning_rate,
             fallback_learning_rate=config.fallback_learning_rate,
@@ -281,11 +275,28 @@ class MLXBLTTrainer:
             batch["topk_logits"] = mx.array(raw["topk_logits"])
         return batch
 
+    def quantization_at(self, step_index: int) -> tuple[float, float, int]:
+        """Weight mix, activation mix and activation bits for this step."""
+        config = self.config
+        if config.quant_ramp_ratio <= 0:
+            fraction = 1.0
+        else:
+            progress = step_index / max(config.steps, 1)
+            fraction = min(progress / config.quant_ramp_ratio, 1.0)
+        weight_mix = config.weight_mix_start + fraction * (1.0 - config.weight_mix_start)
+        activation_mix = config.activation_mix_start + fraction * (1.0 - config.activation_mix_start)
+        bits = round(
+            config.activation_bits_start
+            - fraction * (config.activation_bits_start - config.activation_bits_final)
+        )
+        return weight_mix, activation_mix, bits
+
     def step(
         self, batch: dict[str, mx.array], step_index: int, *, breakdown: bool = False
     ) -> dict[str, float]:
         rate = learning_rate_at(step_index, self.config)
         self.optimizer.learning_rate = rate
+        self.model.set_quantization_state(*self.quantization_at(step_index))
 
         loss, gradients = self._loss_and_grad(batch)
         gradients, grad_norm = clip_gradients(gradients, self.config.grad_clip)

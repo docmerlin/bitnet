@@ -213,13 +213,24 @@ Priority order after current cache/MTP inference work:
 
 ### BLT as the main model
 
-- [ ] **Resolve the CMUD/BitNet-global NaN.** `blt/mlx_global.py` wires MLXBitNet in as
-  BLT's global transformer, and it trains under AdamW (loss 5.592 -> 4.899 on a README
-  corpus). Under CMUD it reaches NaN by the third step (5.592, 5.561, nan) on the same
-  seed and data. It is not a single-step MUD failure: whitening every 2D gradient at step
-  0 stays finite, so it takes two updates for the parameters to reach a state MUD cannot
-  handle. Until this is understood the trainer prints a warning and callers should pass
-  AdamW explicitly. Pure-BLT training with CMUD is unaffected.
+- [x] **Resolved: the NaN was a missing quantisation ramp, not CMUD.** Bisected to 4-bit
+  *activation* quantisation from a cold start: at `activation_mix=1.0` from step 0 the
+  model collapses to uniform output after one update (loss lands exactly on ln(vocab))
+  and NaNs on the next, at every width, learning rate and optimizer variant tried.
+  Ternary weights are innocent -- `weight_mix=1.0` with `activation_mix=0.0` trains fine.
+  `mlx_train.py` had always ramped (`--stage1-activation-mix-start 0.0`); the BLT trainer
+  did not, and BLT's own `MLXHBitLinear` had no `set_quantization_state` at all, so it
+  could not be ramped. Added the knobs to match `layers/h_bitlinear.py`, plus
+  `MLXTernaryBLTModel.set_quantization_state` and a ramp in `MLXBLTTrainer`. Both the
+  plain and BitNet global backbones now train under CMUD.
+- [ ] **Residual instability at extreme patch ratios.** The ramp fixes the cold-start
+  divergence but not everything: with the BitNet backbone at 8 patches over 64 bytes
+  (8 bytes/patch on a 128-wide global model) training still reaches NaN once the ramp
+  completes, while 16 or 32 patches over the same bytes stay finite at both fast and slow
+  ramp rates, and so does never quantising activations. So 4-bit activations remain
+  fragile in this stack and the ramp is necessary rather than sufficient. Worth finding
+  what actually saturates -- most likely the per-token activation scale collapsing when a
+  patch pools very many bytes.
 - [ ] **Padding is not inert for the BitNet backbone.** Zero-length patches perturb it:
   measured drift 0.0 / 1.4e-3 / 2.2e-1 at 1 / 2 / 8 layers, the last a relative error of
   1.0. It does not grow with the amount of padding, so a small perturbation is being
