@@ -31,7 +31,6 @@ def test_hybrid_block():
         use_engram=False,
         use_hadamard=False,
         use_4bit_activations=False,
-        use_mamba3_layers=False,
     )
 
     block = HybridTransformerBlock(config, layer_id=0)

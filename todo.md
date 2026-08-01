@@ -207,27 +207,6 @@ Priority order after current cache/MTP inference work:
   2,661→2,354 tok/s at 50.43M. A three-warmup, five-step physical-1.093B active-loop-1
   test measured 119.74 tok/s split versus 85.63 lazy-fused; fusion saved only 0.131 GiB peak.
   Monolithic compiled fusion was slower still, so production retains separate compiled graphs.
-- [x] **Parallelise the Mamba-3 selective-scan backward.** Profiling the default config
-  (52M, seq 1024) found the backward at 8.5x the forward, and disabling Mamba-3 removed 77%
-  of it. Two causes, both in `_SCAN_BWD`: it reduced dB/dC on thread 0 alone — `2*N*P` serial
-  float ops per timestep with `P-1` threads parked at a barrier, 4096 ops x 1024 steps per
-  threadgroup — plus 8 barriers per timestep for three scalar reductions; and the per-thread
-  `state`/`prev_bu` arrays were sized to the 128 worst case rather than the real `d_state`,
-  so they spilled. Fixed by striping `n` over the P threads, collapsing the scalar reductions
-  onto threads 0/1/2 behind one barrier pair, and templating `d_state` as a Metal
-  compile-time constant (`NMAX`). Reduction order is unchanged, so gradients are
-  bit-identical.
-
-  Kernel microbenchmark at (1,1024,32,32,64), the clean measurement: scan forward
-  14.66 -> 5.53 ms (2.65x), scan backward 219.47 -> 53.66 ms (**4.09x**). The state-history
-  recompute is 5.0 ms and never was the bottleneck — the bwd kernel body was.
-
-  End to end (3 interleaved A/B rounds, since this machine drifts): batch 1 fwd+bwd
-  1,822.7 -> 732.5 ms (**2.49x**), batch 4 5,740 -> 3,023 ms (**1.90x**). Mamba-3 is 3 of 8
-  layers, hence less than the kernel's own speedup. Batch 4 peaks at 20.3 GB on a 32 GB
-  machine and the pre-fix version falls off that cliff under sustained load — 21,214 ms
-  observed once — so worst-case improvement is far larger than 1.9x. Do not quote a
-  single-run batch-4 number; it is not reproducible.
 - [ ] **Deferred: use faster/distributed hardware for full 1B training.** Hardware changes
   are unavailable for now. Single M1 Max estimates are roughly 30–60 tok/s at 1B scale;
   revisit PyTorch/CUDA or distributed benchmarking when hardware access changes.
@@ -241,14 +220,6 @@ Priority order after current cache/MTP inference work:
   | 227M | 2 | 2,096 | 8.1 GB | 15.1 years |
   | 522M | 8 | 1,241 | 23.6 GB | 25.6 years |
   | ~1B | — | ~700 (extrapolated) | — | ~45 years |
-
-  With `use_mamba3_layers=False`, which swaps each Mamba-3 layer for a PaTH attention layer
-  rather than removing it (51.0 -> 49.2M and 522.3 -> 484.9M params, so the layers are still
-  there), same-session pairs: 51M 11,270 -> 16,965 B/s (**1.51x**), 522M 1,117 -> 1,587 B/s
-  (**1.42x**). 1 TB drops to 1.9 and 20.0 years respectively. Smaller than the 1.73x the
-  BitNet stack alone shows at batch 1, because BLT's byte-level encoder and decoder run no
-  Mamba and dilute the share. No perplexity comparison exists either way — this is a pure
-  speed measurement and Mamba-3 is on every third layer by design.
 
   Throughput at 522M by batch: 425 / 673 / 968 / 1,241 for 1 / 2 / 4 / 8 — still rising at
   batch 8 but only +28% for the last doubling, and 23.6 GB leaves no headroom, so ~1.4 KB/s
@@ -297,14 +268,10 @@ End to end, BLT + BitNet at 51M, batch 16, interleaved against master:
 | master at session start | 7,790 | 1.00x |
 | now, identical architecture | 11,907 | **1.53x** |
 | (measured, then removed: no square FFN mid) | 13,621 | 1.75x |
-| now, `use_mamba3_layers=False` (**now the default**) | 16,017 | 2.06x |
-| now, both | 20,367 | **2.61x** |
 
 The square FFN mid is unconditional -- the flag that produced the middle row was removed after
 the measurement. A 200-step smoke on repeating text reached loss 2.279 with the mid and 2.457
-without, so it earns its 16%. `use_mamba3_layers` now defaults to False in both stacks, so the
-2.06x row is the shipped configuration; `--mamba3-layers` turns the SSM layers back on. No
-quality comparison has been run in either direction -- that A/B is still open.
+without, so it earns its 16%.
 
 - [x] **Rejected: gathering the decoder cross-attention.** Implemented and measured at
   **0.85x** -- slower than the masked-dense path -- then reverted. The 3.7x headroom this file

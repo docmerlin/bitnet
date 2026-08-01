@@ -81,18 +81,6 @@ class MLXBitNetConfig:
     use_topk_blocks: bool = False
     topk_blocks: int = 4
     topk_block_size: int = 64
-    # Mamba-3-style SSM on every mamba_layer_period-th layer starting at 0 (~1/3).
-    # Off by default -- costs 1.36-1.51x throughput; see config.TernaryConfig.
-    use_mamba3_layers: bool = False
-    mamba_layer_period: int = 3
-    mamba_d_state: int = 64
-    mamba_expand: int = 2
-    mamba_headdim: int = 32
-    mamba_d_conv: int = 4
-    mamba_dt_min: float = 0.001
-    mamba_dt_max: float = 0.1
-    mamba_a_floor: float = 1e-4
-    use_mamba_scan_kernel: bool = True  # Metal fused selective scan
     activation_bits: int = 4
     use_4bit_activations: bool = True
     use_hadamard: bool = True
@@ -130,12 +118,6 @@ class MLXBitNetConfig:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.path_window_size < 1:
             raise ValueError("path_window_size must be positive")
-        if int(self.mamba_layer_period) < 1:
-            raise ValueError("mamba_layer_period must be >= 1")
-        object.__setattr__(self, "mamba_layer_period", int(self.mamba_layer_period))
-        object.__setattr__(self, "use_mamba3_layers", bool(self.use_mamba3_layers))
-        if int(self.mamba_d_state) < 1 or int(self.mamba_expand) < 1:
-            raise ValueError("mamba_d_state and mamba_expand must be positive")
         if min(self.num_prelude_layers, self.num_recurrent_layers, self.num_coda_layers) < 0:
             raise ValueError("layer counts must be non-negative")
         if self.num_loops < 1:
@@ -1718,25 +1700,13 @@ class MLXPaTHInferenceCache:
 class MLXHybridBlock(nn.Module):
     def __init__(self, config: MLXBitNetConfig, layer_id: int):
         super().__init__()
-        from layers.mamba3 import is_mamba3_layer
-        from mlx_mamba3 import MLXMamba3Mixer
-
         hidden, intermediate = config.hidden_size, config.intermediate_size
         self.config = config
         self.layer_id = layer_id
         self.attn_res_mode = config.attn_res_mode
         self.engram = MLXEngram(config, layer_id) if config.use_engram and layer_id in config.engram_layer_ids else None
         self.attn_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
-        period = int(getattr(config, "mamba_layer_period", 3))
-        self.use_mamba3 = bool(getattr(config, "use_mamba3_layers", False)) and is_mamba3_layer(
-            layer_id, period
-        )
-        if self.use_mamba3:
-            self.mamba = MLXMamba3Mixer(config)
-            self.attn = None
-        else:
-            self.mamba = None
-            self.attn = MLXPaTHAttention(config)
+        self.attn = MLXPaTHAttention(config)
         self.attn_gate = mx.array([0.0])
         self.mlp_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.moe = MLXRFMoE(config) if config.use_rfmoe else None
@@ -1827,17 +1797,8 @@ class MLXHybridBlock(nn.Module):
         return run_mlp(x)
 
     def new_inference_cache(self, batch_size: int) -> "MLXBlockInferenceCache":
-        from mlx_mamba3 import MLXMamba3InferenceCache
-
-        if self.use_mamba3:
-            attention_cache = None
-            mamba_cache = MLXMamba3InferenceCache()
-        else:
-            attention_cache = self.attn.new_inference_cache(batch_size)
-            mamba_cache = None
         return MLXBlockInferenceCache(
-            attention=attention_cache,
-            mamba=mamba_cache,
+            attention=self.attn.new_inference_cache(batch_size),
             engram=MLXEngramInferenceCache() if self.engram is not None else None,
         )
 
@@ -1848,11 +1809,6 @@ class MLXHybridBlock(nn.Module):
         update_memory: bool,
         checkpoint_activations: bool,
     ) -> mx.array:
-        if self.use_mamba3:
-            assert self.mamba is not None
-            run = activation_checkpoint(self.mamba) if checkpoint_activations else self.mamba
-            return run(x_norm)
-        assert self.attn is not None
         return self.attn(
             x_norm,
             segment_ids,
@@ -1941,14 +1897,6 @@ class MLXHybridBlock(nn.Module):
             return self.engram.prefill(h, input_ids, cache.engram)
 
         def attn_runner(h_norm: mx.array) -> mx.array:
-            if self.use_mamba3:
-                assert self.mamba is not None and cache.mamba is not None
-                if mode == "incremental":
-                    return self.mamba.incremental(h_norm, cache.mamba)
-                if mode == "extend":
-                    return self.mamba.extend(h_norm, cache.mamba)
-                return self.mamba.prefill(h_norm, cache.mamba)
-            assert self.attn is not None and cache.attention is not None
             if mode == "incremental":
                 return self.attn.incremental(h_norm, cache.attention, update_memory)
             if mode == "extend":
@@ -1977,10 +1925,7 @@ class MLXHybridBlock(nn.Module):
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.incremental(x, input_ids, token_history, cache.engram)
-        if self.use_mamba3:
-            attention = self.mamba.incremental(self.attn_norm(x), cache.mamba)
-        else:
-            attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
+        attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
         x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
 
@@ -1996,10 +1941,7 @@ class MLXHybridBlock(nn.Module):
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.extend(x, input_ids, token_history, cache.engram)
-        if self.use_mamba3:
-            attention = self.mamba.extend(self.attn_norm(x), cache.mamba)
-        else:
-            attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
+        attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
         x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
 
@@ -2014,10 +1956,7 @@ class MLXHybridBlock(nn.Module):
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.prefill(x, input_ids, cache.engram)
-        if self.use_mamba3:
-            attention = self.mamba.prefill(self.attn_norm(x), cache.mamba)
-        else:
-            attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
+        attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
         x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
 
@@ -2052,25 +1991,19 @@ class MLXHybridBlock(nn.Module):
 
 @dataclass
 class MLXBlockInferenceCache:
-    attention: MLXPaTHInferenceCache | None
+    attention: MLXPaTHInferenceCache
     engram: MLXEngramInferenceCache | None
-    mamba: object | None = None  # MLXMamba3InferenceCache | None
 
     def clone(self) -> "MLXBlockInferenceCache":
         return MLXBlockInferenceCache(
-            self.attention.clone() if self.attention is not None else None,
+            self.attention.clone(),
             self.engram.clone() if self.engram is not None else None,
-            self.mamba.clone() if self.mamba is not None else None,
         )
 
     def arrays(self) -> list[mx.array]:
-        values: list[mx.array] = []
-        if self.attention is not None:
-            values.extend(self.attention.arrays())
+        values = self.attention.arrays()
         if self.engram is not None and self.engram.normalized is not None:
             values.append(self.engram.normalized)
-        if self.mamba is not None and getattr(self.mamba, "last_hidden", None) is not None:
-            values.append(self.mamba.last_hidden)
         return values
 
 
@@ -2228,12 +2161,9 @@ class MLXBitNet(nn.Module):
                 return step(tokens, cache)
             return self._inference_step(tokens, cache)
 
-    def _cache_layout(self, cache: MLXInferenceCache) -> list[tuple[bool, bool]]:
-        """Per expanded layer: (is_mamba, has_engram)."""
-        return [
-            (layer.attention is None and layer.mamba is not None, layer.engram is not None)
-            for layer in cache.layers
-        ]
+    def _cache_layout(self, cache: MLXInferenceCache) -> list[bool]:
+        """Whether each expanded layer has an Engram cache."""
+        return [layer.engram is not None for layer in cache.layers]
 
     def _flatten_inference_cache(self, cache: MLXInferenceCache) -> list[mx.array]:
         batch = cache.token_history.shape[0]
@@ -2243,35 +2173,26 @@ class MLXBitNet(nn.Module):
         dtype = self.embedding.weight.dtype
         arrays: list[mx.array] = [cache.token_history]
         for layer in cache.layers:
-            if layer.attention is not None:
-                att = layer.attention
-                arrays.extend([att.memory_m, att.memory_z, att.memory_initialized])
-                arrays.append(
-                    att.path_projected
-                    if att.path_projected is not None
-                    else mx.zeros((batch, 0, hidden), dtype=dtype)
-                )
-                arrays.append(att.q if att.q is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
-                arrays.append(att.k if att.k is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
-                arrays.append(att.v if att.v is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
-                arrays.append(att.w if att.w is not None else mx.zeros((batch, 0, heads, head_dim), dtype=dtype))
-                arrays.append(att.beta if att.beta is not None else mx.zeros((batch, 0, heads), dtype=mx.float32))
-                arrays.append(
-                    att.log_forget if att.log_forget is not None else mx.zeros((batch, 0, heads), dtype=mx.float32)
-                )
-                open_len = 0 if att.q is None else att.q.shape[2]
-                if att.t_inverse is not None:
-                    arrays.append(att.t_inverse)
-                else:
-                    arrays.append(mx.zeros((batch, heads, open_len, open_len), dtype=mx.float32))
+            att = layer.attention
+            arrays.extend([att.memory_m, att.memory_z, att.memory_initialized])
+            arrays.append(
+                att.path_projected
+                if att.path_projected is not None
+                else mx.zeros((batch, 0, hidden), dtype=dtype)
+            )
+            arrays.append(att.q if att.q is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
+            arrays.append(att.k if att.k is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
+            arrays.append(att.v if att.v is not None else mx.zeros((batch, heads, 0, head_dim), dtype=dtype))
+            arrays.append(att.w if att.w is not None else mx.zeros((batch, 0, heads, head_dim), dtype=dtype))
+            arrays.append(att.beta if att.beta is not None else mx.zeros((batch, 0, heads), dtype=mx.float32))
+            arrays.append(
+                att.log_forget if att.log_forget is not None else mx.zeros((batch, 0, heads), dtype=mx.float32)
+            )
+            open_len = 0 if att.q is None else att.q.shape[2]
+            if att.t_inverse is not None:
+                arrays.append(att.t_inverse)
             else:
-                # Mamba layer: one prefix tensor (may be empty).
-                hist = (
-                    layer.mamba.last_hidden
-                    if layer.mamba is not None and layer.mamba.last_hidden is not None
-                    else mx.zeros((batch, 0, hidden), dtype=dtype)
-                )
-                arrays.append(hist)
+                arrays.append(mx.zeros((batch, heads, open_len, open_len), dtype=mx.float32))
             if layer.engram is not None:
                 eng = layer.engram.normalized
                 if eng is None:
@@ -2283,13 +2204,11 @@ class MLXBitNet(nn.Module):
     def _unflatten_inference_cache(
         self,
         arrays: list[mx.array],
-        layout: list[tuple[bool, bool]],
+        layout: list[bool],
         num_loops: int,
         weight_cache: dict,
         position: int,
     ) -> MLXInferenceCache:
-        from mlx_mamba3 import MLXMamba3InferenceCache
-
         idx = 0
         token_history = arrays[idx]
         idx += 1
@@ -2298,46 +2217,37 @@ class MLXBitNet(nn.Module):
         def nonempty(array: mx.array, axis: int):
             return None if array.shape[axis] == 0 else array
 
-        for is_mamba, has_engram in layout:
-            if is_mamba:
-                hist = arrays[idx]
-                idx += 1
-                mamba = MLXMamba3InferenceCache()
-                mamba.last_hidden = nonempty(hist, 1)
-                mamba.ready = mamba.last_hidden is not None
-                attention = None
-            else:
-                memory_m, memory_z, memory_initialized = arrays[idx], arrays[idx + 1], arrays[idx + 2]
-                idx += 3
-                path_projected = arrays[idx]
-                idx += 1
-                q, k, v, w, beta, log_forget = arrays[idx : idx + 6]
-                idx += 6
-                q_arr = nonempty(q, 2)
-                t_inv = arrays[idx]
-                idx += 1
-                open_len = 0 if q_arr is None else int(q_arr.shape[2])
-                attention = MLXPaTHInferenceCache(
-                    memory_m,
-                    memory_z,
-                    memory_initialized,
-                    nonempty(path_projected, 1),
-                    q_arr,
-                    nonempty(k, 2),
-                    nonempty(v, 2),
-                    nonempty(w, 1),
-                    nonempty(beta, 1),
-                    nonempty(log_forget, 1),
-                    t_inverse=None if open_len == 0 else t_inv,
-                    open_len=open_len,
-                )
-                mamba = None
+        for has_engram in layout:
+            memory_m, memory_z, memory_initialized = arrays[idx], arrays[idx + 1], arrays[idx + 2]
+            idx += 3
+            path_projected = arrays[idx]
+            idx += 1
+            q, k, v, w, beta, log_forget = arrays[idx : idx + 6]
+            idx += 6
+            q_arr = nonempty(q, 2)
+            t_inv = arrays[idx]
+            idx += 1
+            open_len = 0 if q_arr is None else int(q_arr.shape[2])
+            attention = MLXPaTHInferenceCache(
+                memory_m,
+                memory_z,
+                memory_initialized,
+                nonempty(path_projected, 1),
+                q_arr,
+                nonempty(k, 2),
+                nonempty(v, 2),
+                nonempty(w, 1),
+                nonempty(beta, 1),
+                nonempty(log_forget, 1),
+                t_inverse=None if open_len == 0 else t_inv,
+                open_len=open_len,
+            )
             engram = None
             if has_engram:
                 eng = arrays[idx]
                 idx += 1
                 engram = MLXEngramInferenceCache(nonempty(eng, 1))
-            layers.append(MLXBlockInferenceCache(attention, engram, mamba))
+            layers.append(MLXBlockInferenceCache(attention, engram))
         return MLXInferenceCache(layers, token_history, num_loops, weight_cache, position)
 
     def _apply_flat_to_inference_cache(self, cache: MLXInferenceCache, arrays: list[mx.array]) -> None:
@@ -2346,33 +2256,26 @@ class MLXBitNet(nn.Module):
         cache.token_history = arrays[idx]
         idx += 1
         for layer in cache.layers:
-            if layer.attention is not None:
-                att = layer.attention
-                att.memory_m = arrays[idx]
-                att.memory_z = arrays[idx + 1]
-                att.memory_initialized = arrays[idx + 2]
-                idx += 3
-                pp = arrays[idx]
-                idx += 1
-                q, k, v, w, beta, log_forget = arrays[idx : idx + 6]
-                idx += 6
-                t_inv = arrays[idx]
-                idx += 1
-                att.path_projected = None if pp.shape[1] == 0 else pp
-                att.q = None if q.shape[2] == 0 else q
-                att.k = None if k.shape[2] == 0 else k
-                att.v = None if v.shape[2] == 0 else v
-                att.w = None if w.shape[1] == 0 else w
-                att.beta = None if beta.shape[1] == 0 else beta
-                att.log_forget = None if log_forget.shape[1] == 0 else log_forget
-                att.open_len = 0 if att.q is None else att.q.shape[2]
-                att.t_inverse = None if att.open_len == 0 else t_inv
-            else:
-                hist = arrays[idx]
-                idx += 1
-                if layer.mamba is not None:
-                    layer.mamba.last_hidden = None if hist.shape[1] == 0 else hist
-                    layer.mamba.ready = hist.shape[1] > 0
+            att = layer.attention
+            att.memory_m = arrays[idx]
+            att.memory_z = arrays[idx + 1]
+            att.memory_initialized = arrays[idx + 2]
+            idx += 3
+            pp = arrays[idx]
+            idx += 1
+            q, k, v, w, beta, log_forget = arrays[idx : idx + 6]
+            idx += 6
+            t_inv = arrays[idx]
+            idx += 1
+            att.path_projected = None if pp.shape[1] == 0 else pp
+            att.q = None if q.shape[2] == 0 else q
+            att.k = None if k.shape[2] == 0 else k
+            att.v = None if v.shape[2] == 0 else v
+            att.w = None if w.shape[1] == 0 else w
+            att.beta = None if beta.shape[1] == 0 else beta
+            att.log_forget = None if log_forget.shape[1] == 0 else log_forget
+            att.open_len = 0 if att.q is None else att.q.shape[2]
+            att.t_inverse = None if att.open_len == 0 else t_inv
             if layer.engram is not None:
                 eng = arrays[idx]
                 idx += 1
@@ -2389,7 +2292,7 @@ class MLXBitNet(nn.Module):
                 if isinstance(module, MLXHBitLinear):
                     module.pin_inference_weight(self.embedding.weight.dtype, prefer_packed=False)
             loops = getattr(self, "inference_num_loops", self.config.num_loops)
-            path_attn = next((b.attn for b in self.blocks if b.attn is not None), None)
+            path_attn = next((b.attn for b in self.blocks), None)
             default_w = self.config.path_window_size
             width = max(
                 1,
@@ -2412,10 +2315,9 @@ class MLXBitNet(nn.Module):
                         list(flat), layout, loops, weight_cache, position=1
                     )
                     for layer in cache.layers:
-                        if layer.attention is not None:
-                            layer.attention.open_len = (
-                                0 if layer.attention.q is None else layer.attention.q.shape[2]
-                            )
+                        layer.attention.open_len = (
+                            0 if layer.attention.q is None else layer.attention.q.shape[2]
+                        )
                     with self._inference_weight_context(cache):
                         hidden = self._inference_step(step_tokens, cache)
                     return (hidden, *self._flatten_inference_cache(cache))
@@ -2427,10 +2329,9 @@ class MLXBitNet(nn.Module):
                         states = self._prefill(pref, warm)
                         mx.eval(states, *warm.arrays())
                 for layer in warm.layers:
-                    if layer.attention is not None:
-                        layer.attention.open_len = (
-                            0 if layer.attention.q is None else layer.attention.q.shape[2]
-                        )
+                    layer.attention.open_len = (
+                        0 if layer.attention.q is None else layer.attention.q.shape[2]
+                    )
                 compiled_fn = mx.compile(pure_step)
                 flat = self._flatten_inference_cache(warm)
                 out = compiled_fn(mx.array([[10_000 + open_before]], dtype=mx.int32), *flat)
@@ -2444,8 +2345,7 @@ class MLXBitNet(nn.Module):
 
             def _first_path_open_len(cache: MLXInferenceCache) -> int:
                 for layer in cache.layers:
-                    if layer.attention is not None:
-                        return 0 if layer.attention.q is None else int(layer.attention.q.shape[2])
+                    return 0 if layer.attention.q is None else int(layer.attention.q.shape[2])
                 return 0
 
             def step(tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
@@ -2758,7 +2658,7 @@ class MLXBitNet(nn.Module):
         which operates on pooled patch latents rather than a token sequence.
         Nothing in the stack needs discrete ids except Engram, whose n-gram
         hashing is defined over a vocabulary -- everything else (PaTH, Infini,
-        Mamba-3, RFMoE) reads hidden states only. So ``tokens`` stays required
+        RFMoE) reads hidden states only. So ``tokens`` stays required
         exactly when Engram is active and is otherwise optional.
         """
         if (tokens is None) == (inputs_embeds is None):

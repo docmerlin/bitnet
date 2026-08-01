@@ -77,11 +77,26 @@ def test_a_checkpoint_round_trips(tmp_path) -> None:
 
 
 def test_config_from_saved_drops_retired_fields() -> None:
-    # A checkpoint written before use_ffn_mid was removed still carries it.
-    saved = {"vocab_size": 256, "hidden_size": 64, "num_attention_heads": 4, "use_ffn_mid": True}
+    saved = {
+        "vocab_size": 256,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "use_ffn_mid": True,
+        "use_mamba3_layers": False,
+        "mamba_layer_period": 3,
+        "mamba_d_state": 64,
+        "mamba_expand": 2,
+        "mamba_headdim": 32,
+        "mamba_d_conv": 4,
+        "mamba_dt_min": 0.001,
+        "mamba_dt_max": 0.1,
+        "mamba_a_floor": 1e-4,
+        "use_mamba_scan_kernel": True,
+    }
     config = config_from_saved(saved)
     assert config.hidden_size == 64
     assert not hasattr(config, "use_ffn_mid")
+    assert not hasattr(config, "use_mamba3_layers")
 
 
 def test_config_from_saved_still_rejects_an_unknown_field() -> None:

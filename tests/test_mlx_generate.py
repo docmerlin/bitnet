@@ -284,7 +284,6 @@ def test_path_border_update_t_matches_full_solve() -> None:
         infini_memory_dim=4,
         use_engram=False,
         use_path_kernel=False,
-        use_mamba3_layers=False,
     )
     attn = MLXBitNet(config).blocks[0].attn
     mx.random.seed(7)
@@ -329,7 +328,6 @@ def test_path_chunk_last_matches_full_path_chunk() -> None:
         infini_memory_dim=4,
         use_engram=False,
         use_path_kernel=False,
-        use_mamba3_layers=False,
     )
     model = MLXBitNet(config)
     attn = model.blocks[0].attn

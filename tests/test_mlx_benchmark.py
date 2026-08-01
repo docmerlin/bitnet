@@ -188,7 +188,6 @@ def test_mlx_model_preserves_packed_document_boundaries_and_loops() -> None:
         num_coda_layers=0,
         num_loops=2,
         path_window_size=4,
-        use_mamba3_layers=False,
     )
     model = MLXBitNet(config)
     segments = mx.array([[0, 0, 1, 1]])
@@ -213,7 +212,6 @@ def test_mlx_recurrent_loops_reuse_effective_weights(monkeypatch) -> None:
         num_loops=3,
         path_window_size=4,
         use_engram=False,
-        use_mamba3_layers=False,
     )
     reference = MLXBitNet(config, reuse_recurrent_weights=False)
     model = MLXBitNet(config, reuse_recurrent_weights=True)
@@ -361,7 +359,6 @@ def test_mlx_paper_infini_memory_update_matches_formula(use_delta: bool) -> None
         path_window_size=4,
         infini_delta_rule=use_delta,
         use_engram=False,
-        use_mamba3_layers=False,
     )
     attention = MLXPaTHAttention(config)
     length, d, h = 3, 4, 2
@@ -406,7 +403,6 @@ def test_mlx_compiled_irregular_infini_pooling_fits_metal_argument_buffer() -> N
         path_window_size=64,
         infini_memory_dim=64,
         use_engram=False,
-        use_mamba3_layers=False,
     )
     model = MLXBitNet(config)
     gradient_step = create_gradient_step(
@@ -438,7 +434,6 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
         hidden_size=8,
         num_attention_heads=2,
         intermediate_size=16,
-        use_mamba3_layers=False,
         num_prelude_layers=0,
         num_recurrent_layers=1,
         num_coda_layers=0,
@@ -730,7 +725,6 @@ def test_mlx_activation_checkpointing_preserves_gradients_and_state(
         rfmoe_num_experts=2,
         rfmoe_expert_dim=4,
         rfmoe_rank=2,
-        use_mamba3_layers=False,
     )
     reference = MLXBitNet(config)
     checkpointed = MLXBitNet(config)

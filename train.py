@@ -170,20 +170,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sequence-length", type=_sequence_length, default=1024)
     parser.add_argument("--path-window-size", type=int, default=defaults.path_window_size)
-    parser.add_argument(
-        "--mamba3-layers",
-        action=argparse.BooleanOptionalAction,
-        default=defaults.use_mamba3_layers,
-        help="Use Mamba-3-style SSM on every mamba-layer-period-th layer starting at 0.",
-    )
-    parser.add_argument(
-        "--mamba-layer-period",
-        type=int,
-        default=defaults.mamba_layer_period,
-        help="Period for Mamba-3 layers (3 → layers 0,3,6,… ≈ 1/3 of stack).",
-    )
-    parser.add_argument("--mamba-d-state", type=int, default=defaults.mamba_d_state)
-    parser.add_argument("--mamba-expand", type=int, default=defaults.mamba_expand)
     parser.add_argument("--disable-hadamard", action="store_true")
     parser.add_argument(
         "--engram",

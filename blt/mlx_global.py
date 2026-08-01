@@ -5,7 +5,7 @@ what :class:`mlx_model.MLXBitNet` is once you stop feeding it token ids. This
 adapter presents it under the interface
 :class:`blt.mlx_model.MLXTernaryBLTModel` expects -- ``(patch_states,
 attention_mask) -> latents`` -- so the byte-level front end gains PaTH
-attention, Infini memory, RFMoE and the Mamba-3 hybrid without either stack
+attention, Infini memory and RFMoE without either stack
 learning about the other.
 
 Two things the wiring has to get right.

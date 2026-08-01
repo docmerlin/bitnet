@@ -29,7 +29,6 @@ def build_block() -> HybridTransformerBlock:
         use_engram=False,
         use_hadamard=False,
         use_4bit_activations=False,
-        use_mamba3_layers=False,
     )
     return HybridTransformerBlock(config)
 
@@ -46,7 +45,6 @@ def build_model() -> BitNetDeep:
         path_window_size=4,
         infini_delta_rule=True,
         attn_res_init_scale=0.1,
-        use_mamba3_layers=False,
     )
     return BitNetDeep(config)
 
@@ -107,7 +105,6 @@ def test_paper_memory_retrieve_matches_linear_formula() -> None:
             use_engram=False,
             use_hadamard=False,
             use_4bit_activations=False,
-            use_mamba3_layers=False,
         )
     )
     q = torch.randn(2, 2, 3, 8)
@@ -224,7 +221,6 @@ def _assert_checkpoint_matches_reference(granularity: str) -> None:
         infini_delta_rule=True,
         attn_res_init_scale=0.1,
         use_hadamard=False,
-        use_mamba3_layers=False,
     )
     reference_model = BitNetDeep(config)
     checkpoint_model = BitNetDeep(config)

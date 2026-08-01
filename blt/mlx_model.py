@@ -241,7 +241,7 @@ class MLXTernaryBLTModel(nn.Module):
 
         Defaults to BLT's own plain stack. Pass
         :class:`blt.mlx_global.MLXBitNetGlobalTransformer` to run the BitNet
-        model -- PaTH, Infini, RFMoE, Mamba-3 -- over the patch latents instead.
+        model -- PaTH, Infini, RFMoE -- over the patch latents instead.
         Anything with a ``(patch_states, attention_mask=...) -> latents``
         signature works.
         """

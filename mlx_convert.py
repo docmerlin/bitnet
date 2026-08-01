@@ -44,15 +44,9 @@ def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
         use_topk_blocks=bool(getattr(source, "use_topk_blocks", False)),
         topk_blocks=getattr(source, "topk_blocks", 4),
         topk_block_size=getattr(source, "topk_block_size", 64),
-        use_mamba3_layers=getattr(source, "use_mamba3_layers", False),
         # Without this every converted config takes the new untied default and
         # load_pytorch_weights rejects the checkpoint for disagreeing with it.
         tie_word_embeddings=getattr(source, "tie_word_embeddings", True),
-        mamba_layer_period=getattr(source, "mamba_layer_period", 3),
-        mamba_d_state=getattr(source, "mamba_d_state", 64),
-        mamba_expand=getattr(source, "mamba_expand", 2),
-        mamba_headdim=getattr(source, "mamba_headdim", 32),
-        mamba_d_conv=getattr(source, "mamba_d_conv", 4),
         use_4bit_activations=source.use_4bit_activations,
         use_hadamard=source.use_hadamard,
         rms_norm_eps=source.rms_norm_eps,
@@ -136,20 +130,6 @@ def map_pytorch_key(key: str) -> tuple[str | None, bool]:
             "gate": "memory_gate",
         }
         return prefix + "attn." + attention_names.get(attention_suffix, attention_suffix), False
-    if suffix.startswith("mamba."):
-        mamba_suffix = suffix.removeprefix("mamba.")
-        # Conv1d weight layout differs (torch OIHW vs MLX); map name and convert separately if needed.
-        mamba_names = {
-            "out_proj.weight": "out_proj.weight",
-            "in_proj.weight": "in_proj.weight",
-            "conv1d.weight": "conv1d.weight",
-            "conv1d.bias": "conv1d.bias",
-            "dt_bias": "dt_bias",
-            "B_bias": "B_bias",
-            "C_bias": "C_bias",
-            "D": "D",
-        }
-        return prefix + "mamba." + mamba_names.get(mamba_suffix, mamba_suffix), False
     raise ValueError(f"Unsupported PyTorch model key: {key}")
 
 

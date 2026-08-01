@@ -42,11 +42,6 @@ Key properties:
 - each block combines:
   - PaTH-FoX data-dependent positional attention in bounded local windows
   - Infini-Attention style fixed-size memory for context beyond each window
-  - **Mamba-3-style selective SSM**, opt-in via `--mamba3-layers`, on every 3rd unique
-    layer starting at 0 (`layer_id % 3 == 0` → ~1/3 of stack; `--mamba-layer-period`);
-    pure scan on **PyTorch and MLX** (no CUDA `mamba_ssm`). Off by default: the SSM
-    layers measured 1.36–1.51x end-to-end training throughput against the PaTH
-    attention layers that replace them, and no quality comparison has been run
   - local attention work scales linearly with sequence length at fixed
     `--path-window-size` (default 1024); no full-sequence attention matrix
   - **Sandwich RMSNorm** residual: `post(x + scale * sublayer(pre(x)))` on attn and FFN

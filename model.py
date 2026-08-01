@@ -115,13 +115,7 @@ class BitNetDeep(nn.Module):
     def _snapshot_infini_states(
         layers: Sequence[HybridTransformerBlock],
     ) -> List[Optional[dict[str, torch.Tensor]]]:
-        snaps: List[Optional[dict[str, torch.Tensor]]] = []
-        for layer in layers:
-            if layer.infini_attn is None:
-                snaps.append(None)
-            else:
-                snaps.append(layer.infini_attn.get_memory_state())
-        return snaps
+        return [layer.infini_attn.get_memory_state() for layer in layers]
 
     @staticmethod
     @contextlib.contextmanager
@@ -132,7 +126,7 @@ class BitNetDeep(nn.Module):
         """Recompute from original banks, then restore post-forward runtime state."""
         with contextlib.ExitStack() as stack:
             for layer, state in zip(layers, states):
-                if layer.infini_attn is None or state is None:
+                if state is None:
                     continue
                 stack.enter_context(
                     layer.infini_attn.use_memory_state(state, update_memory_buffers=True)
@@ -180,18 +174,6 @@ class BitNetDeep(nn.Module):
                 # Stream carries Python lists — layer ckpt not supported; fall through.
                 do_ckpt = False
         if do_ckpt:
-            if layer.infini_attn is None:
-                return checkpoint(
-                    lambda hidden_states, layer=layer, attention_mask=attention_mask, segment_ids=segment_ids, input_ids=input_ids, update_memory=update_memory: layer(
-                        hidden_states,
-                        attention_mask,
-                        segment_ids=segment_ids,
-                        input_ids=input_ids,
-                        update_memory=update_memory,
-                    ),
-                    state,
-                    use_reentrant=False,
-                )
             layer_memory_state = layer.infini_attn.get_memory_state()
             return checkpoint(
                 lambda hidden_states, layer=layer, attention_mask=attention_mask, segment_ids=segment_ids, input_ids=input_ids, update_memory=update_memory: layer(
@@ -327,8 +309,7 @@ class BitNetDeep(nn.Module):
     ) -> Union[torch.Tensor, tuple[torch.Tensor, list[torch.Tensor]]]:
         if reset_memory:
             for layer in self.layers:
-                if layer.infini_attn is not None:
-                    layer.infini_attn.reset_memory()
+                layer.infini_attn.reset_memory()
 
         x = self.embed_tokens(input_ids)
         x = self.subln(x)

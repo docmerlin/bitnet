@@ -99,20 +99,6 @@ class TernaryConfig:
     use_topk_blocks: bool = False
     topk_blocks: int = 4        # past blocks retrieved per query chunk
     topk_block_size: int = 64   # tokens per retrievable block
-    # Hybrid depth: every ``mamba_layer_period``-th unique layer (starting at 0) uses a
-    # Mamba-3-style selective SSM mixer instead of PaTH+Infini. period=3 → ~1/3 layers.
-    # Off by default: measured on the BLT + BitNet stack, the SSM layers cost 1.36-1.51x
-    # end-to-end throughput against the PaTH attention layers that replace them, and no
-    # quality comparison has been run in either direction. Turn on to A/B.
-    use_mamba3_layers: bool = False
-    mamba_layer_period: int = 3
-    mamba_d_state: int = 64
-    mamba_expand: int = 2
-    mamba_headdim: int = 32
-    mamba_d_conv: int = 4
-    mamba_dt_min: float = 0.001
-    mamba_dt_max: float = 0.1
-    mamba_a_floor: float = 1e-4
     # Residual path: "kimi" = Block AttnRes (arXiv:2603.15031); "sandwich" = legacy scalar residual
     attn_res_mode: str = "kimi"
     # Transformer layers per AttnRes depth-block (None → max(1, unique_layers // 8)).
@@ -174,14 +160,6 @@ class TernaryConfig:
         self.use_topk_blocks = bool(self.use_topk_blocks)
         if min(int(self.topk_blocks), int(self.topk_block_size)) < 1:
             raise ValueError("topk_blocks and topk_block_size must be positive")
-        if int(self.mamba_layer_period) < 1:
-            raise ValueError("mamba_layer_period must be >= 1")
-        self.mamba_layer_period = int(self.mamba_layer_period)
-        self.use_mamba3_layers = bool(self.use_mamba3_layers)
-        if int(self.mamba_d_state) < 1 or int(self.mamba_expand) < 1:
-            raise ValueError("mamba_d_state and mamba_expand must be positive")
-        if int(self.mamba_headdim) < 1 or int(self.mamba_d_conv) < 1:
-            raise ValueError("mamba_headdim and mamba_d_conv must be positive")
         if self.engram_max_ngram_size < 2:
             raise ValueError("engram_max_ngram_size must be >= 2")
         if self.engram_num_heads < 1 or self.engram_head_dim < 1:

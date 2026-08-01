@@ -42,7 +42,21 @@ _EXCLUDED_STATE_NAMES = _MEMORY_STATE_NAMES + _RUNTIME_QUANT_NAMES
 #: still carries them, and passing one to the dataclass is a TypeError. Dropping
 #: *known* removed names keeps old checkpoints loadable while an genuinely
 #: unrecognised key still fails loudly rather than being silently ignored.
-RETIRED_CONFIG_FIELDS = frozenset({"use_ffn_mid"})
+RETIRED_CONFIG_FIELDS = frozenset(
+    {
+        "use_ffn_mid",
+        "use_mamba3_layers",
+        "mamba_layer_period",
+        "mamba_d_state",
+        "mamba_expand",
+        "mamba_headdim",
+        "mamba_d_conv",
+        "mamba_dt_min",
+        "mamba_dt_max",
+        "mamba_a_floor",
+        "use_mamba_scan_kernel",
+    }
+)
 
 
 def config_from_saved(saved_config: dict) -> MLXBitNetConfig:
@@ -123,18 +137,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--topk-blocks", type=int, default=4)
     parser.add_argument("--topk-block-size", type=int, default=64)
-    parser.add_argument(
-        "--mamba3-layers",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Mamba-3-style SSM on every mamba-layer-period-th layer starting at 0. "
-        "Off by default: measured at 1.36-1.51x throughput cost with no quality "
-        "comparison run. --mamba3-layers turns it back on.",
-    )
-    parser.add_argument("--mamba-layer-period", type=int, default=3)
-    parser.add_argument("--mamba-d-state", type=int, default=64)
-    parser.add_argument("--mamba-expand", type=int, default=2)
-    parser.add_argument("--mamba-headdim", type=int, default=32)
     parser.add_argument("--micro-batch-size", type=int, default=4)
     parser.add_argument("--grad-accumulation-steps", type=int, default=4)
     parser.add_argument("--total-tokens", type=int, default=10_000_000)
@@ -727,11 +729,6 @@ def main() -> None:
             use_topk_blocks=args.topk_blocks_branch,
             topk_blocks=args.topk_blocks,
             topk_block_size=args.topk_block_size,
-            use_mamba3_layers=args.mamba3_layers,
-            mamba_layer_period=args.mamba_layer_period,
-            mamba_d_state=args.mamba_d_state,
-            mamba_expand=args.mamba_expand,
-            mamba_headdim=args.mamba_headdim,
             use_path_kernel=args.path_kernel,
             use_engram=args.engram,
             engram_layer_ids=tuple(int(value) for value in args.engram_layer_ids.split(",") if value),

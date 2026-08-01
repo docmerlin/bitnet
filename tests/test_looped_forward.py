@@ -28,7 +28,6 @@ def _tiny_looped(
         num_recurrent_layers=recurrent,
         num_coda_layers=coda,
         num_loops=num_loops,
-        use_mamba3_layers=False,
     )
 
 
@@ -71,10 +70,7 @@ def test_looped_forward_shapes_and_override() -> bool:
     # Amplify sublayer outs so multi-loop dynamics are visible (init is near-identity).
     with torch.no_grad():
         for layer in model.layers:
-            if layer.infini_attn is not None:
-                layer.infini_attn.o_proj.weight.mul_(50.0)
-            if layer.mamba is not None:
-                layer.mamba.out_proj.weight.mul_(50.0)
+            layer.infini_attn.o_proj.weight.mul_(50.0)
             if hasattr(layer, "ffn_down"):
                 layer.ffn_down.weight.mul_(50.0)
             # Sandwich mode residual scales (kimi mode has no .scale).
