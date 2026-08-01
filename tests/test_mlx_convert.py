@@ -140,7 +140,15 @@ def test_pytorch_checkpoint_converts_weights_hashes_optimizer_and_outputs(tmp_pa
         for parameter_id, source_name in zip(group["params"], group["param_names"]):
             source_slot = source_optimizer_state["state"].get(parameter_id, {})
             target_name, squeeze = map_pytorch_key(source_name)
-            prefix = f"states.{group_index}.{target_name}."
+            # PyTorch has two groups (mud, clion); MLX splits clion into an
+            # embedding group and everything else.
+            if group_index == 0:
+                target_group = 0
+            elif CMUD._is_embedding_parameter(target_name, None):
+                target_group = 1
+            else:
+                target_group = 2
+            prefix = f"states.{target_group}.{target_name}."
             for slot_name in ("momentum_buffer", "exp_avg", "exp_avg_q", "exp_avg_scale"):
                 if slot_name not in source_slot:
                     continue

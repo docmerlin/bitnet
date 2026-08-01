@@ -14,7 +14,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from mlx_model import MLXBitNet, MLXBitNetConfig
-from mlx_train import scheduled_value
+from mlx_train import scheduled_value, config_from_saved
 from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
 from training.schedules import loop_count_for_progress
 
@@ -127,7 +127,7 @@ def load_model(
     metadata = json.loads(checkpoint.with_suffix(".json").read_text(encoding="utf-8"))
     config_data = dict(metadata["model_config"])
     config_data["engram_layer_ids"] = tuple(config_data["engram_layer_ids"])
-    model = MLXBitNet(MLXBitNetConfig(**config_data))
+    model = MLXBitNet(config_from_saved(config_data))
     training_args = metadata.get("training_args") or {}
     dtype = {
         "bfloat16": mx.bfloat16,
@@ -266,7 +266,7 @@ def model_callbacks(
     def propose(token_ids: list[int]) -> list[int]:
         states = sync(token_ids)
         pending.clear()
-        main = states @ model.embedding.weight.T
+        main = model.logits_from(states)
         if depth:
             logits = mx.concatenate((main, model.draft_logits(states)), axis=1)
         else:
@@ -286,7 +286,7 @@ def model_callbacks(
             profile.decode_s += time.perf_counter() - started
             profile.decode_steps += 1
         pending[tuple([*prefix, *candidates])] = (branch_cache, states[:, -1:])
-        verifier = states @ model.embedding.weight.T
+        verifier = model.logits_from(states)
         verified = mx.argmax(verifier, axis=-1)
         drafts = mx.argmax(model.draft_logits(states), axis=-1) if depth else mx.zeros((1, 0), dtype=mx.int32)
         _eval(verified, drafts)

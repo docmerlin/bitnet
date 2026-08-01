@@ -179,7 +179,7 @@ def _run_global(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Full encoder + global pass over the committed prefix."""
     patch_lengths = patching.patch_lengths(tokens)
-    byte_embeddings = model.byte_embeddings(tokens)
+    byte_embeddings = model.embed_bytes(tokens, _ones_mask(tokens))
     _, patch_states, patch_ids = model.local_encoder(
         byte_embeddings, patch_lengths, attention_mask=_ones_mask(tokens)
     )
@@ -209,7 +209,7 @@ def _decoder_next(
     """
     attention_mask = _ones_mask(tokens)
     hidden = model.local_encoder.encode_bytes(
-        model.byte_embeddings(tokens),
+        model.embed_bytes(tokens, attention_mask),
         attention_mask=attention_mask,
     )
     stats.draft_encoder += 1

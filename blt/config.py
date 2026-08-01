@@ -30,9 +30,25 @@ class TernaryBLTConfig:
     global_dim: int = 512
     decoder_dim: int = 256
 
-    n_layers_local_encoder: int = 4
+    # Meta's BLT runs 1 encoder layer at 400M/1B and 3 at 2B-8B, on the grounds
+    # that hash n-gram embeddings supply the multi-byte identity the encoder
+    # would otherwise need depth to rebuild -- the paper's word is that the
+    # encoder is "extremely light-weight" *when using* them. Those are in now
+    # (use_ngram_embeddings), and the encoder is 30% of the forward, so this is
+    # the cheap end of that trade: 4 -> 1 layer measured 3.4x on the encoder.
+    #
+    # Justified on speed and on Meta's architecture, NOT on measured quality: at
+    # the scale this repo can train, seed-to-seed spread in held-out loss (0.138)
+    # is larger than the gap between 1 and 4 encoder layers (0.052). See todo.md.
+    n_layers_local_encoder: int = 1
     n_layers_global: int = 8
-    n_layers_local_decoder: int = 4
+    # Meta's budget is encoder-light and decoder-heavy: 1/9 at 400M-1B, 3/7 at
+    # 2B-8B. The decoder does the harder job -- turning a patch latent back into
+    # individual bytes -- and unlike the encoder it has no n-gram embeddings to
+    # lean on. Measured cost against 4 layers: +1.77M parameters and 193 vs 146
+    # ms/step. Held-out loss does not separate them (see todo.md); this follows
+    # the published architecture rather than a local measurement.
+    n_layers_local_decoder: int = 7
 
     n_heads_local_encoder: int = 4
     n_heads_global: int = 8
@@ -57,6 +73,23 @@ class TernaryBLTConfig:
     local_window: int | None = 256
     dropout: float = 0.0
     rope_theta: float = 10000.0
+
+    # Hashed byte n-gram embeddings summed into the byte embedding, as in Meta's
+    # BLT (arXiv:2412.09871 eq. 3). They are what lets that model run a
+    # one-layer local encoder: the paper calls the encoder "extremely
+    # light-weight" *when paired with* hash n-gram embeddings, because the
+    # n-grams supply the multi-byte identity the encoder would otherwise need
+    # depth to rebuild.
+    use_ngram_embeddings: bool = True
+    ngram_sizes: tuple[int, ...] = (3, 4, 5, 6, 7, 8)
+    # Hashes per n-gram size. Meta uses ~500K total at 8B; that would be 128M
+    # parameters at local_dim 256, i.e. larger than this whole model, so the
+    # tables are narrow instead (below) and the count is swept separately.
+    ngram_vocab_size: int = 16384
+    # Table width. None -> local_dim // 4, then one shared projection back up.
+    # Meta embeds at full width; at this scale the narrow-plus-project shape
+    # borrowed from Engram is what keeps the tables from dwarfing the body.
+    ngram_dim: int | None = None
 
     # Meta's teacher averages ~4.5 bytes per patch and the BLT paper's entropy
     # patcher runs finer still; 4 keeps the uniform fallback in that range rather
@@ -95,6 +128,19 @@ class TernaryBLTConfig:
             raise ValueError("cross_attn_k must be positive")
         if self.activation_bits < 2:
             raise ValueError("activation_bits must be at least 2")
+        if self.use_ngram_embeddings:
+            sizes = tuple(int(size) for size in self.ngram_sizes)
+            if not sizes or min(sizes) < 1:
+                raise ValueError("ngram_sizes must be non-empty and positive")
+            if len(set(sizes)) != len(sizes):
+                raise ValueError("ngram_sizes must not repeat a size")
+            object.__setattr__(self, "ngram_sizes", tuple(sorted(sizes)))
+            if self.ngram_vocab_size < 1:
+                raise ValueError("ngram_vocab_size must be positive")
+            if self.ngram_dim is None:
+                object.__setattr__(self, "ngram_dim", max(self.local_dim // 4, 1))
+            elif self.ngram_dim < 1:
+                raise ValueError("ngram_dim must be positive")
         if self.pad_id < -1:
             raise ValueError("pad_id must be -1 or a non-negative token id")
         if 0 <= self.pad_id < self.offset + self.byte_vocab_size:

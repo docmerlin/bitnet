@@ -27,9 +27,9 @@ _SCAN_FWD = mx.fast.metal_kernel(
         uint N = Bmat_shape[3];
         if (p >= P || h >= H || b >= x_shape[0]) return;
 
-        float state[128];
-        float prev_bu[128];
-        for (uint n = 0; n < N && n < 128; ++n) {
+        float state[NMAX];
+        float prev_bu[NMAX];
+        for (uint n = 0; n < NMAX; ++n) {
             state[n] = 0.0f;
             prev_bu[n] = 0.0f;
         }
@@ -42,7 +42,7 @@ _SCAN_FWD = mx.fast.metal_kernel(
             float xv = float(x[ulong(b) * L * H * P + ulong(t) * H * P + ulong(h) * P + p]);
 
             float yv = 0.0f;
-            for (uint n = 0; n < N && n < 128; ++n) {
+            for (uint n = 0; n < NMAX; ++n) {
                 float Bv = float(Bmat[ulong(b) * L * H * N + ulong(t) * H * N + ulong(h) * N + n]);
                 float Cv = float(Cmat[ulong(b) * L * H * N + ulong(t) * H * N + ulong(h) * N + n]);
                 float bu = Bv * xv * dtt;
@@ -73,9 +73,9 @@ _SCAN_RECOMPUTE = mx.fast.metal_kernel(
         uint N = Bmat_shape[3];
         if (p >= P || h >= H || b >= x_shape[0]) return;
 
-        float state[128];
-        float prev_bu[128];
-        for (uint n = 0; n < N && n < 128; ++n) {
+        float state[NMAX];
+        float prev_bu[NMAX];
+        for (uint n = 0; n < NMAX; ++n) {
             state[n] = 0.0f;
             prev_bu[n] = 0.0f;
         }
@@ -88,7 +88,7 @@ _SCAN_RECOMPUTE = mx.fast.metal_kernel(
             float tr = float(trap[ulong(b) * L * H + th]);
             float xv = float(x[ulong(b) * L * H * P + ulong(t) * H * P + ulong(h) * P + p]);
 
-            for (uint n = 0; n < N && n < 128; ++n) {
+            for (uint n = 0; n < NMAX; ++n) {
                 float Bv = float(Bmat[ulong(b) * L * H * N + ulong(t) * H * N + ulong(h) * N + n]);
                 float bu = Bv * xv * dtt;
                 float force = (1.0f - tr) * prev_bu[n] + tr * bu;
@@ -104,6 +104,13 @@ _SCAN_RECOMPUTE = mx.fast.metal_kernel(
 
 # Threadgroup (P,1,1) per (h,b). Shared reduce for scalars + dB/dC strips.
 # sh_dB/sh_dC: [P][N] with P<=64, N<=64 → 16KB each if N=64; use N<=64 path in shared.
+#
+# Every cross-thread reduction here is split across the P threads. The obvious
+# way to write it -- park the sums on thread 0 -- makes the dB/dC reduction
+# 2*N*P serial float ops per timestep with P-1 threads stalled at a barrier,
+# which at L=1024, N=64, P=32 is 4096 serial ops x 1024 steps and dominated the
+# whole training backward (measured: the scan was 77% of it). Striping n over
+# the threads makes it 2*N ops each.
 _SCAN_BWD = mx.fast.metal_kernel(
     name="mamba3_selective_scan_bwd",
     input_names=["x", "decay", "dt", "Bmat", "Cmat", "trap", "dy", "states"],
@@ -119,22 +126,24 @@ _SCAN_BWD = mx.fast.metal_kernel(
         uint N = Bmat_shape[3];
         if (h >= H || b >= x_shape[0] || p >= P) return;
 
-        float dstate[128];
-        float dprev_bu[128];
-        for (uint n = 0; n < N && n < 128; ++n) {
+        float dstate[NMAX];
+        float dprev_bu[NMAX];
+        for (uint n = 0; n < NMAX; ++n) {
             dstate[n] = 0.0f;
             dprev_bu[n] = 0.0f;
         }
 
-        // P<=64, use strip reduction over n in blocks of 1 with tree reduce on p.
-        threadgroup float sh_red[64];
-        // For dB/dC: each thread writes its dB_local[n] then p0 sums — batch n in groups
-        // to cut barriers: process all n, store sh_dBN[p*N + n] if P*N <= 2048 (8KB).
+        // One shared array per scalar so the three reduce in parallel on
+        // threads 0/1/2 behind a single barrier pair.
+        threadgroup float sh_dec[64];
+        threadgroup float sh_dt[64];
+        threadgroup float sh_tr[64];
+        // dB/dC: thread p writes its strip to sh_dBN[p*N + n], then the threads
+        // split the column sums between them. Host side rejects P*N > 2048.
         threadgroup float sh_dBN[2048];
         threadgroup float sh_dCN[2048];
 
         ulong histStride = ulong(L) * H * P * N;
-        bool compact = (P * N <= 2048);
 
         for (int ti = int(L) - 1; ti >= 0; --ti) {
             uint t = uint(ti);
@@ -150,7 +159,7 @@ _SCAN_BWD = mx.fast.metal_kernel(
             float d_tr_local = 0.0f;
             float d_x_local = 0.0f;
 
-            for (uint n = 0; n < N && n < 128; ++n) {
+            for (uint n = 0; n < NMAX; ++n) {
                 ulong hist = ulong(b) * histStride
                     + ulong(t) * H * P * N + ulong(h) * P * N + ulong(p) * N + n;
                 float st = float(states[hist]);
@@ -184,58 +193,47 @@ _SCAN_BWD = mx.fast.metal_kernel(
                 dstate[n] = d_force * dec;
                 dprev_bu[n] = d_bum1;
 
-                if (compact) {
-                    sh_dBN[p * N + n] = dB;
-                    sh_dCN[p * N + n] = dC;
-                } else {
-                    // fallback path written after barrier loop below via sh_red
-                    sh_dBN[p] = dB; // will re-loop n
-                }
+                sh_dBN[p * N + n] = dB;
+                sh_dCN[p * N + n] = dC;
             }
 
             dx[ulong(b) * L * H * P + ulong(t) * H * P + ulong(h) * P + p] = T(d_x_local);
 
-            // scalar reduces (3 barriers)
-            sh_red[p] = d_dec_local;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (p == 0) {
-                float s = 0.0f; for (uint i = 0; i < P; ++i) s += sh_red[i];
-                ddecay[ulong(b) * L * H + th] = T(s);
-            }
+            sh_dec[p] = d_dec_local;
+            sh_dt[p] = d_dt_local;
+            sh_tr[p] = d_tr_local;
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            sh_red[p] = d_dt_local;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (p == 0) {
-                float s = 0.0f; for (uint i = 0; i < P; ++i) s += sh_red[i];
-                ddt[ulong(b) * L * H + th] = T(s);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            sh_red[p] = d_tr_local;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (p == 0) {
-                float s = 0.0f; for (uint i = 0; i < P; ++i) s += sh_red[i];
-                dtrap[ulong(b) * L * H + th] = T(s);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            if (compact) {
-                // one barrier then p0 writes all n
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (p == 0) {
-                    for (uint n = 0; n < N; ++n) {
-                        float sB = 0.0f, sC = 0.0f;
-                        for (uint i = 0; i < P; ++i) {
-                            sB += sh_dBN[i * N + n];
-                            sC += sh_dCN[i * N + n];
-                        }
-                        dBmat[ulong(b) * L * H * N + ulong(t) * H * N + ulong(h) * N + n] = T(sB);
-                        dCmat[ulong(b) * L * H * N + ulong(t) * H * N + ulong(h) * N + n] = T(sC);
-                    }
+            // Striped, not one slot per thread: the threadgroup is P threads
+            // wide and P can be smaller than 3, in which case a fixed
+            // p==0/1/2 assignment leaves ddt and dtrap never written and the
+            // output buffer is returned uninitialised. Measured at headdim 2:
+            // dtrap error 7.7e-03 against 7.5e-09 at headdim 32.
+            for (uint slot = p; slot < 3; slot += P) {
+                float s = 0.0f;
+                if (slot == 0) {
+                    for (uint i = 0; i < P; ++i) s += sh_dec[i];
+                    ddecay[ulong(b) * L * H + th] = T(s);
+                } else if (slot == 1) {
+                    for (uint i = 0; i < P; ++i) s += sh_dt[i];
+                    ddt[ulong(b) * L * H + th] = T(s);
+                } else {
+                    for (uint i = 0; i < P; ++i) s += sh_tr[i];
+                    dtrap[ulong(b) * L * H + th] = T(s);
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
+
+            // Column sums of sh_dBN/sh_dCN, n striped over the P threads.
+            for (uint n = p; n < N; n += P) {
+                float sB = 0.0f, sC = 0.0f;
+                for (uint i = 0; i < P; ++i) {
+                    sB += sh_dBN[i * N + n];
+                    sC += sh_dCN[i * N + n];
+                }
+                dBmat[ulong(b) * L * H * N + ulong(t) * H * N + ulong(h) * N + n] = T(sB);
+                dCmat[ulong(b) * L * H * N + ulong(t) * H * N + ulong(h) * N + n] = T(sC);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     """,
 )
@@ -261,7 +259,11 @@ def selective_scan_fwd_metal(
         raise ValueError("Metal bwd threadgroup expects headdim (P) <= 64")
     return _SCAN_FWD(
         inputs=[x, decay, dt, Bmat, Cmat, trap],
-        template=[("T", mx.float32)],
+        # d_state as a template constant, not a loop bound read from the shape:
+        # the per-thread state/prev_bu arrays then size to the real d_state
+        # instead of the 128 worst case, which is the difference between fitting
+        # in registers and spilling.
+        template=[("T", mx.float32), ("NMAX", int(Bmat.shape[-1]))],
         grid=(headdim, nheads, bsz),
         threadgroup=(min(headdim, 32), 1, 1),
         output_shapes=[x.shape],
@@ -285,11 +287,15 @@ def selective_scan_bwd_metal(
         raise ValueError("Metal scan supports d_state <= 128")
     if headdim > 64:
         raise ValueError("Metal bwd threadgroup expects headdim (P) <= 64")
+    if headdim * n_state > 2048:
+        # sh_dBN/sh_dCN are [P][N]; past this the kernel would read uninitialised
+        # threadgroup memory and hand back silently wrong dB/dC.
+        raise ValueError("Metal scan bwd needs headdim * d_state <= 2048")
 
     hist_shape = (bsz, seq_len, nheads, headdim, n_state)
     (states,) = _SCAN_RECOMPUTE(
         inputs=[x, decay, dt, Bmat, trap],
-        template=[("T", mx.float32)],
+        template=[("T", mx.float32), ("NMAX", n_state)],
         grid=(headdim, nheads, bsz),
         threadgroup=(min(headdim, 32), 1, 1),
         output_shapes=[hist_shape],
@@ -299,7 +305,7 @@ def selective_scan_bwd_metal(
     # One threadgroup per (h,b) with P threads for reduction.
     outs = _SCAN_BWD(
         inputs=[x, decay, dt, Bmat, Cmat, trap, dy, states],
-        template=[("T", mx.float32)],
+        template=[("T", mx.float32), ("NMAX", n_state)],
         grid=(headdim, nheads, bsz),
         threadgroup=(headdim, 1, 1),
         output_shapes=[

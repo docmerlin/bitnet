@@ -44,7 +44,10 @@ def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
         use_topk_blocks=bool(getattr(source, "use_topk_blocks", False)),
         topk_blocks=getattr(source, "topk_blocks", 4),
         topk_block_size=getattr(source, "topk_block_size", 64),
-        use_mamba3_layers=getattr(source, "use_mamba3_layers", True),
+        use_mamba3_layers=getattr(source, "use_mamba3_layers", False),
+        # Without this every converted config takes the new untied default and
+        # load_pytorch_weights rejects the checkpoint for disagreeing with it.
+        tie_word_embeddings=getattr(source, "tie_word_embeddings", True),
         mamba_layer_period=getattr(source, "mamba_layer_period", 3),
         mamba_d_state=getattr(source, "mamba_d_state", 64),
         mamba_expand=getattr(source, "mamba_expand", 2),
@@ -69,7 +72,6 @@ def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
         rfmoe_rank=source.rfmoe_rank,
         rfmoe_theta=source.rfmoe_theta,
         mtp_depth=source.mtp_depth,
-        use_ffn_mid=getattr(source, "use_ffn_mid", True),
         attn_res_mode=getattr(source, "attn_res_mode", "kimi"),
         attn_res_group_size=getattr(source, "attn_res_group_size", None),
     )
@@ -84,7 +86,10 @@ def map_pytorch_key(key: str) -> tuple[str | None, bool]:
     if key in top_level:
         return top_level[key], False
     if key == "lm_head.weight":
-        return None, False
+        # Tied checkpoints repeat the embedding here and the MLX side has no such
+        # parameter; untied ones are carried across. load_pytorch_weights decides
+        # which case this is and drops the key before calling in the tied case.
+        return "lm_head.weight", False
     if key.startswith("loop_hc."):
         return key, False
 
@@ -158,8 +163,16 @@ def _to_mlx(tensor: torch.Tensor, *, squeeze: bool = False) -> mx.array:
 
 
 def load_pytorch_weights(model: MLXBitNet, state: dict[str, torch.Tensor]) -> dict[str, str]:
-    if "lm_head.weight" in state and not torch.equal(state["lm_head.weight"], state["embed_tokens.weight"]):
-        raise ValueError("PyTorch checkpoint has untied lm_head and embedding weights")
+    tied_head = "lm_head.weight" in state and torch.equal(
+        state["lm_head.weight"], state["embed_tokens.weight"]
+    )
+    if tied_head != model.config.tie_word_embeddings:
+        raise ValueError(
+            f"PyTorch checkpoint has a {'tied' if tied_head else 'untied'} lm_head but the "
+            f"MLX config sets tie_word_embeddings={model.config.tie_word_embeddings}"
+        )
+    if tied_head:
+        state = {key: value for key, value in state.items() if key != "lm_head.weight"}
     targets = dict(tree_flatten(model.parameters()))
     converted = []
     name_map = {}
@@ -190,11 +203,21 @@ def _pytorch_parameter_groups(
     model_state: dict[str, torch.Tensor],
 ) -> tuple[list[str], list[str]]:
     buffers = (".offsets", ".multipliers")
-    embeddings = ("embed_tokens.weight", ".engram.embedding.weight", "loop_hc.loop_embed.weight")
+    # An untied lm_head goes with the embeddings, not into MUD -- modded-nanogpt
+    # runs both on the elementwise optimizer and reserves Muon for the body.
+    embeddings = (
+        "embed_tokens.weight",
+        "lm_head.weight",
+        ".engram.embedding.weight",
+        "loop_hc.loop_embed.weight",
+    )
+    tied_head = "lm_head.weight" in model_state and torch.equal(
+        model_state["lm_head.weight"], model_state["embed_tokens.weight"]
+    )
     names = [
         name
         for name in model_state
-        if name != "lm_head.weight" and not name.endswith(buffers)
+        if not (tied_head and name == "lm_head.weight") and not name.endswith(buffers)
     ]
     mud = [
         name
@@ -247,7 +270,7 @@ def _optimizer_from_pytorch(
         "clion": lion_group.get("param_names", fallback_names),
     }
 
-    for kind, group_index in (("mud", 0), ("clion", 1)):
+    for kind in ("mud", "clion"):
         group = groups[kind]
         names = group_names[kind]
         expected_names = mud_names if kind == "mud" else fallback_names
@@ -262,6 +285,14 @@ def _optimizer_from_pytorch(
             if not source_state:
                 continue
             target_name = name_map[source_name]
+            # PyTorch has one C-Lion group; MLX splits it into an embedding group
+            # and everything else, so pick the index per parameter.
+            if kind == "mud":
+                group_index = 0
+            elif CMUD._is_embedding_parameter(target_name, None):
+                group_index = 1
+            else:
+                group_index = 2
             prefix = f"states.{group_index}.{target_name}."
             squeeze = source_name.endswith("engram.short_conv.weight")
             if kind == "mud":
@@ -278,8 +309,8 @@ def _optimizer_from_pytorch(
                 flat_state[prefix + "exp_avg"] = _to_mlx(source_state["exp_avg"], squeeze=squeeze)
 
     step = payload.get("trainer_state", {}).get("step", 0)
-    flat_state["states.0.step"] = mx.array(step, dtype=mx.uint64)
-    flat_state["states.1.step"] = mx.array(step, dtype=mx.uint64)
+    for group_index in range(len(optimizer.optimizers)):
+        flat_state[f"states.{group_index}.step"] = mx.array(step, dtype=mx.uint64)
     optimizer.state = tree_unflatten(list(flat_state.items()))
     return optimizer
 

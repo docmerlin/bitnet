@@ -17,7 +17,9 @@ from mlx.nn.utils import checkpoint as activation_checkpoint
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
 from mlx_ternary_kernel import (
+    activation_levels as _activation_level_pair,
     pack_ternary_weight,
+    ste_activation_quantize,
     ternary_fused_ffn_m1,
     ternary_fused_linear_m1,
     ternary_quantized_linear,
@@ -34,6 +36,23 @@ _path_decode_mode: ContextVar[str] = ContextVar("path_decode_mode", default="las
 
 
 _MEMORY_EPS = 1e-6
+
+
+def _safe_norm(x: mx.array, axis: int, keepdims: bool = False) -> mx.array:
+    """L2 norm whose gradient is finite at zero.
+
+    ``mx.linalg.norm`` differentiates to ``x / ||x||``, which is 0/0 at the
+    origin. Guarding the *result* -- ``mx.maximum(norm(x), eps)`` -- fixes the
+    forward and does nothing for the backward, because ``maximum`` then
+    multiplies the already-NaN cotangent by zero and NaN survives it. Putting
+    eps inside the square root instead keeps the whole thing smooth.
+    """
+    return mx.sqrt(mx.sum(x * x, axis=axis, keepdims=keepdims) + 1e-12)
+
+
+def _safe_normalize(x: mx.array, axis: int = -1, floor: float = 1e-6) -> mx.array:
+    """``x`` scaled to unit norm, finite gradient at zero. See :func:`_safe_norm`."""
+    return x / mx.maximum(_safe_norm(x, axis=axis, keepdims=True), floor)
 
 
 def _infini_sigma(x: mx.array) -> mx.array:
@@ -63,7 +82,8 @@ class MLXBitNetConfig:
     topk_blocks: int = 4
     topk_block_size: int = 64
     # Mamba-3-style SSM on every mamba_layer_period-th layer starting at 0 (~1/3).
-    use_mamba3_layers: bool = True
+    # Off by default -- costs 1.36-1.51x throughput; see config.TernaryConfig.
+    use_mamba3_layers: bool = False
     mamba_layer_period: int = 3
     mamba_d_state: int = 64
     mamba_expand: int = 2
@@ -95,12 +115,15 @@ class MLXBitNetConfig:
     rfmoe_theta: float = 0.01
     rfmoe_backend: str = "auto"
     mtp_depth: int = 0
-    # Dense FFN: SwiGLU up/down plus optional square mid (I→I). False = classic 2-mat SwiGLU.
-    use_ffn_mid: bool = True
     # Residual path: "kimi" = Block AttnRes (arXiv:2603.15031); "sandwich" = legacy scale residual.
     attn_res_mode: str = "kimi"
     # Transformer layers per AttnRes depth-block (None → max(1, unique_layers // 8)).
     attn_res_group_size: int | None = None
+    # Share the output projection with the input embedding. False (untied) is the
+    # modded-nanogpt configuration: an untied head plus a much higher embedding
+    # learning rate was their largest win after Muon. Costs vocab*hidden extra
+    # parameters (16.7M at vocab 32768 / hidden 512).
+    tie_word_embeddings: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads:
@@ -276,8 +299,18 @@ class MLXHBitLinear(nn.Module):
         )
         self.weight_mix = mx.array(1.0)
         self.activation_mix = mx.array(1.0)
-        self.activation_levels = mx.array(float((2 ** (config.activation_bits - 1)) - 1))
-        self.freeze(keys=["weight_mix", "activation_mix", "activation_levels"], recurse=False)
+        # When set, set_quantization_state leaves weight_mix alone. Used by the
+        # identity-initialised FFN mid; see MLXHybridBlock.
+        self.pinned_weight_mix: float | None = None
+        self._pinned_full_weight_quant = False
+        # [positive, negative] for the fused quantiser. Module state, not a
+        # locally built constant, so mx.compile treats it as an input and a
+        # mid-run bit-width change flows through instead of being baked in.
+        self.activation_level_pair = _activation_level_pair(config.activation_bits)
+        self.freeze(
+            keys=["weight_mix", "activation_mix", "activation_level_pair"],
+            recurse=False,
+        )
         # Pinned inference weights: set by pin_inference_weights(); avoid per-token rematerialization.
         self._pinned_dense: mx.array | None = None
         self._pinned_packed: tuple | None = None
@@ -288,10 +321,24 @@ class MLXHBitLinear(nn.Module):
         if self.config.use_hadamard and self.input_dims & (self.input_dims - 1) == 0:
             x = mx.hadamard_transform(x)
         if self.config.use_4bit_activations:
-            levels = self.activation_levels
-            negative_levels = levels + 1
-            activation_scale = mx.maximum(mx.max(mx.abs(x), axis=-1, keepdims=True), 1e-5) / levels
-            quantized_x = mx.clip(mx.round(x / activation_scale), -negative_levels, levels) * activation_scale
+            # One fused kernel rather than the nine elementwise passes the
+            # expression form costs -- absmax, divide, round, clip, rescale, and
+            # the straight-through add. Measured 2-7x on the quantiser alone,
+            # and it is 41-75% of a whole HBitLinear. The levels stay a runtime
+            # array so ramping the bit width does not recompile the graph.
+            #
+            # float32 on purpose. The expression this replaced read the levels
+            # from a float32 array, so bfloat16 activations were promoted and the
+            # whole quantisation -- and the matmul consuming it -- ran at float32.
+            # The kernel works in the input dtype, so passing x through unchanged
+            # would silently drop this stack to bfloat16 quantisation: measured
+            # 1180 of 1200 elements differing on a [4, 300] bf16 input. bfloat16
+            # carries 8 mantissa bits and an 8-bit grid needs 255 levels, so that
+            # is not a safe change to make by accident. See todo.md -- the
+            # implied float32 matmul may itself be worth revisiting deliberately.
+            quantized_x = ste_activation_quantize(
+                x.astype(mx.float32), self.activation_level_pair
+            ).astype(mx.float32)
             if self._full_activation_quant:
                 return quantized_x
             x = x + self.activation_mix * mx.stop_gradient(quantized_x - x)
@@ -316,7 +363,14 @@ class MLXHBitLinear(nn.Module):
         normalized = weight / weight_scale
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
         quantized_weight = ternary * weight_scale
-        effective = (weight + self.weight_mix * mx.stop_gradient(quantized_weight - weight)).astype(dtype)
+        # stop_gradient(q) + mix*(w - stop_gradient(w)) at mix=1, rather than
+        # w + mix*stop_gradient(q - w): same value and gradient, but the latter
+        # computes q - w, and the identity-initialised FFN mid has w ~ I against
+        # q ~ 1, so that subtraction loses most of its significant digits.
+        if self._pinned_full_weight_quant:
+            effective = (mx.stop_gradient(quantized_weight) + (weight - mx.stop_gradient(weight))).astype(dtype)
+        else:
+            effective = (weight + self.weight_mix * mx.stop_gradient(quantized_weight - weight)).astype(dtype)
         if cache is not None and key is not None and key[0] is not None:
             cache[key] = effective
         return effective
@@ -411,10 +465,13 @@ class MLXHBitLinear(nn.Module):
         return x @ self.effective_weight(x.dtype).T
 
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
+        if self.pinned_weight_mix is not None:
+            weight_mix = self.pinned_weight_mix
+        self._pinned_full_weight_quant = self.pinned_weight_mix is not None and weight_mix >= 1.0
         self.weight_mix = mx.array(weight_mix)
         self.activation_mix = mx.array(activation_mix)
         levels = float((2 ** (max(bits, 2) - 1)) - 1)
-        self.activation_levels = mx.array(levels)
+        self.activation_level_pair = _activation_level_pair(bits)
         self._act_levels_f = levels
         self._full_activation_quant = activation_mix >= 1.0
         self.clear_pinned_inference_weight()
@@ -600,14 +657,20 @@ class MLXRFMoEExpert(nn.Module):
         self.b_gate = MLXHBitLinear(rank, expert_dim, config)
         self.w_up = MLXHBitLinear(hidden, expert_dim, config)
         self.w_mid = MLXHBitLinear(expert_dim, expert_dim, config)
-        # Cold start: identity mid ≈ classic 2-mat expert body.
-        self.w_mid.weight = mx.eye(expert_dim, dtype=self.w_mid.weight.dtype)
+        # Cold start: identity mid ~ classic 2-mat expert body.
+        # eye(D)*D, not eye(D): the per-output-channel scale is mean(|row|), so a
+        # plain identity row (one 1, D-1 zeros) has scale 1/D and quantises to
+        # eye(D)/D -- an attenuator, not a pass-through. See TernaryMLP.mid_proj.
+        self.w_mid.weight = mx.eye(expert_dim, dtype=self.w_mid.weight.dtype) * expert_dim
+        self.w_mid.pinned_weight_mix = 1.0
+        self.w_mid.weight_mix = mx.array(1.0)
+        self.w_mid._pinned_full_weight_quant = True
         self.w_down = MLXHBitLinear(expert_dim, hidden, config)
         self.bias = mx.array([1e-6])
 
     def __call__(self, x: mx.array):
         z = self.a_gate(x)
-        gate = mx.maximum(mx.linalg.norm(z, axis=-1) - self.bias, 0.0)
+        gate = mx.maximum(_safe_norm(z, axis=-1) - self.bias, 0.0)
         hidden = mx.sigmoid(self.b_gate(z)) * self.w_up(x)
         contribution = self.w_down(nn.silu(self.w_mid(hidden)))
         return gate, contribution
@@ -697,7 +760,7 @@ class MLXRFMoE(nn.Module):
         )
         z = mx.einsum("td,erd->etr", score_input, a_gate)
         biases = mx.stack([expert.bias for expert in self.experts])
-        gate_stack = mx.maximum(mx.linalg.norm(z, axis=-1) - biases, 0.0)
+        gate_stack = mx.maximum(_safe_norm(z, axis=-1) - biases, 0.0)
         return z, gate_stack
 
     def _metal_forward_arrays(self, x: mx.array):
@@ -819,7 +882,7 @@ class MLXRFMoE(nn.Module):
         target = (1.0 - alpha) * target / mx.sum(target) + alpha / len(self.experts)
         locality = mx.sum(target * (mx.log(mx.maximum(target, 1e-8)) - mx.log(mx.maximum(ranked, 1e-8))))
         centered = self.last_gate - mx.mean(self.last_gate, axis=1, keepdims=True)
-        normalized = centered / mx.maximum(mx.linalg.norm(centered, axis=1, keepdims=True), 1e-8)
+        normalized = _safe_normalize(centered, axis=1, floor=1e-8)
         correlation = normalized @ normalized.T
         off_diagonal = correlation - mx.diag(mx.diag(correlation))
         diversity = mx.sum(mx.square(mx.maximum(off_diagonal, 0.0))) / max(
@@ -1062,7 +1125,7 @@ class MLXPaTHAttention(nn.Module):
         convolved = nn.silu(convolved.astype(mx.float32)).reshape(
             x.shape[0], x.shape[1], self.config.num_attention_heads, self.head_dim
         )
-        vectors = convolved / mx.maximum(mx.linalg.norm(convolved, axis=-1, keepdims=True), 1e-6)
+        vectors = _safe_normalize(convolved)
         return vectors, projected
 
     def _project(self, x: mx.array, segment_ids: mx.array | None):
@@ -1105,7 +1168,7 @@ class MLXPaTHAttention(nn.Module):
         convolved = nn.silu(convolved[:, -length:].astype(mx.float32)).reshape(
             batch, length, self.config.num_attention_heads, self.head_dim
         )
-        w = convolved / mx.maximum(mx.linalg.norm(convolved, axis=-1, keepdims=True), 1e-6)
+        w = _safe_normalize(convolved)
         beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
         forget_logits = self.path_forget(x).astype(mx.float32)
         log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
@@ -1141,7 +1204,7 @@ class MLXPaTHAttention(nn.Module):
         w = nn.silu(convolved.astype(mx.float32)).reshape(
             batch, 1, self.config.num_attention_heads, self.head_dim
         )
-        w = w / mx.maximum(mx.linalg.norm(w, axis=-1, keepdims=True), 1e-6)
+        w = _safe_normalize(w)
         beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
         forget_logits = self.path_forget(x).astype(mx.float32)
         log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
@@ -1679,14 +1742,20 @@ class MLXHybridBlock(nn.Module):
         self.moe = MLXRFMoE(config) if config.use_rfmoe else None
         if self.moe is None:
             self.up = MLXHBitLinear(hidden, intermediate * 2, config)
-            self.mid = (
-                MLXHBitLinear(intermediate, intermediate, config)
-                if config.use_ffn_mid
-                else None
-            )
-            # Cold start: identity mid ≈ classic 2-mat path (silu pass-through on expand).
-            if self.mid is not None:
-                self.mid.weight = mx.eye(intermediate, dtype=self.mid.weight.dtype)
+            self.mid = MLXHBitLinear(intermediate, intermediate, config)
+            # Cold start: identity mid ~ classic 2-mat path (silu pass-through on
+            # expand), scaled so ternarisation lands on a *true* identity. The
+            # per-output-channel scale is mean(|row|); a plain eye(I) row is one 1
+            # and I-1 zeros, so the scale is 1/I and the quantised weight comes out
+            # as eye(I)/I -- a 1/512 attenuator, not a pass-through. eye(I)*I gives
+            # mean(|row|) = 1, so the quantised weight is exactly eye(I). The
+            # weight mix is pinned with it: the straight-through blend only means
+            # anything when raw and quantised share a scale, and here they differ
+            # by I.
+            self.mid.weight = mx.eye(intermediate, dtype=self.mid.weight.dtype) * intermediate
+            self.mid.pinned_weight_mix = 1.0
+            self.mid.weight_mix = mx.array(1.0)
+            self.mid._pinned_full_weight_quant = True
             self.down = MLXHBitLinear(intermediate, hidden, config)
             self.down.weight = self.down.weight * 0.01
         if self.attn_res_mode == "kimi":
@@ -1709,11 +1778,10 @@ class MLXHybridBlock(nn.Module):
         # Decode M=1: one Metal dispatch for up + mid + down ternary FFN.
         hidden = int(x.shape[-1])
         tokens = int(x.size // max(hidden, 1))
-        inter = int(self.mid.weight.shape[0]) if self.mid is not None else 0
+        inter = int(self.mid.weight.shape[0])
         # Fused FFN shared-memory kernel is for small/medium widths; 1B (h=1024, I=2048) uses qmm.
         if (
-            self.mid is not None
-            and tokens == 1
+            tokens == 1
             and hidden <= 512
             and inter <= 1024
             and self.up._full_activation_quant
@@ -1742,9 +1810,7 @@ class MLXHybridBlock(nn.Module):
                 except ValueError:
                     pass
         gate, value = mx.split(self.up(x), 2, axis=-1)
-        hidden_act = nn.silu(gate) * value
-        if self.mid is not None:
-            hidden_act = nn.silu(self.mid(hidden_act))
+        hidden_act = nn.silu(self.mid(nn.silu(gate) * value))
         return self.down(hidden_act)
 
     def _mlp(self, x: mx.array, checkpoint_activations: bool = False) -> mx.array:
@@ -2046,6 +2112,15 @@ class MLXBitNet(nn.Module):
         self.path_decode_mode = "last"
         self._compiled_inference_step = None
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        # Untied: a separate output projection, initialised small so the head
+        # starts near-uniform instead of inheriting the embedding's scale.
+        self.lm_head = (
+            None
+            if config.tie_word_embeddings
+            else nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        )
+        if self.lm_head is not None:
+            self.lm_head.weight = self.lm_head.weight * 0.01
         self.subln = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.blocks = [MLXHybridBlock(config, layer_id) for layer_id in range(config.num_hidden_layers)]
         self.loop_hc = MLXLoopHyperConnection(config)
@@ -2584,18 +2659,24 @@ class MLXBitNet(nn.Module):
         hard = mx.mean(mx.stack(hard_densities)) if hard_densities else mx.array(0.0)
         return density, locality, diversity, hard
 
+    def logits_from(self, hidden: mx.array) -> mx.array:
+        """Unembed. The one place that knows whether the head is tied."""
+        if self.lm_head is None:
+            return hidden @ self.embedding.weight.T
+        return self.lm_head(hidden)
+
     def mtp_logits(self, hidden: mx.array) -> list[mx.array]:
-        return [transform(hidden) @ self.embedding.weight.T for transform in self.mtp_transforms]
+        return [self.logits_from(transform(hidden)) for transform in self.mtp_transforms]
 
     def selected_mtp_logits(self, hidden: mx.array, selector: mx.array) -> mx.array:
         transformed = mx.stack([transform(hidden) for transform in self.mtp_transforms], axis=2)
         selected = mx.sum(transformed * selector[None, None, :, None], axis=2)
-        return selected @ self.embedding.weight.T
+        return self.logits_from(selected)
 
     def draft_logits(self, hidden: mx.array) -> mx.array:
         last = hidden[:, -1:]
         transformed = mx.concatenate([transform(last) for transform in self.mtp_transforms], axis=1)
-        return transformed @ self.embedding.weight.T
+        return self.logits_from(transformed)
 
     @property
     def _kimi_mode(self) -> bool:
@@ -2760,7 +2841,7 @@ class MLXBitNet(nn.Module):
             reset_memory,
             checkpoint_activations,
         )
-        logits = hidden @ self.embedding.weight.T
+        logits = self.logits_from(hidden)
         if return_mtp:
             return logits, self.mtp_logits(hidden)
         return logits

@@ -110,7 +110,13 @@ def test_speculation_runs_one_global_pass_per_round(speculation_window):
     # every speedup in the paper evaporates.
     model = _model()
     prompt = _prompt(model)
-    _, stats = generate(model, prompt, max_new_bytes=24, speculation_window=speculation_window)
+    # eos_id=-1 is unreachable, so this really does run to max_new_bytes.
+    # generate() otherwise falls back to config.eos_id, and whether an
+    # untrained model emits that byte early is a coin flip that any change
+    # to the architecture re-tosses.
+    _, stats = generate(
+        model, prompt, max_new_bytes=24, speculation_window=speculation_window, eos_id=-1
+    )
 
     # One seeding pass for the prompt, then one per round; each round commits at
     # least the verified byte, so rounds can never exceed the bytes produced.
@@ -123,7 +129,7 @@ def test_speculation_runs_one_global_pass_per_round(speculation_window):
 def test_baseline_runs_the_global_model_once_per_patch():
     model = _model(patch_size=4)
     prompt = _prompt(model, length=4)
-    _, stats = generate(model, prompt, max_new_bytes=16, speculation_window=0)
+    _, stats = generate(model, prompt, max_new_bytes=16, speculation_window=0, eos_id=-1)
     # 16 new bytes at 4 bytes per patch, plus the pass that opens the first one.
     assert stats.global_model == pytest.approx(16 / 4, abs=1)
     assert stats.drafted == 0
@@ -201,7 +207,11 @@ def test_speculation_stops_at_eos(speculation_window):
     # an explicit trim the speculative path returns bytes the baseline never emits.
     model = _model()
     prompt = _prompt(model)
-    unbounded, _ = generate(model, prompt, max_new_bytes=16, speculation_window=0)
+    # eos_id=-1 is unreachable, so this really does run to max_new_bytes.
+    # generate() otherwise falls back to config.eos_id, and whether an
+    # untrained model emits that byte early is a coin flip that any change
+    # to the architecture re-tosses.
+    unbounded, _ = generate(model, prompt, max_new_bytes=16, speculation_window=0, eos_id=-1)
     eos_id = int(unbounded[0, prompt.size(1) + 4].item())
 
     baseline, _ = generate(model, prompt, max_new_bytes=16, speculation_window=0, eos_id=eos_id)
@@ -270,8 +280,12 @@ def test_draft_passes_are_charged_less_than_full_encoder_passes():
 def test_patcher_override_is_honoured():
     model = _model(patch_size=2)
     prompt = _prompt(model)
-    _, fine = generate(model, prompt, max_new_bytes=12, speculation_window=0)
+    # eos_id=-1 is unreachable, so this really does run to max_new_bytes.
+    # generate() otherwise falls back to config.eos_id, and whether an
+    # untrained model emits that byte early is a coin flip that any change
+    # to the architecture re-tosses.
+    _, fine = generate(model, prompt, max_new_bytes=12, speculation_window=0, eos_id=-1)
     _, coarse = generate(
-        model, prompt, max_new_bytes=12, speculation_window=0, patcher=UniformPatcher(6)
+        model, prompt, max_new_bytes=12, speculation_window=0, patcher=UniformPatcher(6), eos_id=-1
     )
     assert coarse.global_model < fine.global_model

@@ -26,7 +26,7 @@ Default dense FFN = three stages, not classic two-mat SwiGLU alone:
 2. **mid** — **square** projection `I → I` (same width in/out)
 3. **down** — project `I → H`
 
-Mid intentionally square: intermediate width fixed between up post-SwiGLU features and down. Disable w/ `--no-use-ffn-mid` (MLX) for traditional two-mat; RFMoE experts same square mid (`w_mid`).
+Mid intentionally square: intermediate width fixed between up post-SwiGLU features and down. Always present -- no flag; RFMoE experts same square mid (`w_mid`).
 
 ### Cold start from scratch: identity on the square mid
 
@@ -252,7 +252,7 @@ python3 mlx_benchmark.py --backend torch --steps 100 --warmup-steps 5 \
 
 Implemented:
 
-- `mlx_model.py`: ternary blocks, native Hadamard, custom Metal PaTH solve, packed-document mask, Engram, Infini memory, grouped sparse RFMoE via conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda, MTP heads, optional dense square mid (`use_ffn_mid`; cold-start mid master = identity), classic 2-mat SwiGLU when mid off.
+- `mlx_model.py`: ternary blocks, native Hadamard, custom Metal PaTH solve, packed-document mask, Engram, Infini memory, grouped sparse RFMoE via conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda, MTP heads, dense square mid (cold-start mid master = identity).
 - `mlx_rfmoe_kernel.py`: conditional grouped expert projections + sparse custom input/weight VJPs. Default hybrid: one host compaction, compact `gather_mm` forwards, compact route-wise backward kernels.
 - `mlx_train.py`: stream HF mixtures via existing tokenizer/packer, compiled BF16 grads + optimizer updates, activation ckpt, grad accum, CE/z/MTP/RF aux losses, quantization/loop/block/RF/data/LR curricula, val, JSONL metrics, resumable safetensor model/optimizer ckpts. Resume restore MLX RNG, mixture RNG, HF iterator positions, shuffle buffers, partial packed sequences.
 - `mlx_generate.py`: vanilla + MTP speculative greedy. MTP proposals use final hidden position only; verification accept only target-model argmax matches → generated tokens = vanilla greedy.
@@ -261,7 +261,7 @@ Implemented:
 - Five 4-sequence val batches keep previous default sample count; avoid 4x val expansion from larger microbatches. Val batches materialize once — repeated eval no rescan held-out offset.
 - Whole-gradient compile only when block counts divide sequence length. Irregular layouts run eager: retained compiled curriculum graphs exhaust unified-memory headroom. Remaining MLX argument-buffer failure auto-retry that layout eager.
 - All-feature FineWeb-Edu smoke: Engram, Infini safety, RFMoE, Hyperloop, MTP, two-microbatch accum, val, best/numbered/last/final saves, resume next optimizer step w/ finite loss.
-- From-scratch: every square FFN mid (`mid` / `w_mid`) → identity matrix; see **Dense FFN middle layer (square mid)** above. `--use-ffn-mid` / `--no-use-ffn-mid` select 3-mat vs 2-mat dense FFN.
+- From-scratch: every square FFN mid (`mid` / `w_mid`) → identity matrix; see **Dense FFN middle layer (square mid)** above. The mid is unconditional in both stacks.
 
 Remaining diffs = impl + train-trajectory parity, not missing features:
 

@@ -106,7 +106,7 @@ def _run_global(
     """Full encoder + global pass over the committed prefix."""
     patch_lengths = patching.patch_lengths(tokens)
     _, patch_states, patch_ids = model.local_encoder(
-        model.byte_embeddings(tokens), patch_lengths, attention_mask=_ones_mask(tokens)
+        model.embed_bytes(tokens, _ones_mask(tokens)), patch_lengths, attention_mask=_ones_mask(tokens)
     )
     latents = model.global_transformer(
         patch_states, attention_mask=patch_presence_mask(patch_lengths)
@@ -131,7 +131,7 @@ def _decoder_next(
     """
     attention_mask = _ones_mask(tokens)
     hidden = model.local_encoder.encode_bytes(
-        model.byte_embeddings(tokens), attention_mask=attention_mask
+        model.embed_bytes(tokens, attention_mask), attention_mask=attention_mask
     )
     stats.draft_encoder += 1
     # Shift by one so a byte in patch i reads latents[i-1], matching the model's

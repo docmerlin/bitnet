@@ -66,7 +66,12 @@ def ternary_quantize_ste(weight: torch.Tensor) -> torch.Tensor:
         torch.where(normalized < -0.5, -torch.ones_like(normalized), torch.zeros_like(normalized)),
     )
     quantized = ternary * scale
-    return weight + (quantized - weight).detach()
+    # quantized.detach() + (weight - weight.detach()), not weight + (quantized -
+    # weight).detach(). Same value and same identity gradient, but the second
+    # form computes quantized - weight, and the identity-initialised FFN mid has
+    # weight ~ N against quantized ~ 1, so that subtraction loses most of its
+    # significant digits.
+    return quantized.detach() + (weight - weight.detach())
 
 
 def quantize_activations(x: torch.Tensor, bits: int = 4) -> torch.Tensor:
@@ -196,7 +201,7 @@ class HBitLinear(nn.Module):
         enable_activation_quantization: bool | None = None,
     ) -> None:
         """Update runtime quantization settings for staged training."""
-        if weight_mix is not None:
+        if weight_mix is not None and getattr(self, "pinned_weight_mix", None) is None:
             self.weight_quantization_mix = float(min(max(weight_mix, 0.0), 1.0))
         if activation_mix is not None:
             self.activation_quantization_mix = float(min(max(activation_mix, 0.0), 1.0))

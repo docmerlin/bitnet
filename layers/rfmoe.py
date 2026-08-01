@@ -42,10 +42,20 @@ class RFMoEExpert(nn.Module):
         self.w_up = HBitLinear(hidden_size, expert_dim, bias=False, config=config)    # D -> D_act
         self.w_mid = HBitLinear(expert_dim, expert_dim, bias=False, config=config)    # D_act -> D_act
         # Cold start: identity mid ≈ classic 2-mat expert body.
+        #
+        # eye(D)*D, not eye(D): the per-output-channel scale is mean(|row|), so a
+        # plain identity row (one 1, D-1 zeros) has scale 1/D and quantises to
+        # eye(D)/D -- an attenuator, not a pass-through. Scaling by D makes
+        # mean(|row|) = 1 so the quantised weight is exactly eye(D). The weight
+        # mix is pinned with it, since blending raw and quantised only means
+        # anything when they share a scale. See TernaryMLP.mid_proj.
         with torch.no_grad():
             self.w_mid.weight.copy_(
                 torch.eye(expert_dim, device=self.w_mid.weight.device, dtype=self.w_mid.weight.dtype)
+                * expert_dim
             )
+        self.w_mid.pinned_weight_mix = 1.0
+        self.w_mid.weight_quantization_mix = 1.0
         self.w_down = HBitLinear(expert_dim, hidden_size, bias=False, config=config)  # D_act -> D
         # Per-expert fire bias. Warm-started ~0 so every expert fires early
         # (explore/specialize); a density loss ramps it up later to enforce

@@ -27,6 +27,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from blt.config import TernaryBLTConfig
+from blt.ngram_hash import HASH_MODULUS, HASH_PAD, hash_bases
+from mlx_ternary_kernel import activation_levels, ste_activation_quantize
 
 # torch.nn.RMSNorm(dim) leaves eps=None and uses finfo(x.dtype).eps at runtime.
 _TORCH_FLOAT32_EPS = 1.1920928955078125e-07
@@ -63,6 +65,20 @@ def causal_window_attention_bias(seq_len: int, window: int | None, *, dtype=mx.f
     if window is not None and window > 0:
         invalid = invalid | (q_pos - k_pos >= window)
     return mx.where(invalid, mx.array(_MASK_FLOOR, dtype=dtype), mx.array(0.0, dtype=dtype))
+
+
+def windowed_block_attention_bias(window: int, *, dtype=mx.float32) -> mx.array:
+    """Mask for one query block against ``[previous block, current block]``.
+
+    Query at offset ``p`` in a block covering absolute positions ``[jw, jw+w)``
+    attends to absolute ``[jw+p-w+1, jw+p]``, which in the concatenated pair is
+    exactly ``[p+1, p+w]`` -- a fixed band, the same for every block. Shape
+    ``[w, 2w]``.
+    """
+    p = mx.arange(window).reshape(window, 1)
+    c = mx.arange(2 * window).reshape(1, 2 * window)
+    keep = (c >= p + 1) & (c <= p + window)
+    return mx.where(keep, mx.array(0.0, dtype=dtype), mx.array(_MASK_FLOOR, dtype=dtype))
 
 
 def combine_attention_bias(
@@ -121,6 +137,24 @@ class MLXHBitLinear(nn.Module):
         # layers.h_bitlinear.HBitLinear, which has had them all along.
         self.weight_mix = 1.0
         self.activation_mix = 1.0
+        # When set, set_quantization_state leaves weight_mix alone. Used by the
+        # identity-initialised FFN mid; see MLXTernaryMLP.
+        self.pinned_weight_mix: float | None = None
+        # The ramped values also live as module state, because the trainer wraps
+        # the step in mx.compile and a Python float read inside a traced function
+        # is baked in as a graph constant. Reassigning the float then changes
+        # nothing: measured, a 16-bit and a 4-bit forward returned identical
+        # output under compile, i.e. the whole quantisation ramp was inert.
+        # Arrays in module state are graph *inputs*, so they track. The plain
+        # floats above stay for the branch decisions, which genuinely do need a
+        # retrace when they flip.
+        self.weight_mix_value = mx.array(1.0)
+        self.activation_mix_value = mx.array(1.0)
+        self.activation_level_pair = activation_levels(self.activation_bits)
+        self.freeze(
+            keys=["weight_mix_value", "activation_mix_value", "activation_level_pair"],
+            recurse=False,
+        )
 
         # kaiming_uniform_(a=sqrt(5)) reduces to U(-1/sqrt(fan_in), 1/sqrt(fan_in)).
         bound = 1.0 / math.sqrt(in_features)
@@ -128,22 +162,35 @@ class MLXHBitLinear(nn.Module):
 
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
         """Ramp quantisation strength. 0.0 is full precision, 1.0 fully quantised."""
-        self.weight_mix = float(min(max(weight_mix, 0.0), 1.0))
+        if self.pinned_weight_mix is None:
+            self.weight_mix = float(min(max(weight_mix, 0.0), 1.0))
+        else:
+            self.weight_mix = self.pinned_weight_mix
         self.activation_mix = float(min(max(activation_mix, 0.0), 1.0))
         self.activation_bits = max(int(bits), 2)
+        self.weight_mix_value = mx.array(self.weight_mix)
+        self.activation_mix_value = mx.array(self.activation_mix)
+        self.activation_level_pair = activation_levels(self.activation_bits)
 
     def _prepare_input(self, x: mx.array) -> mx.array:
         if self.use_hadamard:
             x = mx.hadamard_transform(x)
-        if not self.quantize_activations or self.activation_bits < 2 or self.activation_mix <= 0.0:
+        if not self.quantize_activations:
             return x
-        positive_levels = (2 ** (self.activation_bits - 1)) - 1
-        negative_levels = 2 ** (self.activation_bits - 1)
-        scale = mx.maximum(mx.max(mx.abs(x), axis=-1, keepdims=True), 1e-5) / max(positive_levels, 1)
-        quantized = mx.clip(mx.round(x / scale), -negative_levels, positive_levels) * scale
-        if self.activation_mix >= 1.0:
-            return x + mx.stop_gradient(quantized - x)
-        return x + self.activation_mix * mx.stop_gradient(quantized - x)
+        # One fused kernel rather than the nine elementwise passes the
+        # expression form costs -- absmax, divide, round, clip, rescale, and the
+        # straight-through add. Measured 2-7x on the quantiser and 41-75% of a
+        # whole HBitLinear. Bit-identical output; the STE is the kernel's vjp.
+        quantized = ste_activation_quantize(x, self.activation_level_pair)
+        # One branch-free expression rather than early-returning on the mix. A
+        # Python `if` on a ramped value is evaluated once, at trace time, and
+        # baked into the compiled graph: the trainer starts the ramp at
+        # activation_mix=0.0, so the compiled step took the "return x" branch and
+        # never quantised activations again for the whole run. Measured -- a
+        # compiled forward at mix=0 and at mix=1 returned identical output.
+        # At mix=1 this is x + (q - x) = q with an identity gradient, and at
+        # mix=0 it is x, so nothing is lost but the early return.
+        return x + self.activation_mix_value * mx.stop_gradient(quantized - x)
 
     def effective_weight(self) -> mx.array:
         weight = self.weight
@@ -153,8 +200,12 @@ class MLXHBitLinear(nn.Module):
         normalized = weight / scale
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
         if self.weight_mix >= 1.0:
-            return weight + mx.stop_gradient(ternary * scale - weight)
-        return weight + self.weight_mix * mx.stop_gradient(ternary * scale - weight)
+            # stop_gradient(q) + (w - stop_gradient(w)), not w + stop_gradient(q - w).
+            # Same value and same identity gradient, but the second form computes
+            # q - w, and the identity-initialised FFN mid has w ~ N against q ~ 1,
+            # so that subtraction loses most of its significant digits.
+            return mx.stop_gradient(ternary * scale) + (weight - mx.stop_gradient(weight))
+        return weight + self.weight_mix_value * mx.stop_gradient(ternary * scale - weight)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self._prepare_input(x) @ self.effective_weight().T
@@ -195,6 +246,74 @@ class MLXTernarySelfAttention(nn.Module):
         self.v_proj = MLXHBitLinear(dim, dim, config=config)
         self.o_proj = MLXHBitLinear(dim, dim, config=config)
 
+    def _chunkable(self, seq_len: int, attention_mask: mx.array | None) -> bool:
+        """Whether the windowed path can run block-by-block instead of dense.
+
+        Needs a causal window that tiles the sequence and leaves at least two
+        blocks -- below that the dense mask is already the smaller matrix. A
+        caller mask is folded per key, which the shared band mask cannot express,
+        so those fall back.
+        """
+        window = self.local_window
+        return (
+            self.causal
+            and attention_mask is None
+            and window is not None
+            and 0 < window < seq_len
+            and seq_len % window == 0
+        )
+
+    def _windowed_attend(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
+        """Causal sliding-window attention over query blocks of ``local_window``.
+
+        The dense path scores every query against every key and then throws away
+        everything outside the band -- at sequence 1024 and window 256 that is
+        75% of the work. Here each query block sees only the previous and current
+        key blocks, folded onto the batch axis. Identical output to the dense mask.
+
+        Block 0 runs separately rather than sharing the fold. Its "previous"
+        block is zero padding that has to be masked away entirely, and
+        broadcasting a per-block-instance mask to express that costs
+        ``[batch*blocks, 1, window, 2*window]`` -- 33 MB at batch 16, sequence
+        1024, window 256, against 4 MB for the dense mask this is replacing.
+        Two calls with two shared masks allocate neither.
+        """
+        window = self.local_window
+        batch, heads, seq_len, head_dim = q.shape
+        blocks = seq_len // window
+        scale = 1.0 / math.sqrt(head_dim)
+
+        def blocked(t):
+            return t.reshape(batch, heads, blocks, window, head_dim)
+
+        def fold(t, count):
+            return t.transpose(0, 2, 1, 3, 4).reshape(batch * count, heads, -1, head_dim)
+
+        queries, keys, values = blocked(q), blocked(k), blocked(v)
+
+        # Block 0: plain causal attention over its own keys.
+        head_context = mx.fast.scaled_dot_product_attention(
+            queries[:, :, 0], keys[:, :, 0], values[:, :, 0], scale=scale, mask="causal"
+        )
+
+        if blocks == 1:
+            return head_context
+
+        # Blocks 1..n-1: each against [previous, current], one shared band mask.
+        def pair(t):
+            return fold(mx.concatenate([t[:, :, :-1], t[:, :, 1:]], axis=3), blocks - 1)
+
+        tail_context = mx.fast.scaled_dot_product_attention(
+            fold(queries[:, :, 1:], blocks - 1),
+            pair(keys),
+            pair(values),
+            scale=scale,
+            mask=windowed_block_attention_bias(window, dtype=q.dtype),
+        )
+        tail_context = tail_context.reshape(batch, blocks - 1, heads, window, head_dim)
+        context = mx.concatenate([head_context[:, :, None], tail_context.transpose(0, 2, 1, 3, 4)], axis=2)
+        return context.reshape(batch, heads, seq_len, head_dim)
+
     def __call__(self, x: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         batch_size, seq_len, _ = x.shape
 
@@ -206,18 +325,23 @@ class MLXTernarySelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        base_bias = (
-            causal_window_attention_bias(seq_len, self.local_window, dtype=q.dtype) if self.causal else None
-        )
-        bias, valid = combine_attention_bias(
-            attention_mask,
-            base_bias=base_bias,
-            batch_size=batch_size,
-            q_len=seq_len,
-            k_len=seq_len,
-            dtype=q.dtype,
-        )
-        context = _attend(q, k, v, bias, valid)
+        if self._chunkable(seq_len, attention_mask):
+            context = self._windowed_attend(q, k, v)
+        else:
+            base_bias = (
+                causal_window_attention_bias(seq_len, self.local_window, dtype=q.dtype)
+                if self.causal
+                else None
+            )
+            bias, valid = combine_attention_bias(
+                attention_mask,
+                base_bias=base_bias,
+                batch_size=batch_size,
+                q_len=seq_len,
+                k_len=seq_len,
+                dtype=q.dtype,
+            )
+            context = _attend(q, k, v, bias, valid)
         context = context.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.dim)
         return self.o_proj(context)
 
@@ -232,7 +356,19 @@ class MLXTernaryMLP(nn.Module):
         self.gate_proj = MLXHBitLinear(dim, hidden_dim, config=config)
         self.up_proj = MLXHBitLinear(dim, hidden_dim, config=config)
         self.mid_proj = MLXHBitLinear(hidden_dim, hidden_dim, config=config)
-        self.mid_proj.weight = mx.eye(hidden_dim)
+        # Scaled so ternarisation lands on a *true* identity. The per-output-channel
+        # scale is mean(|row|); a plain eye(N) row is one 1 and N-1 zeros, so the
+        # scale is 1/N and the quantised weight comes out as eye(N)/N -- a 1/1024
+        # attenuator, not a pass-through. eye(N)*N gives mean(|row|) = 1, so the
+        # quantised weight is exactly eye(N).
+        #
+        # The weight mix is pinned with it: the straight-through blend
+        # (1-mix)*raw + mix*quantised only means anything when raw and quantised
+        # share a scale, and here they differ by N. Ramping this particular matrix
+        # would put it at 768x identity a quarter of the way through the ramp.
+        self.mid_proj.weight = mx.eye(hidden_dim) * hidden_dim
+        self.mid_proj.pinned_weight_mix = 1.0
+        self.mid_proj.weight_mix = 1.0
         self.down_proj = MLXHBitLinear(hidden_dim, dim, config=config)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -374,3 +510,75 @@ class MLXTernaryPatchGather(nn.Module):
             gathered = mx.where(valid[..., None], gathered, 0.0)
         residual = self.residual_proj(query) if self.residual_proj is not None else query
         return residual + self.out_proj(gathered)
+
+
+class MLXHashNgramEmbedding(nn.Module):
+    """Hashed byte n-gram embeddings summed into the byte embedding.
+
+    Meta's BLT, eq. 3: ``e_i = (x_i + sum_n E_n[Hash(g_{i,n})]) / (|sizes| + 1)``.
+    See :mod:`blt.ngram_hash` for why this exists and what the hash guarantees.
+
+    One table holds every size, offset by slot, which keeps the whole thing to a
+    single gather. The tables are ``ngram_dim`` wide rather than ``local_dim``
+    and a shared projection lifts the sum back up -- at this scale Meta's
+    full-width tables would outweigh the model.
+    """
+
+    def __init__(self, config: TernaryBLTConfig) -> None:
+        super().__init__()
+        self.sizes = tuple(config.ngram_sizes)
+        self.vocab_size = int(config.ngram_vocab_size)
+        self.dim = int(config.ngram_dim)
+        self.embedding = nn.Embedding(len(self.sizes) * self.vocab_size, self.dim)
+        self.proj = (
+            MLXHBitLinear(self.dim, config.local_dim, config=config)
+            if self.dim != config.local_dim
+            else None
+        )
+        # Derived constants, deliberately not module state: storing them would
+        # put them in parameters() on this side and not in the torch state dict,
+        # breaking the name-for-name parity both stacks are built on.
+        self.bases = hash_bases(max(self.sizes))
+
+    def hashes(self, input_ids: mx.array) -> tuple[mx.array, mx.array]:
+        """``(indices, valid)`` per n-gram size, both ``[len(sizes), B, L]``."""
+        batch, length = input_ids.shape
+        ids = input_ids.astype(mx.int64)
+        running = mx.zeros((batch, length), dtype=mx.int64)
+        wanted = {size: slot for slot, size in enumerate(self.sizes)}
+        indices: list[mx.array] = [None] * len(self.sizes)
+        valid: list[mx.array] = [None] * len(self.sizes)
+        positions = mx.arange(length)
+        for lag in range(max(self.sizes)):
+            if lag == 0:
+                shifted = ids
+            elif lag < length:
+                pad = mx.full((batch, lag), HASH_PAD, dtype=mx.int64)
+                shifted = mx.concatenate((pad, ids[:, : length - lag]), axis=1)
+            else:
+                shifted = mx.full((batch, length), HASH_PAD, dtype=mx.int64)
+            running = mx.remainder(running + shifted * self.bases[lag], HASH_MODULUS)
+            size = lag + 1
+            if size in wanted:
+                slot = wanted[size]
+                indices[slot] = mx.remainder(running, self.vocab_size)
+                valid[slot] = mx.broadcast_to(positions[None, :] >= size - 1, (batch, length))
+        return mx.stack(indices), mx.stack(valid)
+
+    def __call__(self, byte_embeddings: mx.array, input_ids: mx.array, attention_mask: mx.array | None = None):
+        indices, valid = self.hashes(input_ids)
+        if attention_mask is not None:
+            # Padding is a suffix, so a position being real implies its whole
+            # backward window is real; masking the position is enough.
+            valid = valid & attention_mask.astype(mx.bool_)[None]
+        offsets = (mx.arange(len(self.sizes), dtype=indices.dtype) * self.vocab_size)[:, None, None]
+        gathered = self.embedding(indices + offsets)
+        gathered = mx.where(valid[..., None], gathered, 0.0)
+        total = mx.sum(gathered, axis=0).astype(byte_embeddings.dtype)
+        if self.proj is not None:
+            total = self.proj(total)
+        # Eq. 3 is a plain sum. An earlier draft averaged over |sizes|+1, which
+        # measured as dividing the byte embedding by 7 -- std 0.994 -> 0.204 --
+        # because the projected n-gram term is much smaller than the byte term,
+        # so the mean mostly just shrinks the latter.
+        return byte_embeddings + total

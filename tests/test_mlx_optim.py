@@ -138,7 +138,10 @@ def test_mlx_optimizer_state_stays_float32_for_bfloat16_parameters() -> None:
     assert mud_state["master_parameter"].dtype == mx.float32
     assert lion_state["exp_avg_scale"].dtype == mx.float32
     assert lion_state["master_parameter"].dtype == mx.float32
-    assert mx.all(updated < parameter).item()
+    # any, not all: whitening an all-ones matrix leaves every row but the first
+    # linearly dependent and so zero-update, and cautious weight decay does not
+    # shrink a coordinate the step is not already moving.
+    assert mx.any(updated < parameter).item()
 
     small_step_lion = CLion(learning_rate=1e-3, eight_bit=False)
     small_state = {}
@@ -170,10 +173,13 @@ def test_mlx_optimizer_can_store_bfloat16_mud_master_parameters() -> None:
         value for key, value in state.items()
         if key.startswith("states.0") and key.endswith("master_parameter")
     ]
+    # states.1 is the embedding group; a bare Linear has nothing in it, so the
+    # bias lands in the states.2 fallback.
     clion_masters = [
         value for key, value in state.items()
-        if key.startswith("states.1") and key.endswith("master_parameter")
+        if key.startswith("states.2") and key.endswith("master_parameter")
     ]
+    assert not [key for key in state if key.endswith("master_parameter") and key.startswith("states.1.")]
     assert len(mud_masters) == len(clion_masters) == 1
     assert mud_masters[0].dtype == mx.bfloat16
     assert clion_masters[0].dtype == mx.float32

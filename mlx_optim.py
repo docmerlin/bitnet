@@ -88,7 +88,20 @@ def mud_decorrelate(
     passes: int = 1,
     eps: float = 1e-8,
     block_size: int | None = None,
+    neuron_norm: bool = False,
 ) -> mx.array:
+    """Triangular whitening of a matrix-valued momentum update.
+
+    ``neuron_norm`` re-normalises the rows of the *returned* matrix. Whitening
+    normalises rows of whichever orientation it worked in, and tall matrices are
+    transposed first for efficiency -- so for a ``[out, in]`` weight with
+    ``out > in`` the uniform axis ends up being the input channels, not the
+    neurons. Measured on this model's shapes: the neuron-axis coefficient of
+    variation is 0.0 for ``out``/``ffn down`` but 0.072 for ``qkv``/``ffn up``,
+    where Newton-Schulz Muon sits at 0.030. That imbalance is what NorMuon
+    (arXiv:2510.05491) exists to remove; this is the stateless version of its
+    fix, and it rotates the update by cos 0.9975.
+    """
     if update.ndim != 2:
         raise ValueError("mud_decorrelate expects a 2D matrix")
     if passes < 1:
@@ -100,6 +113,23 @@ def mud_decorrelate(
     transposed = q.shape[0] > q.shape[1]
     if transposed:
         q = q.T
+
+    def finish(whitened: mx.array) -> mx.array:
+        result = whitened.T if transposed else whitened
+        if neuron_norm and transposed:
+            # Untransposed output already has unit rows; only the transposed
+            # path leaves the neuron axis uneven.
+            #
+            # Rescale back to the Frobenius norm the whitening produced. Making
+            # `out` rows unit-norm when whitening made `in` rows unit-norm moves
+            # the total from sqrt(in) to sqrt(out) -- on a [1536, 512] fused qkv
+            # that is a measured 1.73x larger step, i.e. a silent learning-rate
+            # change on exactly the tall matrices this is meant to help. The
+            # point is to redistribute magnitude across neurons, not to add any.
+            target = mx.linalg.norm(result)
+            result = result / (mx.linalg.norm(result, axis=1, keepdims=True) + eps)
+            result = result * (target / (mx.linalg.norm(result) + eps))
+        return result.astype(original_dtype)
     block_size = q.shape[0] if block_size is None else block_size
     if q.shape[0] > block_size and q.shape[0] % block_size == 0:
         blocks = q.reshape(-1, block_size, q.shape[1])
@@ -108,8 +138,7 @@ def mud_decorrelate(
             triangle = mx.tril(blocks @ blocks.swapaxes(-1, -2)) + eps * mx.eye(block_size)
             blocks = lower_solve(triangle, blocks)
             blocks = blocks / (mx.linalg.norm(blocks, axis=2, keepdims=True) + eps)
-        q = blocks.reshape(q.shape)
-        return (q.T if transposed else q).astype(original_dtype)
+        return finish(blocks.reshape(q.shape))
     blocks = []
     for start in range(0, q.shape[0], block_size):
         block = q[start : start + block_size]
@@ -119,14 +148,28 @@ def mud_decorrelate(
             block = lower_solve(triangle, block)
             block = block / (mx.linalg.norm(block, axis=1, keepdims=True) + eps)
         blocks.append(block)
-    q = mx.concatenate(blocks, axis=0) if len(blocks) > 1 else blocks[0]
-    return (q.T if transposed else q).astype(original_dtype)
+    return finish(mx.concatenate(blocks, axis=0) if len(blocks) > 1 else blocks[0])
 
 
 def cautious_mask(update: mx.array, gradient: mx.array) -> mx.array:
     mask = (update * gradient > 0).astype(update.dtype)
     scale = update.size / mx.maximum(mx.sum(mask), 1.0)
     return update * mask * scale
+
+
+def cautious_decay(update: mx.array, parameter: mx.array) -> mx.array:
+    """Coordinates where decay would fight the update, as a 0/1 mask.
+
+    Cautious Weight Decay (modded-nanogpt records 43 and 50): only shrink a
+    coordinate when the step is already moving it toward zero. Note the mask is
+    update-vs-*parameter*, not the update-vs-gradient sign test in
+    :func:`cautious_mask` -- different question, so it needs its own mask.
+
+    ``update`` is the descent direction as applied, i.e. the parameter moves by
+    ``-lr * update``, so ``update * parameter > 0`` means the step is already
+    shrinking that coordinate.
+    """
+    return (update * parameter > 0).astype(update.dtype)
 
 
 def quantize_blockwise(tensor: mx.array, block_size: int = QUANT_BLOCK_SIZE):
@@ -155,6 +198,8 @@ class MUD(optim.Optimizer):
         block_size: int | None = None,
         eight_bit: bool = False,
         master_dtype: str = "float32",
+        cautious_weight_decay: bool = True,
+        neuron_norm: bool = False,
     ):
         super().__init__()
         if master_dtype not in MASTER_DTYPES:
@@ -166,6 +211,8 @@ class MUD(optim.Optimizer):
         self.block_size = block_size
         self.eight_bit = eight_bit
         self.master_dtype = master_dtype
+        self.cautious_weight_decay = cautious_weight_decay
+        self.neuron_norm = neuron_norm
 
     def init_single(self, parameter: mx.array, state: dict):
         if self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE:
@@ -192,7 +239,9 @@ class MUD(optim.Optimizer):
             previous = mx.zeros(parameter.shape, dtype=mx.float32)
         momentum_buffer = self.momentum * previous + gradient
         direction = gradient + self.momentum * momentum_buffer
-        update = mud_decorrelate(direction, self.passes, block_size=self.block_size)
+        update = mud_decorrelate(
+            direction, self.passes, block_size=self.block_size, neuron_norm=self.neuron_norm
+        )
         update = update * (0.2 * math.sqrt(max(parameter.shape)))
         update = cautious_mask(update, gradient)
         if use_eight_bit:
@@ -204,8 +253,11 @@ class MUD(optim.Optimizer):
             state.pop("momentum_buffer_scale", None)
         learning_rate = self.learning_rate.astype(mx.float32)
         master_parameter = state.get("master_parameter", parameter.astype(MASTER_DTYPES[self.master_dtype]))
+        decay = learning_rate * self.weight_decay
+        if self.cautious_weight_decay:
+            decay = decay * cautious_decay(update, master_parameter.astype(mx.float32))
         master_parameter = (
-            master_parameter * (1.0 - learning_rate * self.weight_decay) - learning_rate * update
+            master_parameter * (1.0 - decay) - learning_rate * update
         ).astype(MASTER_DTYPES[self.master_dtype])
         state["master_parameter"] = master_parameter
         return master_parameter.astype(parameter_dtype)
@@ -264,6 +316,15 @@ class CLion(optim.Optimizer):
 
 
 class CMUD(optim.MultiOptimizer):
+    """MUD on the body, cautious Lion on the embeddings and everything else.
+
+    Three groups, not two: modded-nanogpt's largest win after Muon was untying
+    the output head from the input embedding and running the embedding at a much
+    higher rate than the body. Both of those tables are lookup-shaped rather than
+    matrix-shaped, so neither belongs in MUD's whitening; giving them their own
+    optimizer is what makes a separate rate expressible.
+    """
+
     def __init__(
         self,
         *,
@@ -277,9 +338,16 @@ class CMUD(optim.MultiOptimizer):
         mud_eight_bit: bool = False,
         block_size: int | None = None,
         mud_master_dtype: str = "float32",
+        embedding_learning_rate: float | None = None,
+        cautious_weight_decay: bool = True,
+        neuron_norm: bool = False,
     ):
         self.mud_learning_rate = mud_learning_rate
         self.fallback_learning_rate = fallback_learning_rate
+        # None keeps embeddings on the fallback rate, i.e. the pre-split behaviour.
+        self.embedding_learning_rate = (
+            fallback_learning_rate if embedding_learning_rate is None else embedding_learning_rate
+        )
         mud = MUD(
             mud_learning_rate,
             momentum,
@@ -288,25 +356,51 @@ class CMUD(optim.MultiOptimizer):
             block_size,
             mud_eight_bit,
             mud_master_dtype,
+            cautious_weight_decay,
+            neuron_norm,
         )
+        embedding = CLion(self.embedding_learning_rate, betas, eight_bit)
         clion = CLion(fallback_learning_rate, betas, eight_bit)
-        super().__init__([mud, clion], [self._is_mud_parameter])
+        super().__init__(
+            [mud, embedding, clion],
+            [self._is_mud_parameter, self._is_embedding_parameter],
+        )
+
+    def _split_dictionary(self, gradients: dict):
+        # tree_unflatten turns an empty group into [], and Optimizer.init then
+        # indexes into it and raises. Any model without an embedding-shaped
+        # parameter -- a bare nn.Linear in a test, say -- hits that.
+        return [part if part else {} for part in super()._split_dictionary(gradients)]
 
     @staticmethod
-    def _is_mud_parameter(path: str, parameter: mx.array) -> bool:
-        embedding = path.endswith("embedding.weight") or path.endswith("loop_embed.weight")
+    def _is_embedding_parameter(path: str, parameter: mx.array) -> bool:
+        """Token-indexed tables: the input embedding and an untied output head."""
+        return (
+            path.endswith("embedding.weight")
+            or path.endswith("loop_embed.weight")
+            or path.endswith("lm_head.weight")
+        )
+
+    @classmethod
+    def _is_mud_parameter(cls, path: str, parameter: mx.array) -> bool:
         depthwise_conv = path.endswith("short_conv_weight")
-        return parameter.ndim == 2 and not embedding and not depthwise_conv
+        return (
+            parameter.ndim == 2
+            and not cls._is_embedding_parameter(path, parameter)
+            and not depthwise_conv
+        )
 
     def set_lr_multiplier(self, multiplier: float) -> None:
         self.optimizers[0].learning_rate = self.mud_learning_rate * multiplier
-        self.optimizers[1].learning_rate = self.fallback_learning_rate * multiplier
+        self.optimizers[1].learning_rate = self.embedding_learning_rate * multiplier
+        self.optimizers[2].learning_rate = self.fallback_learning_rate * multiplier
 
     def checkpoint_config(self) -> dict:
-        mud, clion = self.optimizers
+        mud, _embedding, clion = self.optimizers
         return {
             "mud_learning_rate": self.mud_learning_rate,
             "fallback_learning_rate": self.fallback_learning_rate,
+            "embedding_learning_rate": self.embedding_learning_rate,
             "weight_decay": mud.weight_decay,
             "momentum": mud.momentum,
             "passes": mud.passes,
@@ -315,4 +409,6 @@ class CMUD(optim.MultiOptimizer):
             "eight_bit": clion.eight_bit,
             "mud_eight_bit": mud.eight_bit,
             "mud_master_dtype": mud.master_dtype,
+            "cautious_weight_decay": mud.cautious_weight_decay,
+            "neuron_norm": mud.neuron_norm,
         }

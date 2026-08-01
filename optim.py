@@ -129,6 +129,12 @@ def split_parameters_for_cmud(model: nn.Module) -> Tuple[List[nn.Parameter], Lis
         for module in model.modules()
         if isinstance(module, nn.Embedding)
     }
+    # An untied output head is a token-indexed table too, so it belongs with the
+    # embeddings rather than in MUD's whitening -- the split modded-nanogpt uses.
+    # When tied it is the same tensor and the id is already in the set.
+    head = getattr(model, "lm_head", None)
+    if head is not None and getattr(head, "weight", None) is not None:
+        embedding_param_ids.add(id(head.weight))
 
     mud_params: List[nn.Parameter] = []
     fallback_params: List[nn.Parameter] = []

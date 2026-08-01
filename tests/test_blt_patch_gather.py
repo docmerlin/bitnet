@@ -131,12 +131,17 @@ def test_higher_k_actually_changes_the_output(cross_attn_k):
 
 def test_k1_sheds_the_inert_projections():
     config = TernaryBLTConfig(cross_attn_k=1)
-    total = sum(p.numel() for p in TernaryBLTModel(config).parameters())
     # 2 square [decoder_dim, decoder_dim] projections plus one norm per layer.
     shed = config.n_layers_local_decoder * (2 * config.decoder_dim**2 + config.decoder_dim)
-    assert shed == 525_312
-    # The model measured 86,132,480 parameters before TernaryPatchGather landed.
-    assert total == 86_132_480 - shed
+    assert shed == config.n_layers_local_decoder * 131_328
+    # Named parameters rather than a total: an absolute count breaks whenever
+    # anything else in the model changes size, and k also rescales
+    # patch_state_proj, which is present either way and is not what is shed.
+    gathered = dict(TernaryBLTModel(config).named_parameters())
+    attended = dict(TernaryBLTModel(TernaryBLTConfig(cross_attn_k=2)).named_parameters())
+    shed_names = set(attended) - set(gathered)
+    assert shed_names and all("cross_attn_layers" in name for name in shed_names)
+    assert sum(attended[name].numel() for name in shed_names) == shed
 
 
 def test_default_k_restores_real_cross_attention():

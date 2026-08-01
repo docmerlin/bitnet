@@ -72,7 +72,8 @@ class BitNetDeep(nn.Module):
             rms_norm_eps=self.config.rms_norm_eps,
         )
 
-        # Full-precision output projection; tied to embeddings.
+        # Full-precision output projection; tied to the embedding only when
+        # config.tie_word_embeddings is set (see that field).
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
         self.mtp_depth = int(self.config.mtp_depth)
@@ -86,7 +87,13 @@ class BitNetDeep(nn.Module):
             )
 
         self.apply(self._init_weights)
-        self.lm_head.weight = self.embed_tokens.weight
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+        else:
+            # Near-zero so the untied head starts uniform rather than inheriting
+            # the embedding's scale. Matches the MLX side.
+            with torch.no_grad():
+                self.lm_head.weight.mul_(0.01)
         # Re-apply HC-friendly biases after global init (do not wipe with N(0, σ)).
         self.loop_hc._init_identity_friendly()
 

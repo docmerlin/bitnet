@@ -33,8 +33,12 @@ def test_rfmoe_forward_and_grad() -> None:
     assert expert.w_up.weight.shape == (32, hidden)
     assert expert.w_down.weight.shape == (hidden, 32)
     eye = torch.eye(32, dtype=expert.w_mid.weight.dtype)
-    assert torch.allclose(expert.w_mid.weight.detach().cpu(), eye, atol=1e-5), (
-        "w_mid must cold-start as identity"
+    # Effective, not raw: the forward uses quantize(weight), and a raw eye(N)
+    # quantises to eye(N)/N because the per-row scale is mean(|row|) = 1/N.
+    with torch.no_grad():
+        effective = expert.w_mid.effective_weight(torch.float32).cpu()
+    assert torch.allclose(effective, eye, atol=1e-5), (
+        "w_mid must cold-start as an identity in the forward pass"
     )
     x = torch.randn(4, 10, hidden)
     y = moe(x)

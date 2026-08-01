@@ -24,6 +24,39 @@ from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
 
 
 _MEMORY_STATE_NAMES = (".memory_m", ".memory_z", ".memory_initialized")
+# Quantisation knobs that live as module state only so mx.compile treats them as
+# graph inputs rather than baking them in as constants. They are derived from the
+# training schedule, not learned, and set_quantization_state rebuilds them every
+# step -- so saving them bloats every checkpoint and makes the strict key
+# comparison below reject any file written by a build with a different set.
+_RUNTIME_QUANT_NAMES = (
+    ".activation_levels",
+    ".activation_level_pair",
+    ".weight_mix_value",
+    ".activation_mix_value",
+)
+_EXCLUDED_STATE_NAMES = _MEMORY_STATE_NAMES + _RUNTIME_QUANT_NAMES
+
+
+#: Config fields this repo has removed. A checkpoint written before the removal
+#: still carries them, and passing one to the dataclass is a TypeError. Dropping
+#: *known* removed names keeps old checkpoints loadable while an genuinely
+#: unrecognised key still fails loudly rather than being silently ignored.
+RETIRED_CONFIG_FIELDS = frozenset({"use_ffn_mid"})
+
+
+def config_from_saved(saved_config: dict) -> MLXBitNetConfig:
+    """Rebuild a model config from a checkpoint, dropping retired fields."""
+    retired = RETIRED_CONFIG_FIELDS & saved_config.keys()
+    if retired:
+        print(
+            f"checkpoint predates the removal of {sorted(retired)}; ignoring",
+            flush=True,
+        )
+    settings = {k: v for k, v in saved_config.items() if k not in RETIRED_CONFIG_FIELDS}
+    if "engram_layer_ids" in settings:
+        settings["engram_layer_ids"] = tuple(settings["engram_layer_ids"])
+    return MLXBitNetConfig(**settings)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,12 +77,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--intermediate-size", type=int, default=1024)
-    parser.add_argument(
-        "--use-ffn-mid",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Dense FFN square mid (3-mat). --no-use-ffn-mid = classic 2-mat SwiGLU.",
-    )
     parser.add_argument(
         "--attn-res-mode",
         choices=("kimi", "sandwich"),
@@ -99,8 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mamba3-layers",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Mamba-3-style SSM on every mamba-layer-period-th layer starting at 0.",
+        default=False,
+        help="Mamba-3-style SSM on every mamba-layer-period-th layer starting at 0. "
+        "Off by default: measured at 1.36-1.51x throughput cost with no quality "
+        "comparison run. --mamba3-layers turns it back on.",
     )
     parser.add_argument("--mamba-layer-period", type=int, default=3)
     parser.add_argument("--mamba-d-state", type=int, default=64)
@@ -110,16 +139,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-accumulation-steps", type=int, default=4)
     parser.add_argument("--total-tokens", type=int, default=10_000_000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--embedding-learning-rate",
+        type=float,
+        default=None,
+        help="Rate for the token embedding and the untied output head (default: "
+        "--learning-rate). modded-nanogpt runs these well above the body rate; "
+        "try 10-30x once --no-tie-word-embeddings is in play.",
+    )
+    parser.add_argument(
+        "--tie-word-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Share the output projection with the input embedding. Off by default: "
+        "an untied head plus a higher embedding rate was modded-nanogpt's largest "
+        "win after Muon. Costs vocab*hidden extra parameters.",
+    )
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3)
     parser.add_argument("--mud-momentum", type=float, default=0.95)
     parser.add_argument("--mud-passes", type=int, default=1)
     parser.add_argument("--mud-block-size", type=int, default=64)
+    parser.add_argument(
+        "--mud-neuron-norm",
+        action="store_true",
+        help="Re-normalise neuron rows after MUD whitening. MUD transposes tall "
+        "matrices, so qkv and the FFN up-projection come out with a 0.072 "
+        "coefficient of variation across neuron norms (Muon: 0.030). This is the "
+        "stateless form of NorMuon's fix. Off by default -- unvalidated, needs an A/B.",
+    )
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
     parser.add_argument("--no-optimizer-8bit", action="store_true")
     parser.add_argument("--cmud-momentum-8bit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cmud-master-dtype", choices=("float32", "bfloat16"), default="bfloat16")
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument(
+        "--cautious-weight-decay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only decay coordinates the MUD step is already shrinking "
+        "(modded-nanogpt records 43/50). --no-cautious-weight-decay decays everything.",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("cosine", "wsd"),
+        default="cosine",
+        help="wsd = warmup, flat at peak, then linear decay over --cooldown-ratio "
+        "(set that to ~0.4) down to --min-lr-ratio, not to zero.",
+    )
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-ratio", type=float, default=0.08)
     parser.add_argument("--cooldown-ratio", type=float, default=0.05)
@@ -194,6 +261,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("min-num-loops must be positive")
     if not 0 <= args.loop_curriculum_start_ratio <= args.loop_curriculum_ratio <= 1:
         raise ValueError("loop curriculum must satisfy 0 <= start <= end <= 1")
+    if args.lr_schedule == "wsd" and not args.cooldown_steps and args.cooldown_ratio < 0.1:
+        # WSD is a plateau plus a long ramp down. Left at the cosine default the
+        # ramp is 5% of the run, which is a constant-LR run with a cliff at the
+        # end -- worse than the cosine it replaced, and silently so.
+        raise ValueError(
+            "--lr-schedule wsd needs a long decay: set --cooldown-ratio to ~0.4 "
+            "(or --cooldown-steps explicitly)"
+        )
 
 
 def _compile_supported(config: MLXBitNetConfig) -> bool:
@@ -220,8 +295,14 @@ def _gradient_compile_safe(
 
 def _masked_ce(logits, targets, valid):
     safe_targets = mx.where(valid, targets, 0)
-    losses = nn.losses.cross_entropy(logits.astype(mx.float32), safe_targets, reduction="none")
-    return mx.sum(losses * valid) / mx.maximum(mx.sum(valid), 1)
+    # Cross entropy at the logits' own dtype rather than a forced fp32 copy --
+    # modded-nanogpt record 37. At vocab 32768, sequence 1024, batch 4 the copy
+    # is 537 MB and buys nothing: the gradient reaching a bf16 hidden state is
+    # bit-identical either way (measured, relative L2 error 0.0) and the reported
+    # loss moves 5e-4 relative. An fp32 run still gets fp32 here. The per-token
+    # losses are summed in fp32 because that reduction does need the range.
+    losses = nn.losses.cross_entropy(logits, safe_targets, reduction="none")
+    return mx.sum(losses.astype(mx.float32) * valid) / mx.maximum(mx.sum(valid), 1)
 
 
 def mtp_head_index(step: int, microbatch_index: int, accumulation_steps: int, depth: int) -> int:
@@ -268,7 +349,7 @@ def create_gradient_step(
                 num_loops,
                 checkpoint_activations=gradient_checkpointing,
             )
-            logits = hidden @ model.embedding.weight.T
+            logits = model.logits_from(hidden)
             selected_mtp_logits = model.selected_mtp_logits(hidden, mtp_selector)
             mtp_logits = []
         else:
@@ -283,6 +364,11 @@ def create_gradient_step(
         valid = segment_ids == label_segment_ids
         loss = _masked_ce(logits, targets, valid)
         if z_loss_coef > 0:
+            # float32 here, unlike _masked_ce above. The cross-entropy term was
+            # measured to give bit-identical gradients at the logits' own dtype;
+            # this one squares its result, and a bfloat16 logsumexp over 32k
+            # logits carries ~0.06 absolute error, which the square turns into
+            # ~1.8 on the term the regulariser is trying to control.
             log_z = mx.logsumexp(logits.astype(mx.float32), axis=-1)
             loss = loss + z_loss_coef * mx.sum(mx.square(log_z) * valid) / mx.maximum(mx.sum(valid), 1)
         if return_mtp and mtp_selector is not None:
@@ -380,7 +466,7 @@ def save_checkpoint(
     parameters = {
         key: value
         for key, value in tree_flatten(model.parameters())
-        if not key.endswith(_MEMORY_STATE_NAMES)
+        if not key.endswith(_EXCLUDED_STATE_NAMES)
     }
     mx.save_safetensors(str(path), parameters)
     optimizer_path = checkpoint_dir / f"{name}.optimizer.safetensors"
@@ -397,10 +483,55 @@ def save_checkpoint(
     return path
 
 
+def migrate_two_group_optimizer_state(
+    optimizer_state: dict, expected: dict, optimizer: optim.Optimizer
+) -> dict:
+    """Split a two-group CMUD optimizer checkpoint across the current three.
+
+    CMUD used to be [MUD, C-Lion]; it is now [MUD, C-Lion on the token-indexed
+    tables, C-Lion on everything else]. Only the numbering moved -- MUD is still
+    ``states.0``, and every parameter the old ``states.1`` held is in exactly one
+    of the new ``states.1``/``states.2`` -- so the state transfers by rewriting
+    the prefix rather than being discarded.
+    """
+    if not isinstance(optimizer, CMUD) or len(optimizer.optimizers) != 3:
+        return optimizer_state
+    saved_groups = {key.split(".")[1] for key in optimizer_state if key.startswith("states.")}
+    if saved_groups != {"0", "1"}:
+        return optimizer_state
+
+    migrated = {}
+    for key, value in optimizer_state.items():
+        if not key.startswith("states.1."):
+            migrated[key] = value
+            continue
+        name = key[len("states.1."):]
+        if "." not in name:
+            # Per-optimizer scalars (step, learning_rate) belong to the group,
+            # not to any parameter, so both new groups need their own copy
+            # rather than one of them inheriting the old group's.
+            migrated[f"states.1.{name}"] = value
+            migrated[f"states.2.{name}"] = value
+            continue
+        # Drop the trailing slot (exp_avg, master_parameter, ...) to recover the
+        # parameter path the group predicate is defined over.
+        path = name.rsplit(".", 1)[0]
+        group = 1 if CMUD._is_embedding_parameter(path, None) else 2
+        migrated[f"states.{group}.{name}"] = value
+    if migrated.keys() == expected.keys():
+        print("migrated a two-group optimizer checkpoint to the three-group split", flush=True)
+        return migrated
+    return optimizer_state
+
+
 def load_checkpoint(path: Path, model: MLXBitNet, optimizer: optim.Optimizer) -> dict:
     parameters = dict(tree_flatten(model.parameters()))
-    expected = {key for key in parameters if not key.endswith(_MEMORY_STATE_NAMES)}
-    loaded = mx.load(str(path))
+    expected = {key for key in parameters if not key.endswith(_EXCLUDED_STATE_NAMES)}
+    loaded = {
+        key: value
+        for key, value in mx.load(str(path)).items()
+        if not key.endswith(_EXCLUDED_STATE_NAMES)
+    }
     missing = expected - loaded.keys()
     unexpected = loaded.keys() - expected
     if missing or unexpected:
@@ -419,6 +550,9 @@ def load_checkpoint(path: Path, model: MLXBitNet, optimizer: optim.Optimizer) ->
         raise FileNotFoundError(f"Missing optimizer checkpoint: {optimizer_path}")
     optimizer_state = mx.load(str(optimizer_path))
     expected_optimizer = dict(tree_flatten(optimizer.state))
+    optimizer_state = migrate_two_group_optimizer_state(
+        optimizer_state, expected_optimizer, optimizer
+    )
     missing_optimizer = expected_optimizer.keys() - optimizer_state.keys()
     unexpected_optimizer = optimizer_state.keys() - expected_optimizer.keys()
     if missing_optimizer or unexpected_optimizer:
@@ -447,10 +581,35 @@ def scheduled_value(start: float, end: float, progress: float, ratio: float) -> 
     return start + fraction * (end - start)
 
 
-def lr_multiplier(step: int, total_steps: int, warmup_steps: int, cooldown_steps: int, minimum: float) -> float:
+def lr_multiplier(
+    step: int,
+    total_steps: int,
+    warmup_steps: int,
+    cooldown_steps: int,
+    minimum: float,
+    schedule: str = "cosine",
+) -> float:
+    """Warmup, then either a cosine decay or a WSD trapezoid.
+
+    ``wsd`` holds the peak rate flat and then decays linearly to ``minimum``
+    over the last ``cooldown_steps``. modded-nanogpt converged on this over
+    cosine: at a fixed step budget the plateau spends far more of the run at
+    full rate, and the linear tail lands the model rather than coasting through
+    a long low-rate stretch that buys little. It wants a long decay (~30-45% of
+    the run), not the short cosine cooldown -- ``validate_args`` enforces that.
+
+    The tail stops at ``minimum`` rather than zero: their record 19 was "lr
+    decay to 0.1 instead of 0.0" and record 72 raised the floor again, so the
+    last steps are meant to still be learning.
+    """
     if step < warmup_steps:
         return (step + 1) / max(warmup_steps, 1)
     main_steps = max(total_steps - warmup_steps - cooldown_steps, 1)
+    if schedule == "wsd":
+        if step < warmup_steps + main_steps:
+            return 1.0
+        decay = min((step - warmup_steps - main_steps) / max(cooldown_steps, 1), 1.0)
+        return 1.0 * (1.0 - decay) + minimum * decay
     if step < warmup_steps + main_steps:
         progress = (step - warmup_steps) / main_steps
         return minimum + (1.0 - minimum) * 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -542,9 +701,7 @@ def main() -> None:
     mx.random.seed(args.seed)
 
     if args.resume_from:
-        saved_config = saved["model_config"]
-        saved_config["engram_layer_ids"] = tuple(saved_config["engram_layer_ids"])
-        config = MLXBitNetConfig(**saved_config)
+        config = config_from_saved(saved["model_config"])
         tokenizer_vocab_size = config.vocab_size
     else:
         tokenizer_vocab_size = args.vocab_size
@@ -587,9 +744,9 @@ def main() -> None:
             rfmoe_theta=args.rfmoe_theta,
             rfmoe_backend=args.rfmoe_backend,
             mtp_depth=args.mtp_depth,
-            use_ffn_mid=args.use_ffn_mid,
             attn_res_mode=args.attn_res_mode,
             attn_res_group_size=args.attn_res_group_size,
+            tie_word_embeddings=args.tie_word_embeddings,
         )
     if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
         print(
@@ -615,6 +772,9 @@ def main() -> None:
             eight_bit=not args.no_optimizer_8bit,
             mud_eight_bit=args.cmud_momentum_8bit,
             mud_master_dtype=args.cmud_master_dtype,
+            embedding_learning_rate=args.embedding_learning_rate,
+            cautious_weight_decay=args.cautious_weight_decay,
+            neuron_norm=args.mud_neuron_norm,
         )
     optimizer.init(model.trainable_parameters())
     trainer_state = {
@@ -840,7 +1000,9 @@ def main() -> None:
             lambda gradient: gradient / args.grad_accumulation_steps,
             accumulated_gradients,
         )
-        multiplier = lr_multiplier(step - 1, total_steps, warmup_steps, cooldown_steps, args.min_lr_ratio)
+        multiplier = lr_multiplier(
+            step - 1, total_steps, warmup_steps, cooldown_steps, args.min_lr_ratio, args.lr_schedule
+        )
         grad_norm = apply_step(accumulated_gradients, mx.array(multiplier))
         if args.profile_phases:
             sync_started = time.perf_counter()

@@ -31,7 +31,14 @@ from blt.mlx_layers import (
     build_rope_cache,
 )
 
-TOLERANCE = 2e-4
+# Was 2e-4, which only held while the FFN mid quantised to eye(N)/N and so
+# attenuated the block's own output by 1/256. With the mid a true identity the
+# FFN passes signal at unit gain, and the attention path's pre-existing
+# torch-vs-MLX disagreement is no longer damped: measured 2.3e-4 on the block
+# against 5.2e-8 for the MLP alone. Quantisation is a step function, so a 1e-7
+# difference in a pre-activation flips a level and lands as a ~1/127 relative
+# jump -- the same effect that set the tolerance in test_blt_mlx_model.py.
+TOLERANCE = 2e-3
 
 
 def _config(**overrides) -> TernaryBLTConfig:
@@ -104,8 +111,13 @@ def test_mid_proj_starts_as_identity():
     # The torch MLP seeds mid_proj to the identity so a fresh model behaves like
     # the classic two-matrix SwiGLU. A random init here would change cold-start
     # dynamics without changing any test that only checks shapes.
+    # The *effective* weight, not the raw one: these are ternary layers and the
+    # forward uses quantize(weight). Asserting the raw weight is eye(N) is what
+    # let the real bug through -- the per-row scale is mean(|row|) = 1/N for an
+    # identity row, so a raw eye(N) quantised to eye(N)/N, a 1/N attenuator.
     mlx_mlp = MLXTernaryMLP(64, 4.0, config=_config())
-    assert np.allclose(np.asarray(mlx_mlp.mid_proj.weight), np.eye(256, dtype=np.float32))
+    effective = np.asarray(mlx_mlp.mid_proj.effective_weight())
+    assert np.allclose(effective, np.eye(256, dtype=np.float32), atol=1e-6)
 
 
 @pytest.mark.parametrize("local_window", [None, 4])

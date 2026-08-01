@@ -108,10 +108,20 @@ class HybridTransformerBlock(nn.Module):
             inter = config.intermediate_size
             self.ffn_up = HBitLinear(config.hidden_size, inter * 2, bias=False, config=config)
             self.ffn_mid = HBitLinear(inter, inter, bias=False, config=config)
+            # eye(I)*I, not eye(I): the per-output-channel scale is mean(|row|),
+            # so a plain identity row (one 1, I-1 zeros) has scale 1/I and
+            # quantises to eye(I)/I -- a 1/1024 attenuator, not a pass-through.
+            # Scaling by I makes mean(|row|) = 1 so the quantised weight is
+            # exactly eye(I). The weight mix is pinned with it, since blending
+            # raw and quantised only means anything when they share a scale.
+            # See layers.rfmoe.RFMoEExpert and blt.layers.transformer_block.
             with torch.no_grad():
                 self.ffn_mid.weight.copy_(
                     torch.eye(inter, device=self.ffn_mid.weight.device, dtype=self.ffn_mid.weight.dtype)
+                    * inter
                 )
+            self.ffn_mid.pinned_weight_mix = 1.0
+            self.ffn_mid.weight_quantization_mix = 1.0
             self.ffn_down = HBitLinear(inter, config.hidden_size, bias=False, config=config)
 
         # sigmoid(0)=0.5 at init: attention path starts damped.

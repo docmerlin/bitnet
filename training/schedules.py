@@ -32,7 +32,15 @@ def lr_schedule_multiplier(
     warmup_steps: int,
     cooldown_steps: int,
     min_lr_ratio: float,
+    schedule: str = "cosine",
 ) -> float:
+    """Warmup, then either a cosine decay or a WSD trapezoid.
+
+    Mirrors ``mlx_train.lr_multiplier``. The two are kept in step deliberately:
+    ``mlx_convert`` reconstructs a PyTorch run's LR from this helper and refuses
+    the checkpoint on a mismatch, so a schedule that exists on only one side is
+    a conversion failure waiting to happen.
+    """
     if total_steps <= 0:
         return 1.0
 
@@ -40,6 +48,11 @@ def lr_schedule_multiplier(
         return float(step + 1) / max(warmup_steps, 1)
 
     main_steps = max(total_steps - warmup_steps - cooldown_steps, 1)
+    if schedule == "wsd":
+        if step < warmup_steps + main_steps:
+            return 1.0
+        decay = min((step - warmup_steps - main_steps) / max(cooldown_steps, 1), 1.0)
+        return 1.0 * (1.0 - decay) + min_lr_ratio * decay
     if step < warmup_steps + main_steps:
         progress = (step - warmup_steps) / main_steps
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))

@@ -37,12 +37,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("none", "recurrent", "all"),
         default="none",
     )
-    parser.add_argument(
-        "--use-ffn-mid",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Dense FFN square mid (3-mat). --no-use-ffn-mid = classic 2-mat SwiGLU.",
-    )
     parser.add_argument("--profile-phases", action="store_true")
     return parser
 
@@ -97,7 +91,6 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
         use_path_kernel=args.mlx_path_kernel,
         use_engram=False,
         use_rfmoe=False,
-        use_ffn_mid=getattr(args, "use_ffn_mid", True),
         attn_res_mode=getattr(args, "attn_res_mode", "kimi"),
         attn_res_group_size=getattr(args, "attn_res_group_size", None),
     )

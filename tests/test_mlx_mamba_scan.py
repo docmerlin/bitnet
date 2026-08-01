@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import mlx.core as mx
+import pytest
 
 from mlx_mamba_scan_kernel import (
     _scan_vjp_mlx,
@@ -54,3 +55,18 @@ def test_selective_scan_custom_function_grad() -> None:
     mx.eval(val, grad)
     assert float(val) == float(val)
     assert float(mx.mean(mx.abs(grad))) >= 0.0
+
+
+@pytest.mark.parametrize("headdim", [1, 2, 3])
+def test_backward_is_correct_at_small_head_widths(headdim) -> None:
+    # The scalar reductions are striped across the threadgroup rather than
+    # assigned to threads 0/1/2: the threadgroup is headdim threads wide, so a
+    # fixed assignment left ddt and dtrap unwritten below 3 and returned
+    # uninitialised device memory. config.py permits mamba_headdim >= 1.
+    inputs = _rand_scan_inputs(b=1, l=8, h=2, p=headdim, n=16)
+    dy = mx.random.normal(inputs[0].shape).astype(mx.float32)
+    metal = selective_scan_bwd_metal(*inputs, dy)
+    reference = _scan_vjp_mlx(inputs, dy)
+    mx.eval(*metal, *reference)
+    for got, want in zip(metal, reference):
+        assert float(mx.max(mx.abs(got - want))) < 1e-4

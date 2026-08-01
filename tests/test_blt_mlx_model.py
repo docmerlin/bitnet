@@ -149,5 +149,15 @@ def test_torch_state_dict_loads_without_renaming():
     torch_names = set(torch_model.state_dict())
     from mlx.utils import tree_flatten
 
-    mlx_names = {name for name, _ in tree_flatten(mlx_model.parameters())}
+    # Runtime quantisation state is excluded: weight_mix_value,
+    # activation_mix_value and activation_level_pair exist as MLX module state
+    # only so mx.compile treats them as graph inputs rather than baking them in
+    # as constants. The torch side holds the same values as plain Python
+    # attributes. They are scaffolding, not weights, and never transfer.
+    runtime_state = ("weight_mix_value", "activation_mix_value", "activation_level_pair")
+    mlx_names = {
+        name
+        for name, _ in tree_flatten(mlx_model.parameters())
+        if not name.endswith(runtime_state)
+    }
     assert torch_names == mlx_names

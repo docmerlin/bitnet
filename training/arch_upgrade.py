@@ -41,10 +41,21 @@ def filter_retired_decoder_cross_attn_keys(keys: Iterable[str]) -> List[str]:
 
 @torch.no_grad()
 def copy_square_identity_(weight: torch.Tensor) -> bool:
-    """In-place set a square 2D master weight to ``I``. Returns whether applied."""
+    """In-place set a square 2D master weight so it *quantises* to ``I``.
+
+    ``eye(N) * N``, not ``eye(N)``. These are ternary weights: the per-output-
+    channel scale is ``mean(|row|)``, which for a plain identity row (one 1 and
+    N-1 zeros) is ``1/N``, so the quantised weight would be ``eye(N)/N`` -- a
+    1/N attenuator rather than the pass-through this helper exists to create.
+    Scaling by N makes ``mean(|row|) = 1``. Callers that own the module should
+    also pin its weight mix; see ``layers.hybrid_block``.
+
+    Returns whether applied.
+    """
     if weight.ndim != 2 or weight.size(0) != weight.size(1):
         return False
-    weight.copy_(torch.eye(weight.size(0), device=weight.device, dtype=weight.dtype))
+    size = weight.size(0)
+    weight.copy_(torch.eye(size, device=weight.device, dtype=weight.dtype) * size)
     return True
 
 

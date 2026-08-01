@@ -7,6 +7,14 @@ Experimental PyTorch repo, two research tracks:
 
 Early-stage research code. Interfaces, defaults, training behavior evolving fast.
 
+⚠️ **No checkpoint compatibility before 1.0.** Checkpoints are not portable across
+commits. Architecture and optimizer state layout change whenever a change is worth
+more than the old runs, and there is no migration path — resume from a checkpoint
+only within the commit that wrote it. Most recent break: the output head is now
+untied from the input embedding by default (`--no-tie-word-embeddings`), which adds
+an `lm_head.weight` parameter and splits the optimizer into three groups instead of
+two, so both model and optimizer state shapes moved.
+
 **Distillation teacher.** This repo distills from [Ornith 1.0](https://huggingface.co/deepreinforce-ai) (DeepReinforce AI) — an open-weights, MIT-licensed model family on HuggingFace. Open-weights teachers under permissive licenses only.
 
 ⚠️ **Not for Claude distillation.** This repo cannot and should not be used to distill Claude or any Anthropic model. See the Anthropic Terms of Service for policies on model distillation and derivative use.
@@ -34,9 +42,11 @@ Key properties:
 - each block combines:
   - PaTH-FoX data-dependent positional attention in bounded local windows
   - Infini-Attention style fixed-size memory for context beyond each window
-  - **Mamba-3-style selective SSM** on every 3rd unique layer starting at 0
-    (`layer_id % 3 == 0` → ~1/3 of stack; `--mamba3-layers` / `--no-mamba3-layers`,
-    `--mamba-layer-period`); pure scan on **PyTorch and MLX** (no CUDA `mamba_ssm`)
+  - **Mamba-3-style selective SSM**, opt-in via `--mamba3-layers`, on every 3rd unique
+    layer starting at 0 (`layer_id % 3 == 0` → ~1/3 of stack; `--mamba-layer-period`);
+    pure scan on **PyTorch and MLX** (no CUDA `mamba_ssm`). Off by default: the SSM
+    layers measured 1.36–1.51x end-to-end training throughput against the PaTH
+    attention layers that replace them, and no quality comparison has been run
   - local attention work scales linearly with sequence length at fixed
     `--path-window-size` (default 1024); no full-sequence attention matrix
   - **Sandwich RMSNorm** residual: `post(x + scale * sublayer(pre(x)))` on attn and FFN
@@ -302,7 +312,11 @@ Usage:
 
 - **C-MUD for 2D matrix weights** — bulk of model (`HBitLinear` projections,
   attention and FFN weights). Where triangular momentum decorrelation defined.
-- **8-bit C-Lion as fallback** for params MUD doesn't target: embeddings,
+- **8-bit C-Lion on the token-indexed tables** — input embedding, loop embedding,
+  and the untied `lm_head`. These are lookups, not matrices; whitening is the wrong
+  treatment. MLX puts them in own optimizer group so they can run at own rate
+  (`--embedding-learning-rate`), which is what makes untied head pay off.
+- **8-bit C-Lion as fallback** for everything else MUD doesn't target:
   RMSNorm/SubLN gains, biases, scalar/vector gates and AttnRes scales. Cautious
   variant of Lion (not plain Lion), 8-bit optimizer state to keep memory low.
 
@@ -315,6 +329,9 @@ Relevant flags:
 
 - `--optimizer {cmud,lion}` (default `cmud`)
 - `--learning-rate` — LR for C-Lion fallback group (and legacy Lion path)
+- `--embedding-learning-rate` (MLX only) — LR for embedding / `lm_head` group;
+  defaults to `--learning-rate`. modded-nanogpt runs these well above body rate
+- `--tie-word-embeddings` / `--no-tie-word-embeddings` (MLX only, default untied)
 - `--mud-learning-rate` — LR for MUD matrix group (MUD paper default `1e-3`)
 - `--mud-momentum` — MUD heavy-ball momentum (Nesterov lookahead)
 - `--mud-passes` — triangular-whitening passes `p` (default `1` = MUD1; `2` for

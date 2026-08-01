@@ -485,7 +485,9 @@ def test_mlx_full_feature_model_states_and_heads() -> None:
     )
     mx.eval(attention.memory_initialized, attention.memory_m)
     assert attention.memory_initialized.item()
-    assert mx.count_nonzero(attention.memory_m).item() > 0
+    # mx.count_nonzero does not exist in this MLX version; the point is only
+    # that the memory bank actually got written.
+    assert int(mx.sum((attention.memory_m != 0).astype(mx.int32))) > 0
 
     attention.reset_memory(2)
     mixed_segments = mx.array([[0, 0, 0, 0], [0, 0, 1, 1]])

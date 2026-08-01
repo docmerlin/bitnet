@@ -14,6 +14,7 @@ import mlx.nn as nn
 
 from blt.config import TernaryBLTConfig
 from blt.mlx_layers import (
+    MLXHashNgramEmbedding,
     MLXHBitLinear,
     MLXTernaryCrossAttention,
     MLXTernaryPatchGather,
@@ -247,6 +248,7 @@ class MLXTernaryBLTModel(nn.Module):
         super().__init__()
         self.config = config
         self.byte_embeddings = nn.Embedding(config.vocab_size, config.local_dim)
+        self.ngram_embeddings = MLXHashNgramEmbedding(config) if config.use_ngram_embeddings else None
         self.local_encoder = MLXLocalEncoder(config)
         self.global_transformer = global_transformer or MLXGlobalTransformer(config)
         self.local_decoder = MLXLocalDecoder(config)
@@ -276,6 +278,17 @@ class MLXTernaryBLTModel(nn.Module):
         if backbone is not None and hasattr(backbone, "set_quantization_state"):
             backbone.set_quantization_state(weight_mix, activation_mix, bits)
 
+    def embed_bytes(self, input_ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
+        """Byte embeddings, plus hashed n-gram embeddings when enabled.
+
+        Every path into the model goes through here -- training and both
+        generation paths -- so the n-grams cannot be silently skipped at decode.
+        """
+        embeddings = self.byte_embeddings(input_ids)
+        if self.ngram_embeddings is None:
+            return embeddings
+        return self.ngram_embeddings(embeddings, input_ids, attention_mask)
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -302,7 +315,7 @@ class MLXTernaryBLTModel(nn.Module):
             )
         patch_lengths = normalize_patch_lengths_to_targets(patch_lengths, valid_lengths)
 
-        byte_embeddings = self.byte_embeddings(input_ids)
+        byte_embeddings = self.embed_bytes(input_ids, attention_mask)
         encoder_hidden, encoder_patches, patch_ids = self.local_encoder(
             byte_embeddings, patch_lengths, attention_mask=attention_mask
         )

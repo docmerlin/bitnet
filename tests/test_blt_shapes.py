@@ -61,8 +61,12 @@ def test_blt_forward_shapes() -> bool:
         assert hasattr(mlp, "mid_proj"), "TernaryMLP missing mid_proj"
         assert mlp.mid_proj.weight.shape == (h, h), mlp.mid_proj.weight.shape
         eye = torch.eye(h, dtype=mlp.mid_proj.weight.dtype)
-        assert torch.allclose(mlp.mid_proj.weight.detach().cpu(), eye, atol=1e-5), (
-            "mid_proj must cold-start as identity"
+        # Effective, not raw: the forward uses quantize(weight), and a raw eye(N)
+        # quantises to eye(N)/N because the per-row scale is mean(|row|) = 1/N.
+        with torch.no_grad():
+            effective = mlp.mid_proj.effective_weight(torch.float32).cpu()
+        assert torch.allclose(effective, eye, atol=1e-5), (
+            "mid_proj must cold-start as an identity in the forward pass"
         )
 
     # Mid participates in backward (not dead/unused).

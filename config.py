@@ -101,7 +101,10 @@ class TernaryConfig:
     topk_block_size: int = 64   # tokens per retrievable block
     # Hybrid depth: every ``mamba_layer_period``-th unique layer (starting at 0) uses a
     # Mamba-3-style selective SSM mixer instead of PaTH+Infini. period=3 → ~1/3 layers.
-    use_mamba3_layers: bool = True
+    # Off by default: measured on the BLT + BitNet stack, the SSM layers cost 1.36-1.51x
+    # end-to-end throughput against the PaTH attention layers that replace them, and no
+    # quality comparison has been run in either direction. Turn on to A/B.
+    use_mamba3_layers: bool = False
     mamba_layer_period: int = 3
     mamba_d_state: int = 64
     mamba_expand: int = 2
@@ -143,6 +146,12 @@ class TernaryConfig:
 
     # Multi-token prediction (data-efficiency). 0 = off (plain next-token).
     mtp_depth: int = 0
+
+    # Share the output projection with the input embedding. False (untied) is the
+    # modded-nanogpt configuration: an untied head plus a much higher embedding
+    # learning rate was their largest win after Muon. Costs vocab*hidden extra
+    # parameters (16.7M at vocab 32768 / hidden 512).
+    tie_word_embeddings: bool = False
 
     # Looped / recurrent-depth structure. None = resolve in __post_init__.
     # Effective depth = prelude + recurrent * num_loops + coda.

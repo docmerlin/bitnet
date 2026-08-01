@@ -169,7 +169,12 @@ def test_soft_resume_pre_mid_checkpoint_identity_inits_mid() -> bool:
         ]
         assert mid_mats, "expected dense ffn_mid weights"
         for mat in mid_mats:
-            eye = torch.eye(mat.size(0), dtype=mat.dtype)
+            # eye(N)*N, because these are ternary weights: the per-output-channel
+            # scale is mean(|row|), which is 1/N for a plain identity row, so a
+            # raw eye(N) would quantise to eye(N)/N -- an attenuator rather than
+            # the pass-through the upgrade exists to install.
+            size = mat.size(0)
+            eye = torch.eye(size, dtype=mat.dtype) * size
             assert torch.allclose(mat.detach().cpu(), eye, atol=1e-5), mat
 
         # Non-mid weights should still match the source model (up/down restored).

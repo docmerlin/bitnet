@@ -1,0 +1,124 @@
+"""Checkpoint save/load: what is stored, and what old files still load."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import mlx.core as mx
+import pytest
+from mlx.utils import tree_flatten
+
+from mlx_model import MLXBitNet, MLXBitNetConfig
+from mlx_optim import CMUD
+from mlx_train import (
+    _RUNTIME_QUANT_NAMES,
+    config_from_saved,
+    load_checkpoint,
+    migrate_two_group_optimizer_state,
+    save_checkpoint,
+)
+
+
+def _config(**overrides) -> MLXBitNetConfig:
+    base = dict(
+        vocab_size=256, hidden_size=64, num_attention_heads=4, intermediate_size=128,
+        num_prelude_layers=1, num_recurrent_layers=1, num_coda_layers=1, num_loops=1,
+        use_engram=False, mtp_depth=0,
+    )
+    base.update(overrides)
+    return MLXBitNetConfig(**base)
+
+
+def _optimizer() -> CMUD:
+    return CMUD(mud_learning_rate=1e-3, fallback_learning_rate=3e-4, weight_decay=0.0)
+
+
+def test_runtime_quantisation_state_is_not_written_to_checkpoints(tmp_path) -> None:
+    # These are rebuilt by set_quantization_state every step. Storing them bloats
+    # the file and makes the strict key comparison reject any build with a
+    # different set of them.
+    config = _config()
+    model = MLXBitNet(config)
+    optimizer = _optimizer()
+    optimizer.init(model.trainable_parameters())
+    mx.eval(model.parameters())
+
+    assert any(
+        name.endswith(_RUNTIME_QUANT_NAMES) for name, _ in tree_flatten(model.parameters())
+    ), "expected runtime quantisation state on the model"
+
+    path = save_checkpoint(tmp_path, model, optimizer, config, {"step": 1}, "ckpt")
+    stored = mx.load(str(path))
+    assert not [key for key in stored if key.endswith(_RUNTIME_QUANT_NAMES)]
+
+
+def test_a_checkpoint_round_trips(tmp_path) -> None:
+    config = _config()
+    model = MLXBitNet(config)
+    optimizer = _optimizer()
+    optimizer.init(model.trainable_parameters())
+    mx.eval(model.parameters())
+    path = save_checkpoint(tmp_path, model, optimizer, config, {"step": 3}, "ckpt")
+
+    restored = MLXBitNet(config)
+    restored_optimizer = _optimizer()
+    restored_optimizer.init(restored.trainable_parameters())
+    mx.eval(restored.parameters())
+    load_checkpoint(path, restored, restored_optimizer)
+
+    before = dict(tree_flatten(model.parameters()))
+    after = dict(tree_flatten(restored.parameters()))
+    for key, value in before.items():
+        # Infini memory buffers start empty and are excluded from the file too.
+        if key.endswith(_RUNTIME_QUANT_NAMES) or value.size == 0:
+            continue
+        assert float(mx.max(mx.abs(value - after[key]))) == 0.0, key
+
+
+def test_config_from_saved_drops_retired_fields() -> None:
+    # A checkpoint written before use_ffn_mid was removed still carries it.
+    saved = {"vocab_size": 256, "hidden_size": 64, "num_attention_heads": 4, "use_ffn_mid": True}
+    config = config_from_saved(saved)
+    assert config.hidden_size == 64
+    assert not hasattr(config, "use_ffn_mid")
+
+
+def test_config_from_saved_still_rejects_an_unknown_field() -> None:
+    # Only *known* retired names are dropped; a typo or real drift must fail.
+    with pytest.raises(TypeError):
+        config_from_saved({"vocab_size": 256, "hidden_size": 64, "nonsense_field": 1})
+
+
+def test_two_group_optimizer_state_migrates_to_three() -> None:
+    # CMUD was [MUD, C-Lion]; it is now [MUD, embeddings, everything else].
+    config = _config()
+    model = MLXBitNet(config)
+    optimizer = _optimizer()
+    optimizer.init(model.trainable_parameters())
+    mx.eval(model.parameters())
+    expected = dict(tree_flatten(optimizer.state))
+
+    # Fold the two C-Lion groups back into one, as the old build wrote them.
+    old_style = {}
+    for key, value in expected.items():
+        if key.startswith("states.2."):
+            name = key[len("states.2."):]
+            # Per-group scalars collapse rather than collide.
+            old_style["states.1." + name] = value
+        else:
+            old_style[key] = value
+    assert {k.split(".")[1] for k in old_style if k.startswith("states.")} == {"0", "1"}
+
+    migrated = migrate_two_group_optimizer_state(old_style, expected, optimizer)
+    assert migrated.keys() == expected.keys()
+
+
+def test_migration_leaves_a_current_checkpoint_alone() -> None:
+    config = _config()
+    model = MLXBitNet(config)
+    optimizer = _optimizer()
+    optimizer.init(model.trainable_parameters())
+    mx.eval(model.parameters())
+    expected = dict(tree_flatten(optimizer.state))
+    assert migrate_two_group_optimizer_state(dict(expected), expected, optimizer) == expected

@@ -87,8 +87,12 @@ def test_hybrid_block():
     assert block.ffn_up.weight.shape == (inter * 2, d)
     assert block.ffn_mid.weight.shape == (inter, inter)
     eye = torch.eye(inter, dtype=block.ffn_mid.weight.dtype)
-    assert torch.allclose(block.ffn_mid.weight.detach().cpu(), eye, atol=1e-5), (
-        "ffn_mid must cold-start as identity"
+    # Effective, not raw: the forward uses quantize(weight), and a raw eye(N)
+    # quantises to eye(N)/N because the per-row scale is mean(|row|) = 1/N.
+    with torch.no_grad():
+        effective = block.ffn_mid.effective_weight(torch.float32).cpu()
+    assert torch.allclose(effective, eye, atol=1e-5), (
+        "ffn_mid must cold-start as an identity in the forward pass"
     )
     assert block.ffn_down.weight.shape == (d, inter)
 

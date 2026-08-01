@@ -11,6 +11,7 @@ from blt.config import TernaryBLTConfig
 from blt.layers.global_transformer import GlobalTransformer
 from blt.layers.local_decoder import LocalDecoder
 from blt.layers.local_encoder import LocalEncoder
+from blt.layers.ngram import HashNgramEmbedding
 from blt.patching.teacher_patcher import UniformPatcher, normalize_patch_lengths_to_targets, patch_presence_mask
 from layers.h_bitlinear import HBitLinear
 from utils import validate_suffix_padded_mask
@@ -33,11 +34,25 @@ class TernaryBLTModel(nn.Module):
         self.config = config
         padding_idx = config.pad_id if config.pad_id >= 0 else None
         self.byte_embeddings = nn.Embedding(config.vocab_size, config.local_dim, padding_idx=padding_idx)
+        self.ngram_embeddings = HashNgramEmbedding(config) if config.use_ngram_embeddings else None
         self.local_encoder = LocalEncoder(config)
         self.global_transformer = GlobalTransformer(config)
         self.local_decoder = LocalDecoder(config)
         self.output_head = HBitLinear(config.decoder_dim, config.vocab_size, config=config)
         self.fallback_patcher = UniformPatcher(config.patch_size)
+
+    def embed_bytes(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Byte embeddings, plus hashed n-gram embeddings when enabled.
+
+        Every path into the model goes through here -- training and both
+        generation paths -- so the n-grams cannot be silently skipped at decode.
+        """
+        embeddings = self.byte_embeddings(input_ids)
+        if self.ngram_embeddings is None:
+            return embeddings
+        return self.ngram_embeddings(embeddings, input_ids, attention_mask)
 
     def forward(
         self,
@@ -64,7 +79,7 @@ class TernaryBLTModel(nn.Module):
             patch_lengths = self.fallback_patcher.patch(input_ids)
         patch_lengths = normalize_patch_lengths_to_targets(patch_lengths, valid_lengths)
 
-        byte_embeddings = self.byte_embeddings(input_ids)
+        byte_embeddings = self.embed_bytes(input_ids, attention_mask)
         encoder_hidden, encoder_patches, patch_ids = self.local_encoder(
             byte_embeddings,
             patch_lengths,

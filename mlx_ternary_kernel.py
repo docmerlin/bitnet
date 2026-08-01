@@ -497,3 +497,105 @@ def ternary_fused_ffn_m1(
         output_dtypes=[mx.float32],
     )[0]
     return y.reshape(*orig[:-1], hidden).astype(dtype)
+
+
+# ---------------------------------------------------------------------------
+# Fused straight-through activation quantisation.
+#
+# The expression form -- absmax reduce, divide, round, clip, rescale, then
+# ``x + stop_gradient(q - x)`` for the STE -- is about nine elementwise passes
+# over the activation tensor. That is not a rounding error: measured on one
+# HBitLinear at batch 16 x 1024 tokens it is 41% of a 256->1024 projection,
+# 49% of 1024->1024, and 75% of 1024->256, where the layer costs 4.1x a plain
+# matmul. Down-projections are worst because the pass count scales with the
+# *input* width while the matmul scales with input x output.
+#
+# One threadgroup per row: reduce |x| across the row in threadgroup memory,
+# then write the quantised row. Two reads and one write instead of nine passes.
+# The STE is the custom_function's vjp (identity), so the backward stops here
+# rather than differentiating through round/clip.
+# ---------------------------------------------------------------------------
+
+_FUSED_ACT_QUANT = mx.fast.metal_kernel(
+    name="fused_activation_quantize",
+    input_names=["x", "levels"],
+    output_names=["out"],
+    source=r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = thread_position_in_grid.y;
+        uint width = x_shape[x_ndim - 1];
+        ulong base = ulong(row) * width;
+
+        float positive = levels[0];
+        float negative = levels[1];
+
+        threadgroup float shared[TG];
+        float local_max = 0.0f;
+        for (uint i = lane; i < width; i += TG) {
+            local_max = max(local_max, abs(float(x[base + i])));
+        }
+        shared[lane] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = TG / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                shared[lane] = max(shared[lane], shared[lane + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Stay in T and divide rather than multiplying by a reciprocal, so this
+        // matches the expression form bit for bit. Both shortcuts disagree only
+        // on values sitting exactly on a rounding boundary -- which at 8 bits
+        // over a 16M-element tensor is not rare.
+        T scale = T(max(shared[0], 1e-5f) / positive);
+        for (uint i = lane; i < width; i += TG) {
+            float value = rint(float(T(x[base + i]) / scale));
+            value = min(max(value, -negative), positive);
+            out[base + i] = T(T(value) * scale);
+        }
+    """,
+)
+
+
+def _fused_activation_quantize(x: mx.array, levels: mx.array) -> mx.array:
+    width = x.shape[-1]
+    rows = x.size // max(width, 1)
+    # Power-of-two threadgroup so the tree reduction above is exact.
+    threads = 256 if width >= 256 else max(32, 1 << (max(width, 1) - 1).bit_length())
+    return _FUSED_ACT_QUANT(
+        inputs=[x, levels],
+        template=[("T", x.dtype), ("TG", threads)],
+        grid=(threads, rows, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def activation_levels(bits: int) -> mx.array:
+    """``[positive, negative]`` level counts for :func:`ste_activation_quantize`.
+
+    A runtime input rather than a template constant so that ramping
+    ``activation_bits`` mid-training does not recompile the graph.
+    """
+    bits = max(int(bits), 2)
+    return mx.array([float((2 ** (bits - 1)) - 1), float(2 ** (bits - 1))], dtype=mx.float32)
+
+
+@mx.custom_function
+def ste_activation_quantize(x: mx.array, levels: mx.array) -> mx.array:
+    """Per-row absmax quantisation of ``x`` with a straight-through gradient.
+
+    Bit-identical to the expression form for float32 and bfloat16 at every
+    width. float16 at 16 bits can differ by one quantisation step, because a
+    10-bit mantissa cannot hold the 32767-level grid the divide passes through;
+    that combination is degenerate anyway.
+    """
+    return _fused_activation_quantize(x, levels)
+
+
+@ste_activation_quantize.vjp
+def _ste_activation_quantize_vjp(primals, cotangent, _output):
+    # Straight through: the quantiser is the identity on the backward pass.
+    _, levels = primals
+    return cotangent, mx.zeros_like(levels)
