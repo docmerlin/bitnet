@@ -210,15 +210,9 @@ class MLXBLTTrainer:
             teacher_topk_logits=batch.get("topk_logits"),
         )
 
-    def _loss(self, batch: dict[str, mx.array]) -> mx.array:
-        """Scalar loss, and nothing else.
-
-        Deliberately free of side effects: stashing the metric breakdown on
-        ``self`` here would make the function impure and ``mx.compile`` rejects
-        it. The breakdown is recovered by :meth:`loss_breakdown` on the steps
-        that actually log one.
-        """
-        return self._terms(batch)[0]
+    def _loss(self, batch: dict[str, mx.array]):
+        """Return scalar loss with metric arrays as gradient auxiliaries."""
+        return self._terms(batch)
 
     def loss_breakdown(self, batch: dict[str, mx.array]) -> dict[str, float]:
         """Per-term metrics for one batch. Uncompiled, so only call it to log."""
@@ -302,15 +296,20 @@ class MLXBLTTrainer:
             self.optimizer.learning_rate = rate
         self.model.set_quantization_state(*self.quantization_at(step_index))
 
-        loss, gradients = self._loss_and_grad(batch)
+        (loss, loss_metrics), gradients = self._loss_and_grad(batch)
         gradients, grad_norm = clip_gradients(gradients, self.config.grad_clip)
         self.optimizer.update(self.model, gradients)
-        mx.eval(self.model.parameters(), self.optimizer.state, loss, grad_norm)
+        mx.eval(
+            self.model.parameters(),
+            self.optimizer.state,
+            loss,
+            grad_norm,
+            *(loss_metrics.values() if breakdown else ()),
+        )
 
         metrics = {"loss": float(loss), "grad_norm": float(grad_norm), "learning_rate": rate}
         if breakdown:
-            # Costs a second forward, so it is reserved for steps that log.
-            metrics.update(self.loss_breakdown(batch))
+            metrics.update({name: float(value) for name, value in loss_metrics.items()})
         return metrics
 
     def train(self, *, log=print) -> list[dict[str, float]]:

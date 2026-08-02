@@ -96,6 +96,49 @@ def test_hbitlinear_matches_torch(in_features, out_features):
     _close(expected, mlx_layer(mx.array(x)))
 
 
+def test_shared_projections_prepare_inputs_once(monkeypatch):
+    config = _config()
+    attention = MLXTernarySelfAttention(64, 4, config=config)
+    mlp = MLXTernaryMLP(64, 4.0, config=config)
+    cross_attention = MLXTernaryCrossAttention(64, 64, hidden_dim=64, num_heads=4, config=config)
+    tracked = {
+        id(attention.q_proj): "attention_q",
+        id(attention.k_proj): "attention_k",
+        id(attention.v_proj): "attention_v",
+        id(mlp.gate_proj): "mlp_gate",
+        id(mlp.up_proj): "mlp_up",
+        id(cross_attention.k_proj): "cross_k",
+        id(cross_attention.v_proj): "cross_v",
+    }
+    calls = dict.fromkeys(tracked.values(), 0)
+    original = MLXHBitLinear.prepare_input
+
+    def counted(layer, values):
+        if name := tracked.get(id(layer)):
+            calls[name] += 1
+        return original(layer, values)
+
+    monkeypatch.setattr(MLXHBitLinear, "prepare_input", counted)
+    x = mx.random.normal((2, 8, 64))
+    outputs = (attention(x), mlp(x), cross_attention(x, x))
+    mx.eval(*outputs)
+
+    assert calls == {
+        "attention_q": 1,
+        "attention_k": 0,
+        "attention_v": 0,
+        "mlp_gate": 1,
+        "mlp_up": 0,
+        "cross_k": 1,
+        "cross_v": 0,
+    }
+
+    attention.k_proj.set_quantization_state(1.0, 0.5, 8)
+    calls.update((name, 0) for name in calls)
+    mx.eval(attention(x))
+    assert calls["attention_q"] == calls["attention_k"] == calls["attention_v"] == 1
+
+
 def test_mlp_matches_torch():
     config = _config()
     torch_mlp = TernaryMLP(64, 4.0, config=config)

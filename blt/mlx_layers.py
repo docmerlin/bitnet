@@ -172,7 +172,7 @@ class MLXHBitLinear(nn.Module):
         self.activation_mix_value = mx.array(self.activation_mix)
         self.activation_level_pair = activation_levels(self.activation_bits)
 
-    def _prepare_input(self, x: mx.array) -> mx.array:
+    def prepare_input(self, x: mx.array) -> mx.array:
         if self.use_hadamard:
             x = mx.hadamard_transform(x)
         if not self.quantize_activations:
@@ -208,7 +208,11 @@ class MLXHBitLinear(nn.Module):
         return weight + self.weight_mix_value * mx.stop_gradient(ternary * scale - weight)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self._prepare_input(x) @ self.effective_weight().T
+        return self.forward_prepared(self.prepare_input(x))
+
+    def forward_prepared(self, x: mx.array) -> mx.array:
+        """Project input prepared by a layer with matching activation settings."""
+        return x @ self.effective_weight().T
 
 
 def _rms_norm(dim: int) -> nn.RMSNorm:
@@ -320,7 +324,16 @@ class MLXTernarySelfAttention(nn.Module):
         def heads(t):
             return t.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q, k, v = heads(self.q_proj(x)), heads(self.k_proj(x)), heads(self.v_proj(x))
+        same_preparation = all(
+            layer.activation_mix == self.q_proj.activation_mix
+            and layer.activation_bits == self.q_proj.activation_bits
+            for layer in (self.k_proj, self.v_proj)
+        )
+        prepared = self.q_proj.prepare_input(x) if same_preparation else None
+        q, k, v = (
+            heads(layer(x) if prepared is None else layer.forward_prepared(prepared))
+            for layer in (self.q_proj, self.k_proj, self.v_proj)
+        )
         cos, sin = build_rope_cache(seq_len, self.head_dim, theta=self.rope_theta)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -372,7 +385,14 @@ class MLXTernaryMLP(nn.Module):
         self.down_proj = MLXHBitLinear(hidden_dim, dim, config=config)
 
     def __call__(self, x: mx.array) -> mx.array:
-        hidden = nn.silu(self.gate_proj(x)) * self.up_proj(x)
+        same_preparation = (
+            self.gate_proj.activation_mix == self.up_proj.activation_mix
+            and self.gate_proj.activation_bits == self.up_proj.activation_bits
+        )
+        prepared = self.gate_proj.prepare_input(x) if same_preparation else None
+        gate = self.gate_proj(x) if prepared is None else self.gate_proj.forward_prepared(prepared)
+        up = self.up_proj(x) if prepared is None else self.up_proj.forward_prepared(prepared)
+        hidden = nn.silu(gate) * up
         return self.down_proj(nn.silu(self.mid_proj(hidden)))
 
 
@@ -443,8 +463,19 @@ class MLXTernaryCrossAttention(nn.Module):
             return t.reshape(batch_size, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = heads(self.q_proj(self.query_norm(query)), query_len)
-        k = heads(self.k_proj(normed_kv), kv_len)
-        v = heads(self.v_proj(normed_kv), kv_len)
+        same_preparation = (
+            self.k_proj.activation_mix == self.v_proj.activation_mix
+            and self.k_proj.activation_bits == self.v_proj.activation_bits
+        )
+        prepared = self.k_proj.prepare_input(normed_kv) if same_preparation else None
+        k = heads(
+            self.k_proj(normed_kv) if prepared is None else self.k_proj.forward_prepared(prepared),
+            kv_len,
+        )
+        v = heads(
+            self.v_proj(normed_kv) if prepared is None else self.v_proj.forward_prepared(prepared),
+            kv_len,
+        )
 
         bias, valid = combine_attention_bias(
             mask, base_bias=None, batch_size=batch_size, q_len=query_len, k_len=kv_len, dtype=q.dtype

@@ -205,6 +205,27 @@ def test_loss_breakdown_is_available_on_demand(tmp_path):
     assert trainer.step(batch, 1, breakdown=False).keys() == {"loss", "grad_norm", "learning_rate"}
 
 
+@pytest.mark.parametrize("compile_step", [False, True])
+def test_logged_step_reuses_gradient_forward(tmp_path, monkeypatch, compile_step):
+    model = MLXTernaryBLTModel(_config())
+    trainer = MLXBLTTrainer(
+        model,
+        _corpus(tmp_path),
+        TrainingConfig(steps=1, batch_size=2, logits_kl=0.0, compile_step=compile_step),
+    )
+    calls = 0
+    original = model.__class__.__call__
+
+    def counted(instance, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(instance, *args, **kwargs)
+
+    monkeypatch.setattr(model.__class__, "__call__", counted)
+    trainer.step(trainer.sample_batch(), 0, breakdown=True)
+    assert calls == 1
+
+
 @pytest.mark.parametrize("global_backbone", [False, True])
 def test_training_survives_the_quantisation_ramp(tmp_path, global_backbone):
     # 4-bit activations from a cold start collapse the model to uniform output
@@ -259,9 +280,9 @@ def test_activation_mix_zero_skips_quantisation():
     mx.eval(layer.parameters())
     x = mx.array(np.random.default_rng(0).standard_normal((1, 4, 64)).astype(np.float32))
     layer.set_quantization_state(1.0, 0.0, 8)
-    unquantised = layer._prepare_input(x)
+    unquantised = layer.prepare_input(x)
     layer.set_quantization_state(1.0, 1.0, 4)
-    quantised = layer._prepare_input(x)
+    quantised = layer.prepare_input(x)
     assert float(mx.max(mx.abs(unquantised - quantised))) > 1e-4
 
 
