@@ -13,7 +13,7 @@ MASTER_DTYPES = {"float32": mx.float32, "bfloat16": mx.bfloat16}
 
 _RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
     name="mud_rectangular_lower_solve",
-    input_names=["matrix", "rhs"],
+    input_names=["matrix", "rhs", "diagonal_epsilon"],
     output_names=["solution"],
     source=r"""
         uint column = thread_position_in_grid.x;
@@ -28,7 +28,7 @@ _RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
                 value -= float(matrix[row * rows + inner])
                     * float(solution[inner * columns + column]);
             }
-            value /= float(matrix[row * rows + row]);
+            value /= float(matrix[row * rows + row]) + float(diagonal_epsilon);
             solution[row * columns + column] = T(value);
         }
     """,
@@ -36,7 +36,7 @@ _RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
 
 _BATCHED_RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
     name="mud_batched_rectangular_lower_solve",
-    input_names=["matrix", "rhs"],
+    input_names=["matrix", "rhs", "diagonal_epsilon"],
     output_names=["solution"],
     source=r"""
         uint column = thread_position_in_grid.x;
@@ -54,7 +54,7 @@ _BATCHED_RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
                 value -= float(matrix[matrix_offset + row * rows + inner])
                     * float(solution[rhs_offset + inner * columns + column]);
             }
-            value /= float(matrix[matrix_offset + row * rows + row]);
+            value /= float(matrix[matrix_offset + row * rows + row]) + float(diagonal_epsilon);
             solution[rhs_offset + row * columns + column] = T(value);
         }
     """,
@@ -105,11 +105,12 @@ _FUSED_MUD_MOMENTUM = mx.fast.metal_kernel(
 )
 
 
-def lower_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
+def lower_solve(matrix: mx.array, rhs: mx.array, diagonal_epsilon: float = 0.0) -> mx.array:
+    epsilon = mx.array(diagonal_epsilon, dtype=mx.float32)
     if rhs.ndim == 3:
         batches, _, columns = rhs.shape
         return _BATCHED_RECTANGULAR_LOWER_SOLVE(
-            inputs=[matrix.astype(mx.float32), rhs.astype(mx.float32)],
+            inputs=[matrix.astype(mx.float32), rhs.astype(mx.float32), epsilon],
             template=[("T", mx.float32)],
             grid=(columns, batches, 1),
             threadgroup=(min(columns, 256), 1, 1),
@@ -118,7 +119,7 @@ def lower_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
         )[0]
     columns = rhs.shape[1]
     return _RECTANGULAR_LOWER_SOLVE(
-        inputs=[matrix.astype(mx.float32), rhs.astype(mx.float32)],
+        inputs=[matrix.astype(mx.float32), rhs.astype(mx.float32), epsilon],
         template=[("T", mx.float32)],
         grid=(columns, 1, 1),
         threadgroup=(min(columns, 256), 1, 1),
@@ -179,8 +180,8 @@ def mud_decorrelate(
         blocks = q.reshape(-1, block_size, q.shape[1])
         for _ in range(passes):
             blocks = blocks / (mx.linalg.norm(blocks, axis=2, keepdims=True) + eps)
-            triangle = mx.tril(blocks @ blocks.swapaxes(-1, -2)) + eps * mx.eye(block_size)
-            blocks = lower_solve(triangle, blocks)
+            gram = blocks @ blocks.swapaxes(-1, -2)
+            blocks = lower_solve(gram, blocks, eps)
             blocks = blocks / (mx.linalg.norm(blocks, axis=2, keepdims=True) + eps)
         return finish(blocks.reshape(q.shape))
     blocks = []
@@ -188,8 +189,8 @@ def mud_decorrelate(
         block = q[start : start + block_size]
         for _ in range(passes):
             block = block / (mx.linalg.norm(block, axis=1, keepdims=True) + eps)
-            triangle = mx.tril(block @ block.T) + eps * mx.eye(block.shape[0])
-            block = lower_solve(triangle, block)
+            gram = block @ block.T
+            block = lower_solve(gram, block, eps)
             block = block / (mx.linalg.norm(block, axis=1, keepdims=True) + eps)
         blocks.append(block)
     return finish(mx.concatenate(blocks, axis=0) if len(blocks) > 1 else blocks[0])
