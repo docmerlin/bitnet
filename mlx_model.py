@@ -281,6 +281,7 @@ class MLXHBitLinear(nn.Module):
         )
         self.weight_mix = mx.array(1.0)
         self.activation_mix = mx.array(1.0)
+        self._activation_mix_f = 1.0
         # When set, set_quantization_state leaves weight_mix alone. Used by the
         # identity-initialised FFN mid; see MLXHybridBlock.
         self.pinned_weight_mix: float | None = None
@@ -434,7 +435,10 @@ class MLXHBitLinear(nn.Module):
                     dtype=x.dtype,
                 )
 
-        x = self.prepare_input(x)
+        return self.forward_prepared(self.prepare_input(x))
+
+    def forward_prepared(self, x: mx.array) -> mx.array:
+        """Project input already transformed and activation-quantized by an equivalent layer."""
         if self._pinned_packed is not None:
             packed, scales, _ = self._pinned_packed
             return ternary_quantized_linear(x, self.weight, packed, scales)
@@ -452,6 +456,7 @@ class MLXHBitLinear(nn.Module):
         self._pinned_full_weight_quant = self.pinned_weight_mix is not None and weight_mix >= 1.0
         self.weight_mix = mx.array(weight_mix)
         self.activation_mix = mx.array(activation_mix)
+        self._activation_mix_f = activation_mix
         levels = float((2 ** (max(bits, 2) - 1)) - 1)
         self.activation_level_pair = _activation_level_pair(bits)
         self._act_levels_f = levels
@@ -1097,8 +1102,18 @@ class MLXPaTHAttention(nn.Module):
         vectors, _ = self._path_vectors(x, segment_ids)
         return vectors
 
-    def _path_vectors(self, x: mx.array, segment_ids: mx.array | None):
-        projected = self.path_up(self.path_down(x))
+    def _path_vectors(
+        self,
+        x: mx.array,
+        segment_ids: mx.array | None,
+        prepared_x: mx.array | None = None,
+    ):
+        path_input = (
+            self.path_down(x)
+            if prepared_x is None
+            else self.path_down.forward_prepared(prepared_x)
+        )
+        projected = self.path_up(path_input)
         convolved = (
             projected * self.path_conv_weight[:, 2]
             + self._shift(projected, segment_ids, 1) * self.path_conv_weight[:, 1]
@@ -1112,7 +1127,14 @@ class MLXPaTHAttention(nn.Module):
 
     def _project(self, x: mx.array, segment_ids: mx.array | None):
         batch, length, _ = x.shape
-        qkv = self.qkv(x).reshape(
+        # Keep single-token fused projections; share preprocessing on training/prefill batches.
+        same_preparation = (
+            self.qkv._activation_mix_f == self.path_down._activation_mix_f
+            and self.qkv._act_levels_f == self.path_down._act_levels_f
+        )
+        prepared_x = self.qkv.prepare_input(x) if batch * length > 1 and same_preparation else None
+        projected_qkv = self.qkv(x) if prepared_x is None else self.qkv.forward_prepared(prepared_x)
+        qkv = projected_qkv.reshape(
             batch,
             length,
             3,
@@ -1122,7 +1144,7 @@ class MLXPaTHAttention(nn.Module):
         q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
         k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
         v = qkv[:, :, 2].transpose(0, 2, 1, 3)
-        w, projected = self._path_vectors(x, segment_ids)
+        w, projected = self._path_vectors(x, segment_ids, prepared_x)
         beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
         forget_logits = self.path_forget(x).astype(mx.float32)
         log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)

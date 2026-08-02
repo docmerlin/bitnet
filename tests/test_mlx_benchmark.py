@@ -200,6 +200,95 @@ def test_mlx_model_preserves_packed_document_boundaries_and_loops() -> None:
     assert not mx.allclose(first, recurrent).item()
 
 
+@pytest.mark.parametrize(
+    ("shape", "different_settings", "expected_calls"),
+    [
+        ((2, 4, 64), False, {"qkv": 2, "path": 0}),
+        ((2, 4, 64), True, {"qkv": 2, "path": 2}),
+        ((1, 1, 64), False, {"qkv": 0, "path": 0}),
+    ],
+)
+def test_mlx_qkv_and_path_share_input_preparation(
+    monkeypatch,
+    shape,
+    different_settings,
+    expected_calls,
+) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=32,
+        hidden_size=64,
+        num_attention_heads=4,
+        intermediate_size=128,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        num_loops=1,
+        path_window_size=4,
+        use_engram=False,
+    )
+    attention = MLXPaTHAttention(config)
+    for layer in (attention.qkv, attention.path_down, attention.path_up):
+        layer.set_quantization_state(0.75, 0.5, 8)
+    if different_settings:
+        attention.path_down.set_quantization_state(0.75, 0.25, 8)
+    batch, length, _ = shape
+    if length == 1:
+        from mlx_model import _recurrent_quantized_matmul
+
+        token = _recurrent_quantized_matmul.set(True)
+        try:
+            for layer in (attention.qkv, attention.path_down):
+                layer.set_quantization_state(1.0, 1.0, 4)
+                layer.pin_inference_weight(mx.float32, prefer_packed=True)
+        finally:
+            _recurrent_quantized_matmul.reset(token)
+    x = mx.random.normal(shape)
+    segments = mx.zeros((batch, length), dtype=mx.int32)
+
+    def independent(values):
+        qkv = attention.qkv(values).reshape(batch, length, 3, config.num_attention_heads, 16)
+        q = attention.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
+        k = attention.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
+        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
+        w, projected = attention._path_vectors(values, segments)
+        beta = 2.0 * mx.sigmoid(attention.path_beta(values).astype(mx.float32))
+        forget_logits = attention.path_forget(values).astype(mx.float32)
+        log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
+        return q, k, v, w, beta, log_forget, projected
+
+    expected = independent(x)
+    expected_grad = (
+        mx.grad(lambda values: sum(mx.sum(item) for item in independent(values)))(x)
+        if length > 1
+        else None
+    )
+
+    calls = {"qkv": 0, "path": 0}
+    original = MLXHBitLinear.prepare_input
+
+    def counted(layer, values):
+        if layer is attention.qkv:
+            calls["qkv"] += 1
+        elif layer is attention.path_down:
+            calls["path"] += 1
+        return original(layer, values)
+
+    monkeypatch.setattr(MLXHBitLinear, "prepare_input", counted)
+    actual = attention._project(x, segments)
+    actual_grad = (
+        mx.grad(lambda values: sum(mx.sum(item) for item in attention._project(values, segments)))(x)
+        if length > 1
+        else None
+    )
+    mx.eval(expected, actual, *(() if expected_grad is None else (expected_grad, actual_grad)))
+
+    assert calls == expected_calls
+    for expected_item, actual_item in zip(expected, actual):
+        assert mx.array_equal(actual_item, expected_item).item()
+    if expected_grad is not None:
+        assert mx.allclose(actual_grad, expected_grad, rtol=1e-6, atol=1e-6).item()
+
+
 def test_mlx_recurrent_loops_reuse_effective_weights(monkeypatch) -> None:
     config = MLXBitNetConfig(
         vocab_size=32,
