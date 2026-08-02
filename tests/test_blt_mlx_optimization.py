@@ -20,7 +20,7 @@ from blt.config import TernaryBLTConfig
 from blt.mlx_data import ByteCorpus, write_byte_corpus
 from blt.mlx_model import MLXTernaryBLTModel
 from blt.mlx_patching import build_uniform_patch_lengths, pad_patch_lengths_to_bucket
-from blt.mlx_train import MUD_BLOCK_SIZE, BLTCMUD, MLXBLTTrainer, TrainingConfig
+from blt.mlx_train import MUD_BLOCK_SIZE, BLTCMUD, MLXBLTTrainer, TrainingConfig, learning_rate_at
 
 SEQ = 64
 
@@ -74,6 +74,30 @@ def test_trainer_passes_the_configured_block_size(tmp_path):
         TrainingConfig(steps=1, batch_size=2, logits_kl=0.0, log_every=0, mud_block_size=16),
     )
     assert trainer.optimizer.optimizers[0].block_size == 16
+
+
+def test_lr_schedule_preserves_optimizer_group_ratios(tmp_path):
+    mx.random.seed(0)
+    model = MLXTernaryBLTModel(_config())
+    mx.eval(model.parameters())
+    config = TrainingConfig(
+        steps=4,
+        batch_size=2,
+        learning_rate=2e-3,
+        fallback_learning_rate=3e-4,
+        warmup_steps=2,
+        logits_kl=0.0,
+        log_every=0,
+    )
+    trainer = MLXBLTTrainer(model, _corpus(tmp_path), config)
+
+    trainer.step(trainer.sample_batch(), 0)
+
+    multiplier = learning_rate_at(0, config) / config.learning_rate
+    mud, embedding, fallback = trainer.optimizer.optimizers
+    assert float(mud.learning_rate) == pytest.approx(config.learning_rate * multiplier)
+    assert float(embedding.learning_rate) == pytest.approx(config.fallback_learning_rate * multiplier)
+    assert float(fallback.learning_rate) == pytest.approx(config.fallback_learning_rate * multiplier)
 
 
 @pytest.mark.parametrize("width,bucket,expected", [(130, 32, 160), (128, 32, 128), (1, 16, 16), (65, 64, 128)])

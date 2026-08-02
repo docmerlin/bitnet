@@ -9,7 +9,9 @@ implementation that still runs on CPU-class hardware.
 
 from __future__ import annotations
 
+import contextlib
 import math
+from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -19,6 +21,19 @@ import torch.nn.functional as F
 
 _HADAMARD_BASE_CACHE: dict[int, torch.Tensor] = {}
 _HADAMARD_DEVICE_CACHE: dict[tuple[int, str, int | None, torch.dtype], torch.Tensor] = {}
+_EFFECTIVE_WEIGHT_CACHE: ContextVar[dict[tuple[int, torch.dtype], torch.Tensor] | None] = ContextVar(
+    "effective_weight_cache", default=None
+)
+
+
+@contextlib.contextmanager
+def reuse_effective_weights():
+    """Reuse quantized weights within one recurrent forward scope."""
+    token = _EFFECTIVE_WEIGHT_CACHE.set({})
+    try:
+        yield
+    finally:
+        _EFFECTIVE_WEIGHT_CACHE.reset(token)
 
 
 def hadamard_matrix(size: int) -> torch.Tensor:
@@ -170,14 +185,25 @@ class HBitLinear(nn.Module):
 
     def effective_weight(self, dtype: torch.dtype, weight: torch.Tensor | None = None) -> torch.Tensor:
         """Return mixed ternary weight, including grouped leading dimensions."""
+        cache = _EFFECTIVE_WEIGHT_CACHE.get()
+        key = (id(self), dtype)
+        if weight is None and cache is not None and key in cache:
+            return cache[key]
+
         weight = self.weight if weight is None else weight
         if self.enable_weight_quantization:
             quantized_weight = ternary_quantize_ste(weight).to(dtype=dtype)
             if self.weight_quantization_mix >= 1.0:
-                return quantized_weight
+                result = quantized_weight
             elif self.weight_quantization_mix > 0.0:
-                return torch.lerp(weight.to(dtype=dtype), quantized_weight, self.weight_quantization_mix)
-        return weight.to(dtype=dtype)
+                result = torch.lerp(weight.to(dtype=dtype), quantized_weight, self.weight_quantization_mix)
+            else:
+                result = weight.to(dtype=dtype)
+        else:
+            result = weight.to(dtype=dtype)
+        if weight is self.weight and cache is not None:
+            cache[key] = result
+        return result
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply Hadamard (on input), activation quantization, and ternary weight matmul.
@@ -185,7 +211,10 @@ class HBitLinear(nn.Module):
         Following BitNet b1.58 best practices, Hadamard is applied to the input
         before the ternary weight multiplication for improved quantization stability.
         """
-        x = self.prepare_input(x)
+        return self.forward_prepared(self.prepare_input(x))
+
+    def forward_prepared(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply this projection to input already prepared by an equivalent layer."""
         weight = self.effective_weight(x.dtype)
 
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None

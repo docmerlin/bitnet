@@ -38,6 +38,7 @@ def _tiny_args(optimizer: str = "cmud") -> argparse.Namespace:
         mud_learning_rate=1e-3,
         mud_momentum=0.95,
         mud_passes=1,
+        mud_block_size=64,
         no_optimizer_8bit=False,
         weight_decay=0.0,
         lion_beta1=0.9,

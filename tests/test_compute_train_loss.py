@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -53,6 +54,25 @@ def test_compute_train_loss_adds_z_loss() -> bool:
     return True
 
 
+def test_z_loss_reuses_cross_entropy_partition() -> None:
+    torch.manual_seed(4)
+    logits = torch.randn(2, 8, 64, requires_grad=True)
+    labels = torch.randint(0, 64, (2, 8))
+    labels[0, 3] = -100
+    reference_logits = logits.detach().clone().requires_grad_()
+
+    actual = language_modeling_loss(logits, labels, z_loss_coef=1e-2)
+    valid = labels.ne(-100)
+    log_z = torch.logsumexp(reference_logits.float(), dim=-1)
+    expected = F.cross_entropy(reference_logits.flatten(0, 1), labels.flatten(), ignore_index=-100)
+    expected = expected + 1e-2 * log_z[valid].square().mean()
+    actual.backward()
+    expected.backward()
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+    assert torch.allclose(logits.grad, reference_logits.grad, atol=1e-6)
+
+
 def test_compute_train_loss_ignores_cross_document_targets() -> None:
     model = BitNetDeep(_tiny_config())
     logits = torch.zeros(1, 3, 64)
@@ -72,11 +92,20 @@ def test_compute_train_loss_ignores_cross_document_targets() -> None:
 
 
 def test_language_modeling_loss_handles_fully_masked_batch() -> None:
-    logits = torch.randn(1, 2, 64, requires_grad=True)
-    loss = language_modeling_loss(logits, torch.full((1, 2), -100))
-    assert loss.item() == 0.0
-    loss.backward()
-    assert torch.count_nonzero(logits.grad) == 0
+    for z_loss_coef in (0.0, 1e-2):
+        logits = torch.randn(1, 2, 64, requires_grad=True)
+        loss = language_modeling_loss(logits, torch.full((1, 2), -100), z_loss_coef=z_loss_coef)
+        assert loss.item() == 0.0
+        loss.backward()
+        assert torch.count_nonzero(logits.grad) == 0
+
+
+@pytest.mark.parametrize("invalid_label", [-2, -1, 64])
+def test_z_loss_rejects_invalid_labels(invalid_label: int) -> None:
+    logits = torch.randn(1, 2, 64)
+    labels = torch.tensor([[0, invalid_label]])
+    with pytest.raises((IndexError, RuntimeError)):
+        language_modeling_loss(logits, labels, z_loss_coef=1e-2)
 
 
 def test_rfmoe_aux_terms_are_independent() -> bool:

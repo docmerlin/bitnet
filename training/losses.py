@@ -33,13 +33,16 @@ def language_modeling_loss(
     flat_logits = logits.reshape(-1, logits.size(-1))
     flat_labels = labels.reshape(-1)
     valid = flat_labels.ne(-100)
-    if not torch.any(valid):
-        return flat_logits.sum() * 0.0
-    loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
-    if z_loss_coef > 0.0:
-        log_z = torch.logsumexp(flat_logits.float(), dim=-1)
-        loss = loss + z_loss_coef * log_z[valid].pow(2).mean()
-    return loss
+    valid_count = valid.sum().clamp_min(1)
+    if z_loss_coef <= 0.0:
+        return F.cross_entropy(flat_logits, flat_labels, ignore_index=-100, reduction="sum") / valid_count
+
+    log_z = torch.logsumexp(flat_logits.float(), dim=-1)
+    safe_labels = torch.where(valid, flat_labels, 0)
+    target_logits = flat_logits.float().gather(1, safe_labels.unsqueeze(1)).squeeze(1)
+    valid_float = valid.to(log_z.dtype)
+    nll = ((log_z - target_logits) * valid_float).sum() / valid_count
+    return nll + z_loss_coef * (log_z.square() * valid_float).sum() / valid_count
 
 
 def multi_token_loss(

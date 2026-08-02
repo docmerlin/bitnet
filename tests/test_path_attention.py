@@ -90,6 +90,34 @@ def test_path_parameters_receive_gradients() -> None:
     assert attention.path_w_down.weight.grad is not None
 
 
+def test_batched_packed_chunks_match_fallback_gradients() -> None:
+    torch.manual_seed(10)
+    batched = _attention()
+    fallback = _attention()
+    fallback.load_state_dict(batched.state_dict())
+    batched_x = torch.randn(1, 8, 12, requires_grad=True)
+    fallback_x = batched_x.detach().clone().requires_grad_()
+    segment_ids = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]])
+
+    batched_output = batched(batched_x, segment_ids=segment_ids, memory_safe=False)
+    fallback_output = fallback(
+        fallback_x,
+        attention_mask=torch.ones(1, 8, dtype=torch.bool),
+        segment_ids=segment_ids,
+        memory_safe=False,
+    )
+    batched_output.sum().backward()
+    fallback_output.sum().backward()
+
+    torch.testing.assert_close(batched_output, fallback_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(batched_x.grad, fallback_x.grad, atol=1e-5, rtol=1e-5)
+    for (batched_name, batched_param), (fallback_name, fallback_param) in zip(
+        batched.named_parameters(), fallback.named_parameters()
+    ):
+        assert batched_name == fallback_name
+        torch.testing.assert_close(batched_param.grad, fallback_param.grad, atol=1e-5, rtol=1e-5)
+
+
 def test_infini_memory_bridges_path_windows_without_cross_document_leak() -> None:
     torch.manual_seed(10)
     attention = _attention()

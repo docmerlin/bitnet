@@ -39,6 +39,36 @@ def test_mud_decorrelate_row_orthonormalizes() -> bool:
     return True
 
 
+def test_blockwise_mud_matches_independent_blocks() -> None:
+    torch.manual_seed(4)
+    grad = torch.randn(19, 32)
+    actual = mud_decorrelate(grad, passes=2, block_size=8)
+    expected = torch.cat(
+        [mud_decorrelate(grad[start : start + 8], passes=2) for start in range(0, grad.size(0), 8)]
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_cmud_defaults_to_64_row_whitening_blocks() -> None:
+    model = nn.Linear(128, 128, bias=False)
+    optimizer = build_cmud(model, lr=0.05, fallback_lr=0.02, weight_decay=0.0)
+    mud_group = next(group for group in optimizer.param_groups if group["kind"] == "mud")
+    assert mud_group["block_size"] == 64
+
+
+def test_legacy_cmud_checkpoint_keeps_full_matrix_whitening() -> None:
+    model = nn.Linear(128, 128, bias=False)
+    optimizer = build_cmud(model, lr=0.05, fallback_lr=0.02, weight_decay=0.0)
+    payload = optimizer.state_dict()
+    for group in payload["param_groups"]:
+        group.pop("block_size", None)
+
+    restored = build_cmud(model, lr=0.05, fallback_lr=0.02, weight_decay=0.0)
+    restored.load_state_dict(payload)
+    mud_group = next(group for group in restored.param_groups if group["kind"] == "mud")
+    assert mud_group.get("block_size") is None
+
+
 def test_cautious_mask_zeroes_disagreeing_coords() -> bool:
     update = torch.tensor([1.0, -1.0, 1.0, -1.0])
     grad = torch.tensor([1.0, 1.0, -1.0, -1.0])  # agrees on coords 0 and 3

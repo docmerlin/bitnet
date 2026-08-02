@@ -295,7 +295,11 @@ class MLXBLTTrainer:
         self, batch: dict[str, mx.array], step_index: int, *, breakdown: bool = False
     ) -> dict[str, float]:
         rate = learning_rate_at(step_index, self.config)
-        self.optimizer.learning_rate = rate
+        multiplier = rate / self.config.learning_rate if self.config.learning_rate else 0.0
+        if hasattr(self.optimizer, "set_lr_multiplier"):
+            self.optimizer.set_lr_multiplier(multiplier)
+        else:
+            self.optimizer.learning_rate = rate
         self.model.set_quantization_state(*self.quantization_at(step_index))
 
         loss, gradients = self._loss_and_grad(batch)

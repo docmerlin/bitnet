@@ -57,11 +57,11 @@ except ImportError as exc:  # pragma: no cover
     _TOKENIZER_IMPORT_ERROR = exc
 
 
-def _sequence_length(value: str) -> int:
-    sequence_length = int(value)
-    if sequence_length <= 0:
+def _positive_int(value: str) -> int:
+    result = int(value)
+    if result <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
-    return sequence_length
+    return result
 
 
 def _validate_sequence_path_window(args: argparse.Namespace) -> None:
@@ -168,7 +168,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Transformer layers per AttnRes depth-block (default: unique_layers//8).",
     )
-    parser.add_argument("--sequence-length", type=_sequence_length, default=1024)
+    parser.add_argument("--sequence-length", type=_positive_int, default=1024)
     parser.add_argument("--path-window-size", type=int, default=defaults.path_window_size)
     parser.add_argument("--disable-hadamard", action="store_true")
     parser.add_argument(
@@ -222,6 +222,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3)
     parser.add_argument("--mud-momentum", type=float, default=0.95)
     parser.add_argument("--mud-passes", type=int, default=1)
+    parser.add_argument(
+        "--mud-block-size",
+        type=_positive_int,
+        default=64,
+        help="Rows per independent batched MUD whitening block.",
+    )
     parser.add_argument("--no-optimizer-8bit", action="store_true")
     parser.add_argument("--warmup-ratio", type=float, default=0.08)
     parser.add_argument("--cooldown-ratio", type=float, default=0.05)
@@ -481,9 +487,11 @@ def main() -> None:
 
             for _ in range(args.grad_accumulation_steps):
                 batch = next(active_train_batch_stream)
+                segment_ids_cpu = batch["segment_ids"]
+                memory_safe = bool((segment_ids_cpu == segment_ids_cpu[:, :1]).all())
                 input_ids = batch["input_ids"].to(device, non_blocking=non_blocking)
                 labels = batch["labels"].to(device, non_blocking=non_blocking)
-                segment_ids = batch["segment_ids"].to(device, non_blocking=non_blocking)
+                segment_ids = segment_ids_cpu.to(device, non_blocking=non_blocking)
                 label_segment_ids = batch["label_segment_ids"].to(device, non_blocking=non_blocking)
 
                 with autocast_context(device, amp_enabled, amp_dtype):
@@ -493,12 +501,14 @@ def main() -> None:
                             segment_ids=segment_ids,
                             return_mtp=True,
                             num_loops=active_loops,
+                            memory_safe=memory_safe,
                         )
                     else:
                         logits, mtp_logits = runner(
                             input_ids,
                             segment_ids=segment_ids,
                             num_loops=active_loops,
+                            memory_safe=memory_safe,
                         ), []
                     loss = compute_train_loss(
                         base_model,

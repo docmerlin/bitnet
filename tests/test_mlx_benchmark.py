@@ -978,3 +978,49 @@ def test_hbitlinear_m1_uses_fused_ternary_path() -> None:
     actual = layer(x)
     mx.eval(expected, actual)
     assert mx.allclose(actual, expected, rtol=1e-3, atol=1e-3).item()
+
+
+def test_fused_ffn_m1_is_skipped_when_hadamard_is_enabled(monkeypatch) -> None:
+    import mlx_model
+
+    config = MLXBitNetConfig(
+        vocab_size=32,
+        hidden_size=64,
+        num_attention_heads=4,
+        intermediate_size=128,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        use_hadamard=True,
+        use_4bit_activations=True,
+    )
+    block = mlx_model.MLXHybridBlock(config, 0)
+    token = mlx_model._recurrent_quantized_matmul.set(True)
+    try:
+        for layer in (block.up, block.mid, block.down):
+            layer.set_quantization_state(1.0, 1.0, 4)
+            layer.pin_inference_weight(mx.float32, prefer_packed=True)
+    finally:
+        mlx_model._recurrent_quantized_matmul.reset(token)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("fused FFN omits required Hadamard transforms")
+
+    monkeypatch.setattr(mlx_model, "ternary_fused_ffn_m1", fail_if_called)
+    x = mx.random.normal((1, 1, 64)).astype(mx.float32)
+    output = block._dense_mlp(x)
+
+    from mlx_ternary_kernel import ternary_effective_weight
+
+    def project(value, layer):
+        transformed = mx.hadamard_transform(value)
+        levels = 7.0
+        scale = mx.maximum(mx.max(mx.abs(transformed), axis=-1, keepdims=True), 1e-5) / levels
+        quantized = mx.clip(mx.round(transformed / scale), -(levels + 1), levels) * scale
+        return quantized @ ternary_effective_weight(layer.weight).T
+
+    gate, value = mx.split(project(x, block.up), 2, axis=-1)
+    expected = project(nn.silu(project(nn.silu(gate) * value, block.mid)), block.down)
+    mx.eval(output, expected)
+    assert mx.allclose(output, expected, rtol=1e-3, atol=1e-3).item()

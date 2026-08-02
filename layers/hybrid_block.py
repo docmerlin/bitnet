@@ -134,6 +134,7 @@ class HybridTransformerBlock(nn.Module):
         query_valid: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
         update_memory: Optional[bool] = None,
+        memory_safe: Optional[bool] = None,
     ) -> torch.Tensor:
         self.infini_attn.num_blocks = self.num_blocks
         return self.infini_attn(
@@ -143,6 +144,7 @@ class HybridTransformerBlock(nn.Module):
             query_valid=query_valid,
             segment_ids=segment_ids,
             update_memory=update_memory,
+            memory_safe=memory_safe,
         )
 
     def _dense_mlp(self, x: torch.Tensor) -> torch.Tensor:
@@ -166,6 +168,7 @@ class HybridTransformerBlock(nn.Module):
         segment_ids: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         update_memory: Optional[bool] = None,
+        memory_safe: Optional[bool] = None,
     ) -> torch.Tensor:
         """Legacy sandwich residual path."""
         if self.engram is not None:
@@ -187,6 +190,7 @@ class HybridTransformerBlock(nn.Module):
             query_valid=query_valid,
             segment_ids=segment_ids,
             update_memory=update_memory,
+            memory_safe=memory_safe,
         )
         x = self.attn_res(residual, torch.sigmoid(self.gate) * mixer_out)
 
@@ -205,6 +209,7 @@ class HybridTransformerBlock(nn.Module):
         segment_ids: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         update_memory: Optional[bool] = None,
+        memory_safe: Optional[bool] = None,
     ) -> AttnResStream:
         """Kimi Block AttnRes: mix depth → pre-norm sublayer → accumulate delta."""
         # Use this layer's mix modules (per-layer w_l).
@@ -229,6 +234,7 @@ class HybridTransformerBlock(nn.Module):
             query_valid=query_valid,
             segment_ids=segment_ids,
             update_memory=update_memory,
+            memory_safe=memory_safe,
         )
         stream.add_sublayer(torch.sigmoid(self.gate) * attn_out)
 
@@ -248,6 +254,7 @@ class HybridTransformerBlock(nn.Module):
         segment_ids: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         update_memory: Optional[bool] = None,
+        memory_safe: Optional[bool] = None,
     ) -> Union[torch.Tensor, AttnResStream]:
         if self.attn_res_mode == "kimi":
             if not isinstance(x, AttnResStream):
@@ -260,6 +267,7 @@ class HybridTransformerBlock(nn.Module):
                 segment_ids=segment_ids,
                 input_ids=input_ids,
                 update_memory=update_memory,
+                memory_safe=memory_safe,
             )
         if isinstance(x, AttnResStream):
             raise TypeError("sandwich mode expects a hidden tensor, not AttnResStream")
@@ -271,4 +279,5 @@ class HybridTransformerBlock(nn.Module):
             segment_ids=segment_ids,
             input_ids=input_ids,
             update_memory=update_memory,
+            memory_safe=memory_safe,
         )

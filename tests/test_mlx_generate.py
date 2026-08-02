@@ -433,7 +433,7 @@ def test_num_loops_override_changes_cache_depth() -> None:
     assert len(cache3.layers) == 1 + 2 * 3 + 1
 
 
-def test_compiled_inference_step_matches_eager() -> None:
+def test_compiled_inference_step_matches_eager(monkeypatch) -> None:
     config = MLXBitNetConfig(
         vocab_size=32,
         hidden_size=16,
@@ -458,7 +458,17 @@ def test_compiled_inference_step_matches_eager() -> None:
         model.inference_num_loops = 2
         model.path_decode_mode = "last"
     compiled.pin_inference_weights(mx.bfloat16, prefer_packed=False)
+    compile_calls = 0
+    original_compile = mx.compile
+
+    def tracked_compile(*args, **kwargs):
+        nonlocal compile_calls
+        compile_calls += 1
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "compile", tracked_compile)
     assert compiled.enable_compiled_inference()
+    assert compile_calls == 0
     tokens = [1, 2, 3, 4, 5, 6]
     cache_e = eager.new_inference_cache(num_loops=2)
     cache_c = compiled.new_inference_cache(num_loops=2)
@@ -472,3 +482,50 @@ def test_compiled_inference_step_matches_eager() -> None:
         b = compiled.inference_step(mx.array([[token]]), cache_c)
         mx.eval(a, b, *cache_e.arrays(), *cache_c.arrays())
         assert mx.allclose(a, b, rtol=1e-2, atol=1e-2).item(), token
+    assert compile_calls > 0
+    assert compiled._compiled_inference_step is not None
+    assert compiled._compiled_by_open_len
+
+
+def test_lazy_compiled_inference_failure_falls_back_to_eager(monkeypatch) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=4,
+        intermediate_size=32,
+        num_prelude_layers=1,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        num_loops=1,
+        block_size=2,
+        path_window_size=4,
+        infini_memory_dim=2,
+        use_engram=False,
+    )
+    eager = MLXBitNet(config)
+    fallback = MLXBitNet(config)
+    fallback.load_weights(list(tree_flatten(eager.parameters())))
+    for model in (eager, fallback):
+        model.set_quantization_state(1.0, 1.0, 4)
+        model.set_inference_block_width(2)
+
+    compile_calls = 0
+
+    def fail_compile(*args, **kwargs):
+        nonlocal compile_calls
+        compile_calls += 1
+        raise RuntimeError("compile unavailable")
+
+    monkeypatch.setattr(mx, "compile", fail_compile)
+    assert fallback.enable_compiled_inference()
+    eager_cache = eager.new_inference_cache()
+    fallback_cache = fallback.new_inference_cache()
+
+    for token in (1, 2):
+        expected = eager.inference_step(mx.array([[token]]), eager_cache)
+        actual = fallback.inference_step(mx.array([[token]]), fallback_cache)
+        mx.eval(expected, actual, *eager_cache.arrays(), *fallback_cache.arrays())
+        assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-4).item()
+
+    assert compile_calls == 1
+    assert fallback._compiled_inference_step is None

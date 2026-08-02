@@ -1757,6 +1757,7 @@ class MLXHybridBlock(nn.Module):
             and self.up._full_activation_quant
             and self.mid._full_activation_quant
             and self.down._full_activation_quant
+            and not self.up.config.use_hadamard
         ):
             up_p = self.up._packed_weight(x)
             mid_p = self.mid._packed_weight(x)
@@ -2334,14 +2335,10 @@ class MLXBitNet(nn.Module):
                     )
                 compiled_fn = mx.compile(pure_step)
                 flat = self._flatten_inference_cache(warm)
-                out = compiled_fn(mx.array([[10_000 + open_before]], dtype=mx.int32), *flat)
+                out = compiled_fn(mx.array([[0]], dtype=mx.int32), *flat)
                 mx.eval(out[0])
                 compiled[open_before] = compiled_fn
                 return compiled_fn
-
-            # Eagerly specialize every open length so decode does not pay first-use compile cost.
-            for open_before in range(width):
-                compile_open_before(open_before)
 
             def _first_path_open_len(cache: MLXInferenceCache) -> int:
                 for layer in cache.layers:
@@ -2353,10 +2350,16 @@ class MLXBitNet(nn.Module):
                 open_before = int(open_before)
                 if open_before < 0 or open_before >= width:
                     return self._inference_step(tokens, cache)
-                fn = compile_open_before(open_before)
-                flat_in = self._flatten_inference_cache(cache)
-                result = fn(tokens, *flat_in)
-                mx.eval(result)
+                try:
+                    fn = compile_open_before(open_before)
+                    flat_in = self._flatten_inference_cache(cache)
+                    result = fn(tokens, *flat_in)
+                    mx.eval(result)
+                except Exception:
+                    self._compiled_inference_step = None
+                    self._compiled_by_open_len = None
+                    self.pin_inference_weights(prefer_packed=True)
+                    return self._inference_step(tokens, cache)
                 hidden = result[0]
                 self._apply_flat_to_inference_cache(cache, list(result[1:]))
                 cache.position += 1

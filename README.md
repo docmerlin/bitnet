@@ -294,9 +294,11 @@ Newton-Schulz iteration with cheaper **triangular whitening** surrogate: per
 pass it row-normalizes momentum, forms row Gram `G = Q Qᵀ`, takes lower
 triangle `T = tril(G)` as Cholesky-like factor, applies forward triangular
 solve `Q ← T⁻¹ Q`, re-normalizes. Single pass (MUD1, default) costs one `k×k`
-triangular solve where `k = min(rows, cols)` — ~12× fewer FLOPs than Muon — and
-map converges quadratically toward row-orthonormal `Q Qᵀ ≈ I_k` as passes
-increase. Matrix update scaled by `0.2·√(max(rows, cols))`.
+triangular solve under full-matrix whitening, where `k = min(rows, cols)`.
+New runs instead batch independent 64-row solves, reducing large-matrix cost;
+old checkpoints without block metadata retain full-matrix whitening. Additional
+passes move each block toward row-orthonormality. Matrix update scaled by
+`0.2·√(max(rows, cols))`.
 
 **C-** prefix is cautious-optimizer mod from *Cautious Optimizers: Improving
 Training with One Line of Code*, which zeroes any per-coordinate update whose
@@ -331,6 +333,7 @@ Relevant flags:
 - `--mud-momentum` — MUD heavy-ball momentum (Nesterov lookahead)
 - `--mud-passes` — triangular-whitening passes `p` (default `1` = MUD1; `2` for
   harder landscapes)
+- `--mud-block-size` — independent whitening rows per block (default `64`)
 - `--no-cautious` — drop cautious mask (plain MUD + Lion)
 - `--no-optimizer-8bit` — keep C-Lion fallback momentum full precision
 

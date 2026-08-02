@@ -57,5 +57,27 @@ def test_precomputed_bias_matches_fallback() -> bool:
     return True
 
 
+def test_qkv_and_path_share_input_preparation(monkeypatch) -> None:
+    torch.manual_seed(1)
+    attn = InfiniAttention(_config()).eval()
+    calls = {"qkv": 0, "path": 0}
+    qkv_prepare = attn.qkv.prepare_input
+    path_prepare = attn.path_w_down.prepare_input
+
+    def prepare_qkv(x):
+        calls["qkv"] += 1
+        return qkv_prepare(x)
+
+    def prepare_path(x):
+        calls["path"] += 1
+        return path_prepare(x)
+
+    monkeypatch.setattr(attn.qkv, "prepare_input", prepare_qkv)
+    monkeypatch.setattr(attn.path_w_down, "prepare_input", prepare_path)
+    attn(torch.randn(1, 8, attn.hidden_size), memory_safe=False)
+
+    assert calls == {"qkv": 1, "path": 0}
+
+
 if __name__ == "__main__":
     test_precomputed_bias_matches_fallback()

@@ -249,9 +249,15 @@ class InfiniAttention(nn.Module):
         weights = torch.softmax(logits.float(), dim=-1).to(dtype=v.dtype)
         return torch.matmul(weights, selected_v)
 
-    def _path_vectors(self, x: torch.Tensor, segment_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    def _path_vectors(
+        self,
+        x: torch.Tensor,
+        segment_ids: Optional[torch.Tensor],
+        prepared_x: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Paper PaTH low-rank projection, causal width-3 depthwise conv, L2 norm."""
-        projected = self.path_w_up(self.path_w_down(x))
+        down = self.path_w_down(x) if prepared_x is None else self.path_w_down.forward_prepared(prepared_x)
+        projected = self.path_w_up(down)
         weight = self.path_conv_weight.to(dtype=projected.dtype)
         convolved = projected * weight[:, 2]
         for offset, kernel_index in ((1, 1), (2, 0)):
@@ -346,20 +352,56 @@ class InfiniAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         segment_ids: Optional[torch.Tensor],
         update_memory: bool,
+        memory_safe: Optional[bool] = None,
     ) -> torch.Tensor:
-        chunks = []
-        memory_safe = True
-        if attention_mask is not None:
-            memory_safe = memory_safe and attention_mask.ndim == 2 and bool(attention_mask.all())
-        if segment_ids is not None:
-            memory_safe = memory_safe and bool((segment_ids == segment_ids[:, :1]).all())
+        if memory_safe is None:
+            memory_safe = True
+            if attention_mask is not None:
+                memory_safe = memory_safe and attention_mask.ndim == 2 and bool(attention_mask.all())
+            if segment_ids is not None:
+                memory_safe = memory_safe and bool((segment_ids == segment_ids[:, :1]).all())
+
+        ranges = list(self._chunk_ranges(q.size(2)))
+        chunk_len = ranges[0][1] - ranges[0][0]
+        regular_chunks = all(
+            start == index * chunk_len and end == start + chunk_len
+            for index, (start, end) in enumerate(ranges)
+        )
+        if not memory_safe and attention_mask is None and regular_chunks:
+            batch_size, heads, seq_len, dim = q.shape
+            num_chunks = len(ranges)
+
+            def batch_chunks(tensor: torch.Tensor) -> torch.Tensor:
+                return tensor.reshape(batch_size, heads, num_chunks, chunk_len, dim).transpose(1, 2).reshape(
+                    batch_size * num_chunks, heads, chunk_len, dim
+                )
+
+            chunk_mask = None
+            if segment_ids is not None:
+                ids = segment_ids.reshape(batch_size, num_chunks, chunk_len)
+                chunk_mask = ids.unsqueeze(-1).eq(ids.unsqueeze(-2)).reshape(
+                    batch_size * num_chunks, chunk_len, chunk_len
+                )
+            batched = self._path_chunk(
+                batch_chunks(q),
+                batch_chunks(k),
+                batch_chunks(v),
+                w.reshape(batch_size * num_chunks, chunk_len, heads, dim),
+                beta.reshape(batch_size * num_chunks, chunk_len, heads),
+                log_forget.reshape(batch_size * num_chunks, chunk_len, heads),
+                chunk_mask,
+            )
+            return batched.reshape(batch_size, num_chunks, heads, chunk_len, dim).transpose(1, 2).reshape(
+                batch_size, heads, seq_len, dim
+            )
 
         # Carry M,z through path windows (BPTT within the forward; detach on store).
         memory_m = self.memory_m
         memory_z = self.memory_z
         memory_initialized = self.memory_initialized
 
-        for start, end in self._chunk_ranges(q.size(2)):
+        chunks = []
+        for start, end in ranges:
             chunk_mask = self._slice_mask(attention_mask, start, end) if attention_mask is not None else None
             if segment_ids is not None:
                 ids = segment_ids[:, start:end]
@@ -427,10 +469,14 @@ class InfiniAttention(nn.Module):
         query_valid: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
         update_memory: Optional[bool] = None,
+        memory_safe: Optional[bool] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         self._ensure_memory_batch(batch_size)
-        qkv = self.qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        prepared_x = self.qkv.prepare_input(x)
+        qkv = self.qkv.forward_prepared(prepared_x).view(
+            batch_size, seq_len, 3, self.num_heads, self.head_dim
+        )
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -439,14 +485,20 @@ class InfiniAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        w = self._path_vectors(x, segment_ids)
+        same_preparation = (
+            self.qkv.hadamard_size == self.path_w_down.hadamard_size
+            and self.qkv.enable_activation_quantization == self.path_w_down.enable_activation_quantization
+            and self.qkv.activation_bits == self.path_w_down.activation_bits
+            and self.qkv.activation_quantization_mix == self.path_w_down.activation_quantization_mix
+        )
+        w = self._path_vectors(x, segment_ids, prepared_x if same_preparation else None)
         beta = 2.0 * torch.sigmoid(self.path_beta(x).float())
         log_forget = F.logsigmoid(self.path_forget(x).float())
         local_mask = attn_bias if attn_bias is not None else attention_mask
         requested = self.update_memory_buffers if update_memory is None else bool(update_memory)
         do_update = requested and self.update_memory_buffers
         context = self._local_path_attention(
-            q, k, v, w, beta, log_forget, local_mask, segment_ids, do_update
+            q, k, v, w, beta, log_forget, local_mask, segment_ids, do_update, memory_safe
         )
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         output = self.o_proj(context)

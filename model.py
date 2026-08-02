@@ -19,6 +19,7 @@ from torch.utils.checkpoint import checkpoint
 
 from config import TernaryConfig
 from layers.attn_res import AttnResStream
+from layers.h_bitlinear import reuse_effective_weights
 from layers.hybrid_block import HybridTransformerBlock
 from layers.loop_mhc import LoopHyperConnection
 
@@ -153,6 +154,18 @@ class BitNetDeep(nn.Module):
                 )
         raise RuntimeError("kimi AttnRes requires at least one hybrid layer with depth mixes")
 
+    @staticmethod
+    def _memory_is_safe(
+        attention_mask: Optional[torch.Tensor],
+        segment_ids: Optional[torch.Tensor],
+    ) -> bool:
+        safe = attention_mask is None or (
+            attention_mask.ndim == 2 and bool(attention_mask.all())
+        )
+        if safe and segment_ids is not None:
+            safe = bool((segment_ids == segment_ids[:, :1]).all())
+        return safe
+
     def _run_layer(
         self,
         layer: HybridTransformerBlock,
@@ -162,6 +175,7 @@ class BitNetDeep(nn.Module):
         input_ids: torch.Tensor,
         *,
         update_memory: Optional[bool] = None,
+        memory_safe: Optional[bool] = None,
     ) -> Union[torch.Tensor, AttnResStream]:
         """Run one block. Checkpoint when enabled and granularity is ``layer``."""
         do_ckpt = (
@@ -182,6 +196,7 @@ class BitNetDeep(nn.Module):
                     segment_ids=segment_ids,
                     input_ids=input_ids,
                     update_memory=update_memory,
+                    memory_safe=memory_safe,
                 ),
                 state,
                 use_reentrant=False,
@@ -198,6 +213,7 @@ class BitNetDeep(nn.Module):
             segment_ids=segment_ids,
             input_ids=input_ids,
             update_memory=update_memory,
+            memory_safe=memory_safe,
         )
 
     def _run_stack(
@@ -209,6 +225,7 @@ class BitNetDeep(nn.Module):
         input_ids: torch.Tensor,
         *,
         update_memory: Optional[bool] = None,
+        memory_safe: Optional[bool] = None,
     ) -> Union[torch.Tensor, AttnResStream]:
         """Run a sequence of blocks without per-layer checkpointing."""
         for layer in layers:
@@ -218,6 +235,7 @@ class BitNetDeep(nn.Module):
                 segment_ids=segment_ids,
                 input_ids=input_ids,
                 update_memory=update_memory,
+                memory_safe=memory_safe,
             )
         return state
 
@@ -230,6 +248,7 @@ class BitNetDeep(nn.Module):
         input_ids: torch.Tensor,
         *,
         update_memory: bool,
+        memory_safe: bool,
     ) -> torch.Tensor:
         """One full middle-stack pass; optional loop-granularity checkpoint.
 
@@ -253,6 +272,7 @@ class BitNetDeep(nn.Module):
                     segment_ids,
                     input_ids,
                     update_memory=update_memory,
+                    memory_safe=memory_safe,
                 )
             return stream.hidden()
 
@@ -265,6 +285,7 @@ class BitNetDeep(nn.Module):
                     segment_ids,
                     input_ids,
                     update_memory=update_memory,
+                    memory_safe=memory_safe,
                 )
             return x
 
@@ -278,6 +299,7 @@ class BitNetDeep(nn.Module):
             segment_ids=segment_ids,
             input_ids=input_ids,
             update_memory=update_memory,
+            memory_safe=memory_safe,
         ) -> torch.Tensor:
             return self._run_stack(
                 layers_list,
@@ -286,6 +308,7 @@ class BitNetDeep(nn.Module):
                 segment_ids,
                 input_ids,
                 update_memory=update_memory,
+                memory_safe=memory_safe,
             )
 
         return checkpoint(
@@ -306,6 +329,7 @@ class BitNetDeep(nn.Module):
         segment_ids: Optional[torch.Tensor] = None,
         return_mtp: bool = False,
         num_loops: Optional[int] = None,
+        memory_safe: Optional[bool] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, list[torch.Tensor]]]:
         if reset_memory:
             for layer in self.layers:
@@ -313,6 +337,8 @@ class BitNetDeep(nn.Module):
 
         x = self.embed_tokens(input_ids)
         x = self.subln(x)
+        if memory_safe is None:
+            memory_safe = self._memory_is_safe(attention_mask, segment_ids)
 
         p = self.num_prelude
         r = self.num_recurrent
@@ -325,44 +351,74 @@ class BitNetDeep(nn.Module):
         if kimi:
             stream = self._new_stream(x)
             for layer in self.layers[:p]:
-                stream = self._run_layer(layer, stream, attention_mask, segment_ids, input_ids)
+                stream = self._run_layer(
+                    layer,
+                    stream,
+                    attention_mask,
+                    segment_ids,
+                    input_ids,
+                    memory_safe=memory_safe,
+                )
             x = stream.hidden()
         else:
             for layer in self.layers[:p]:
-                x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
+                x = self._run_layer(
+                    layer,
+                    x,
+                    attention_mask,
+                    segment_ids,
+                    input_ids,
+                    memory_safe=memory_safe,
+                )
 
         # Recurrent × R + Hyperloop HC. Infini B: read all loops, write last only.
         # Each loop iteration **resets** AttnRes depth history (see module docstring).
         recurrent = self.layers[p : p + r]
         if r > 0:
             y = self.loop_hc.expand(x)  # (B, T, n=4, C)
-            for loop_i in range(loops):
-                write_memory = loop_i == loops - 1
-                x_in, _h_pre, h_post, h_res = self.loop_hc.project_in(y)
-                x_in = self._run_recurrent_iteration(
-                    recurrent,
-                    x_in,
-                    attention_mask,
-                    segment_ids,
-                    input_ids,
-                    update_memory=write_memory,
-                )
-                e_l = self.loop_hc.loop_embedding(
-                    loop_i, device=x_in.device, dtype=x_in.dtype
-                )
-                u = x_in + e_l
-                y = self.loop_hc.write_back(y, u, h_post, h_res)
+            with reuse_effective_weights():
+                for loop_i in range(loops):
+                    write_memory = loop_i == loops - 1
+                    x_in, _h_pre, h_post, h_res = self.loop_hc.project_in(y)
+                    x_in = self._run_recurrent_iteration(
+                        recurrent,
+                        x_in,
+                        attention_mask,
+                        segment_ids,
+                        input_ids,
+                        update_memory=write_memory,
+                        memory_safe=memory_safe,
+                    )
+                    e_l = self.loop_hc.loop_embedding(
+                        loop_i, device=x_in.device, dtype=x_in.dtype
+                    )
+                    u = x_in + e_l
+                    y = self.loop_hc.write_back(y, u, h_post, h_res)
             x = self.loop_hc.fold(y)
 
         # Coda once (fresh AttnRes segment after HC fold).
         if kimi:
             stream = self._new_stream(x)
             for layer in self.layers[p + r :]:
-                stream = self._run_layer(layer, stream, attention_mask, segment_ids, input_ids)
+                stream = self._run_layer(
+                    layer,
+                    stream,
+                    attention_mask,
+                    segment_ids,
+                    input_ids,
+                    memory_safe=memory_safe,
+                )
             x = stream.hidden()
         else:
             for layer in self.layers[p + r :]:
-                x = self._run_layer(layer, x, attention_mask, segment_ids, input_ids)
+                x = self._run_layer(
+                    layer,
+                    x,
+                    attention_mask,
+                    segment_ids,
+                    input_ids,
+                    memory_safe=memory_safe,
+                )
 
         x = self.norm(x)
         logits = self.lm_head(x)

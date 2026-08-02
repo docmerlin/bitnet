@@ -4,7 +4,7 @@
 import torch
 
 from config import TernaryConfig
-from layers.h_bitlinear import HBitLinear, get_hadamard_tensor
+from layers.h_bitlinear import HBitLinear, get_hadamard_tensor, reuse_effective_weights
 
 
 def test_hadamard_tensor_is_shared() -> bool:
@@ -36,6 +36,36 @@ def test_hadamard_tensor_is_shared() -> bool:
 
     print("HBitLinear shared Hadamard cache tests passed")
     return True
+
+
+def test_effective_weight_reuse_preserves_gradients() -> None:
+    torch.manual_seed(1)
+    cfg = TernaryConfig(
+        vocab_size=32,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        head_dim=4,
+        intermediate_size=16,
+        use_hadamard=False,
+        use_4bit_activations=False,
+    )
+    reference = HBitLinear(8, 8, config=cfg)
+    cached = HBitLinear(8, 8, config=cfg)
+    cached.load_state_dict(reference.state_dict())
+    x = torch.randn(2, 8)
+    reference_x = x.clone().requires_grad_()
+    cached_x = x.clone().requires_grad_()
+
+    reference_output = reference(reference_x) + reference(reference_x)
+    with reuse_effective_weights():
+        cached_output = cached(cached_x) + cached(cached_x)
+    reference_output.sum().backward()
+    cached_output.sum().backward()
+
+    assert torch.equal(reference_output, cached_output)
+    assert torch.equal(reference_x.grad, cached_x.grad)
+    assert torch.equal(reference.weight.grad, cached.weight.grad)
 
 
 if __name__ == "__main__":

@@ -151,6 +151,7 @@ def create_optimizer(model: nn.Module, args: argparse.Namespace) -> Optimizer:
         weight_decay=args.weight_decay,
         momentum=args.mud_momentum,
         passes=args.mud_passes,
+        block_size=args.mud_block_size,
         betas=(args.lion_beta1, args.lion_beta2),
         eight_bit=not args.no_optimizer_8bit,
     )

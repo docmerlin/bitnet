@@ -7,12 +7,11 @@ This implements the optimizer plan documented in the README:
   triangular whitening surrogate rather than Muon's polar / Newton-Schulz iteration:
   each pass row-normalizes the matrix, forms the row Gram ``G = Q Qᵀ``, takes its
   lower triangle ``T = tril(G)`` as a cheap Cholesky-like factor, applies a forward
-  triangular solve ``Q <- T⁻¹ Q``, and re-normalizes. One pass (MUD1) is the default
-  and costs a single ``k×k`` triangular solve (k = the smaller matrix dimension) —
-  roughly 12x fewer FLOPs than Muon's repeated full matmuls. The ``C-`` prefix is the
-  cautious-optimizer mask from *Cautious Optimizers: Improving Training with One Line
-  of Code*, which zeroes any per-coordinate update whose sign disagrees with the
-  current gradient and rescales the survivors to preserve the average step size.
+  triangular solve ``Q <- T⁻¹ Q``, and re-normalizes. New runs batch independent
+  64-row blocks; ``block_size=None`` keeps full-matrix whitening. The ``C-`` prefix
+  is the cautious-optimizer mask from *Cautious Optimizers: Improving Training with
+  One Line of Code*, which zeroes any per-coordinate update whose sign disagrees
+  with the current gradient and rescales the survivors to preserve average step size.
 
 - **8-bit C-Lion** for every other parameter (embeddings, norms, biases, scalar
   gates, AttnRes scales). This is the cautious variant of Lion; its single momentum
@@ -36,13 +35,18 @@ from torch.optim.optimizer import Optimizer
 _QUANT_BLOCK_SIZE = 2048
 
 
-def mud_decorrelate(update: torch.Tensor, passes: int = 1, eps: float = 1e-8) -> torch.Tensor:
+def mud_decorrelate(
+    update: torch.Tensor,
+    passes: int = 1,
+    eps: float = 1e-8,
+    block_size: int | None = None,
+) -> torch.Tensor:
     """MUD triangular whitening of a momentum matrix (Algorithm 2 of the MUD paper).
 
-    Decorrelates ``update`` toward a row-orthonormal matrix (``Q Qᵀ ≈ I_k`` along the
-    smaller dimension ``k = min(n, m)``) using a lower-triangular Gram surrogate and a
-    forward triangular solve instead of Muon's polar iteration. Each of ``passes``
-    iterations:
+    Decorrelates ``update`` toward row-orthonormal blocks using a lower-triangular
+    Gram surrogate and a forward triangular solve instead of Muon's polar iteration.
+    ``block_size=None`` whitens the full smaller dimension ``k = min(n, m)``; a block
+    size batches independent row groups. Each of ``passes`` iterations:
 
     1. row-normalize ``Q = diag((r + ε)⁻¹) M``     (``r`` = per-row L2 norms),
     2. form the row Gram ``G = Q Qᵀ``,
@@ -57,16 +61,26 @@ def mud_decorrelate(update: torch.Tensor, passes: int = 1, eps: float = 1e-8) ->
         raise ValueError("mud_decorrelate expects a 2D matrix")
     if passes < 1:
         raise ValueError("passes must be >= 1")
+    if block_size is not None and block_size < 1:
+        raise ValueError("block_size must be positive")
 
     q = update.to(torch.float32)
     transposed = q.size(0) > q.size(1)
     if transposed:
         q = q.t()  # now k x d with k = min(n, m) <= d
 
+    rows = q.size(0)
+    blocked = block_size is not None and rows > block_size
+    if blocked:
+        pad = (-rows) % block_size
+        if pad:
+            q = torch.cat((q, q.new_zeros(pad, q.size(1))))
+        q = q.reshape(-1, block_size, q.size(1))
+
     for _ in range(passes):
-        row_norm = q.norm(dim=1, keepdim=True)
+        row_norm = q.norm(dim=-1, keepdim=True)
         q = q / (row_norm + eps)
-        gram = q @ q.t()
+        gram = q @ q.transpose(-1, -2)
         tri = torch.tril(gram)
         # Guard the triangular solve: an all-zero momentum row normalizes to zero,
         # leaving a zero on the Gram diagonal that would make the solve divide by
@@ -74,9 +88,11 @@ def mud_decorrelate(update: torch.Tensor, passes: int = 1, eps: float = 1e-8) ->
         # so the diagonal is otherwise ~1, making this negligible).
         tri.diagonal(dim1=-2, dim2=-1).add_(eps)
         q = torch.linalg.solve_triangular(tri, q, upper=False)
-        row_norm = q.norm(dim=1, keepdim=True)
+        row_norm = q.norm(dim=-1, keepdim=True)
         q = q / (row_norm + eps)
 
+    if blocked:
+        q = q.reshape(-1, q.size(-1))[:rows]
     if transposed:
         q = q.t()
     return q.to(update.dtype)
@@ -166,6 +182,7 @@ class CMUD(Optimizer):
         momentum: float = 0.95,
         nesterov: bool = True,
         passes: int = 1,
+        block_size: int | None = 64,
         betas: Tuple[float, float] = (0.95, 0.98),
         weight_decay: float = 0.0,
         eight_bit: bool = True,
@@ -178,12 +195,15 @@ class CMUD(Optimizer):
             raise ValueError("C-Lion betas must be in [0, 1)")
         if passes < 1:
             raise ValueError("passes must be >= 1")
+        if block_size is not None and block_size < 1:
+            raise ValueError("block_size must be positive")
 
         defaults = {
             "lr": lr,
             "momentum": momentum,
             "nesterov": nesterov,
             "passes": passes,
+            "block_size": block_size,
             "betas": betas,
             "weight_decay": weight_decay,
             "eight_bit": eight_bit,
@@ -211,6 +231,7 @@ class CMUD(Optimizer):
         momentum = group["momentum"]
         nesterov = group["nesterov"]
         passes = group["passes"]
+        block_size = group.get("block_size")
         weight_decay = group["weight_decay"]
 
         for param in group["params"]:
@@ -229,7 +250,7 @@ class CMUD(Optimizer):
             buffer.mul_(momentum).add_(grad)
 
             direction = grad.add(buffer, alpha=momentum) if nesterov else buffer
-            update = mud_decorrelate(direction, passes=passes)
+            update = mud_decorrelate(direction, passes=passes, block_size=block_size)
             # s(W) in the MUD weight update (Eq. 10) is left generic in the body
             # ("shape-dependent scaling"); the concrete 0.2 * sqrt(max(n, m)) is the
             # Appendix A code constant, from Liu et al. 2025 (Muon RMS-matching scale).
@@ -308,6 +329,7 @@ def build_cmud(
     weight_decay: float,
     momentum: float = 0.95,
     passes: int = 1,
+    block_size: int | None = 64,
     betas: Tuple[float, float] = (0.95, 0.98),
     eight_bit: bool = True,
 ) -> CMUD:
@@ -332,6 +354,7 @@ def build_cmud(
         lr=lr,
         momentum=momentum,
         passes=passes,
+        block_size=block_size,
         betas=betas,
         weight_decay=weight_decay,
         eight_bit=eight_bit,

@@ -49,6 +49,63 @@ def build_model() -> BitNetDeep:
     return BitNetDeep(config)
 
 
+def test_model_computes_memory_safety_once_for_all_blocks(monkeypatch) -> None:
+    model = build_model().eval()
+    seen = []
+    original = InfiniAttention._local_path_attention
+
+    def wrapped(
+        self,
+        q,
+        k,
+        v,
+        w,
+        beta,
+        log_forget,
+        attention_mask,
+        segment_ids,
+        update_memory,
+        memory_safe=None,
+    ):
+        seen.append(memory_safe)
+        return original(
+            self,
+            q,
+            k,
+            v,
+            w,
+            beta,
+            log_forget,
+            attention_mask,
+            segment_ids,
+            update_memory,
+            memory_safe,
+        )
+
+    monkeypatch.setattr(InfiniAttention, "_local_path_attention", wrapped)
+    tokens = torch.randint(0, model.config.vocab_size, (1, 8))
+    segment_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]])
+    with torch.no_grad():
+        model(tokens, segment_ids=segment_ids)
+
+    assert seen == [False] * len(model.layers)
+
+
+def test_model_accepts_precomputed_memory_safety(monkeypatch) -> None:
+    model = build_model().eval()
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("device memory-safety reduction should be skipped")
+
+    monkeypatch.setattr(model, "_memory_is_safe", unexpected)
+    tokens = torch.randint(0, model.config.vocab_size, (1, 8))
+    segment_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]])
+    with torch.no_grad():
+        logits = model(tokens, segment_ids=segment_ids, memory_safe=False)
+
+    assert logits.shape == (1, 8, model.config.vocab_size)
+
+
 def test_infini_attention_memory_updates() -> bool:
     torch.manual_seed(0)
     block = build_block()
