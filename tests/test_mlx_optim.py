@@ -9,7 +9,16 @@ mx = pytest.importorskip("mlx.core")
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_optim import CMUD, CLion, MUD, cautious_mask, dequantize_blockwise, mud_decorrelate, quantize_blockwise
+from mlx_optim import (
+    CMUD,
+    CLion,
+    MUD,
+    _fused_mud_momentum,
+    cautious_mask,
+    dequantize_blockwise,
+    mud_decorrelate,
+    quantize_blockwise,
+)
 from optim import cautious_mask as torch_cautious_mask
 from optim import mud_decorrelate as torch_mud_decorrelate
 
@@ -93,6 +102,22 @@ def test_mlx_mud_block_quantization() -> None:
     assert "momentum_buffer" not in state
     relative_error = mx.mean(mx.abs(restored - gradient.astype(mx.float32))) / mx.mean(mx.abs(gradient))
     assert relative_error.item() < 0.02
+
+
+@pytest.mark.parametrize("momentum", [0.0, 0.5, 0.95, -0.25, 1.0])
+def test_mlx_fused_mud_momentum_matches_native_operations(momentum: float) -> None:
+    gradient = mx.random.normal((50, 100))
+    previous_q, previous_scale = quantize_blockwise(mx.random.normal(gradient.shape))
+    previous = dequantize_blockwise(previous_q, previous_scale, gradient.shape)
+    expected_momentum = momentum * previous + gradient
+    expected = (
+        gradient + momentum * expected_momentum,
+        *quantize_blockwise(expected_momentum),
+    )
+    actual = _fused_mud_momentum(gradient, previous_q, previous_scale, momentum)
+    mx.eval(expected, actual)
+
+    assert all(mx.array_equal(left, right).item() for left, right in zip(expected, actual))
 
 
 def test_mlx_cmud_reduces_loss() -> None:

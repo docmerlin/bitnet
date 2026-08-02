@@ -60,6 +60,50 @@ _BATCHED_RECTANGULAR_LOWER_SOLVE = mx.fast.metal_kernel(
     """,
 )
 
+_FUSED_MUD_MOMENTUM = mx.fast.metal_kernel(
+    name="fused_mud_momentum",
+    input_names=["gradient", "previous_q", "previous_scale", "momentum_value"],
+    output_names=["direction", "next_q", "next_scale"],
+    source=r"""
+        uint lane = thread_position_in_threadgroup.x;
+        uint block = thread_position_in_grid.y;
+        uint size = gradient_shape[0] * gradient_shape[1];
+        float momentum = float(momentum_value);
+        ulong base = ulong(block) * BLOCK_SIZE;
+
+        threadgroup float values[BLOCK_SIZE];
+        threadgroup float maxima[256];
+        float local_max = 0.0f;
+        for (uint offset = lane; offset < BLOCK_SIZE; offset += 256) {
+            ulong index = base + offset;
+            // Volatile preserves separate-operation rounding instead of contracting
+            // into FMAs, keeping optimizer state bit-identical to the native path.
+            volatile float previous = index < size
+                ? float(previous_q[index]) * previous_scale[block]
+                : 0.0f;
+            volatile float value = momentum * previous;
+            value = index < size ? value + float(gradient[index]) : 0.0f;
+            values[offset] = value;
+            local_max = max(local_max, abs(value));
+        }
+        maxima[lane] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (lane < stride) maxima[lane] = max(maxima[lane], maxima[lane + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float scale = max(maxima[0], 1e-8f) / 127.0f;
+        if (lane == 0) next_scale[block] = scale;
+        for (uint offset = lane; offset < BLOCK_SIZE; offset += 256) {
+            ulong index = base + offset;
+            float value = values[offset];
+            next_q[index] = char(clamp(rint(value / scale), -127.0f, 127.0f));
+            volatile float decayed = momentum * value;
+            if (index < size) direction[index] = float(gradient[index]) + decayed;
+        }
+    """,
+)
+
 
 def lower_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
     if rhs.ndim == 3:
@@ -188,6 +232,23 @@ def dequantize_blockwise(quantized: mx.array, scale: mx.array, shape: tuple[int,
     return (quantized.astype(mx.float32) * scale[:, None]).reshape(-1)[:size].reshape(shape)
 
 
+def _fused_mud_momentum(
+    gradient: mx.array,
+    previous_q: mx.array,
+    previous_scale: mx.array,
+    momentum: float,
+):
+    blocks = previous_q.shape[0]
+    return _FUSED_MUD_MOMENTUM(
+        inputs=[gradient, previous_q, previous_scale, mx.array(momentum, dtype=mx.float32)],
+        template=[("BLOCK_SIZE", QUANT_BLOCK_SIZE)],
+        grid=(256, blocks, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[gradient.shape, previous_q.shape, previous_scale.shape],
+        output_dtypes=[mx.float32, mx.int8, mx.float32],
+    )
+
+
 class MUD(optim.Optimizer):
     def __init__(
         self,
@@ -227,7 +288,16 @@ class MUD(optim.Optimizer):
         parameter_dtype = parameter.dtype
         gradient = gradient.astype(mx.float32)
         use_eight_bit = self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE
-        if "momentum_buffer_q" in state:
+        fused_state = None
+        if use_eight_bit and "momentum_buffer_q" in state:
+            direction, next_q, next_scale = _fused_mud_momentum(
+                gradient,
+                state["momentum_buffer_q"],
+                state["momentum_buffer_scale"],
+                self.momentum,
+            )
+            fused_state = next_q, next_scale
+        elif "momentum_buffer_q" in state:
             previous = dequantize_blockwise(
                 state["momentum_buffer_q"],
                 state["momentum_buffer_scale"],
@@ -237,14 +307,18 @@ class MUD(optim.Optimizer):
             previous = state["momentum_buffer"]
         else:
             previous = mx.zeros(parameter.shape, dtype=mx.float32)
-        momentum_buffer = self.momentum * previous + gradient
-        direction = gradient + self.momentum * momentum_buffer
+        if fused_state is None:
+            momentum_buffer = self.momentum * previous + gradient
+            direction = gradient + self.momentum * momentum_buffer
         update = mud_decorrelate(
             direction, self.passes, block_size=self.block_size, neuron_norm=self.neuron_norm
         )
         update = update * (0.2 * math.sqrt(max(parameter.shape)))
         update = cautious_mask(update, gradient)
-        if use_eight_bit:
+        if fused_state is not None:
+            state["momentum_buffer_q"], state["momentum_buffer_scale"] = fused_state
+            state.pop("momentum_buffer", None)
+        elif use_eight_bit:
             state["momentum_buffer_q"], state["momentum_buffer_scale"] = quantize_blockwise(momentum_buffer)
             state.pop("momentum_buffer", None)
         else:
