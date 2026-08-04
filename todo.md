@@ -560,12 +560,12 @@ Superseded detail from the earlier pass:
   running the global model less, and coarser patches pay for it in quality. Measure
   `GenerationStats.bytes_per_global_pass` and `acceptance_rate` on the trained model rather
   than assuming these projections hold.
-- [ ] **Add a KV cache to the BLT decode path.** `blt/generate.py` re-runs the encoder and
-  decoder over the whole prefix for every drafted byte, so it is O(L²) and the BLT-S
-  projections above are ceilings it cannot currently reach. Also batch size 1 only:
-  verification accepts a different count per row, so batching needs ragged bookkeeping.
-  Both matter before any wall-clock claim — at ~86M parameters generation is launch-bound
-  rather than memory-bandwidth-bound, so the paper's bandwidth metric may not translate.
+- [x] **Add a KV cache to the BLT MLX decode path.** Encoder/decoder self-attn `prefill` /
+  `extend` with K/V cache; draft loop keeps caches across bytes and invalidates after each
+  global pass. Hash n-grams still embed over the full prefix (lone-tail embed was wrong).
+  Interleaved A/B on h256 / 1+4+4, prompt 32 + 64 new, both modes pinned, M1 Max: no-cache
+  109 B/s vs cache 154–157 B/s (**~1.43×**). Byte-identical to torch generate. Batch-1 still;
+  torch `blt/generate.py` not yet ported.
 - [ ] **Deferred: BLT-D / BLT-DV block diffusion.** Same paper, §3 and §5.2. Much faster than
   BLT-S (up to 86% bandwidth reduction at block 16) but requires retraining with a block
   diffusion objective and costs real quality: at 1B, best-setting D-8 loses 14% BLEU on
@@ -635,8 +635,7 @@ regressions can be reverted.**
 
 **Generation:**
 
-- [ ] **KV cache on BLT decode** (same item as above under BLT generation performance).
-  Highest remaining inference-algorithm win; blocks realistic BLT-S measurement.
+- [x] **KV cache on BLT MLX decode** (see BLT generation performance). ~1.43× on top of pin.
 - [ ] **Generate-only FFN simplification** for BitNet (skip or fuse mid when quality allows);
   scale Infini/PaTH geometry for probe models.
 

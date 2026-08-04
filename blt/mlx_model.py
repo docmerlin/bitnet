@@ -93,6 +93,32 @@ class MLXLocalEncoder(nn.Module):
             hidden = mx.where(attention_mask[..., None], hidden, 0.0)
         return hidden
 
+    def encode_bytes_prefill(
+        self, byte_embeddings: mx.array
+    ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
+        """Generation prefill: full-prefix encode + per-block self-attn K/V."""
+        hidden = byte_embeddings
+        caches: list[tuple[mx.array, mx.array]] = []
+        for block in self.blocks:
+            hidden, cache = block.prefill(hidden)
+            caches.append(cache)
+        return self.output_norm(hidden), caches
+
+    def encode_bytes_extend(
+        self,
+        byte_embeddings: mx.array,
+        caches: list[tuple[mx.array, mx.array]],
+        *,
+        offset: int,
+    ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
+        """Generation step: encode only new byte positions against cached K/V."""
+        hidden = byte_embeddings
+        new_caches: list[tuple[mx.array, mx.array]] = []
+        for block, cache in zip(self.blocks, caches):
+            hidden, cache = block.extend(hidden, cache, offset=offset)
+            new_caches.append(cache)
+        return self.output_norm(hidden), new_caches
+
     def __call__(
         self,
         byte_embeddings: mx.array,
@@ -233,6 +259,75 @@ class MLXLocalDecoder(nn.Module):
         if byte_mask is not None:
             hidden = mx.where(byte_mask[..., None], hidden, 0.0)
         return hidden
+
+
+    def _prepare_latents(self, patch_states: mx.array) -> mx.array:
+        latent = self.patch_state_proj(patch_states) if self.patch_state_proj is not None else patch_states
+        if self.cross_attn_k > 1:
+            batch_size, num_patches = patch_states.shape[0], patch_states.shape[1]
+            latent = latent.reshape(batch_size, num_patches * self.cross_attn_k, -1)
+        return latent
+
+    def prefill(
+        self,
+        byte_states: mx.array,
+        patch_states: mx.array,
+        patch_ids: mx.array,
+    ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
+        """Full-prefix decoder for generation; returns last-pos-ready state + self-attn caches."""
+        hidden = self.byte_state_proj(byte_states) if self.byte_state_proj is not None else byte_states
+        latent = self._prepare_latents(patch_states)
+        cross_valid = patch_ids >= 0
+        cross_mask = None
+        if self.cross_attn_k > 1:
+            membership = patch_membership_mask(
+                mx.maximum(patch_ids, 0), patch_states.shape[1], patches_as_queries=False
+            )
+            cross_mask = mx.repeat(membership, self.cross_attn_k, axis=-1) & cross_valid[..., None]
+
+        caches: list[tuple[mx.array, mx.array]] = []
+        for cross_attn, block in zip(self.cross_attn_layers, self.blocks):
+            hidden = (
+                cross_attn(hidden, latent, mask=cross_mask)
+                if self.cross_attn_k > 1
+                else cross_attn(hidden, latent, patch_ids, valid=cross_valid)
+            )
+            hidden, cache = block.prefill(hidden)
+            caches.append(cache)
+        return self.output_norm(hidden), caches
+
+    def extend(
+        self,
+        byte_states: mx.array,
+        patch_states: mx.array,
+        patch_ids: mx.array,
+        caches: list[tuple[mx.array, mx.array]],
+        *,
+        offset: int,
+    ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
+        """Decode only new positions (typically one byte) with self-attn K/V cache."""
+        hidden = self.byte_state_proj(byte_states) if self.byte_state_proj is not None else byte_states
+        latent = self._prepare_latents(patch_states)
+        cross_valid = patch_ids >= 0
+        cross_mask = None
+        if self.cross_attn_k > 1:
+            membership = patch_membership_mask(
+                mx.maximum(patch_ids, 0), patch_states.shape[1], patches_as_queries=False
+            )
+            cross_mask = mx.repeat(membership, self.cross_attn_k, axis=-1) & cross_valid[..., None]
+
+        new_caches: list[tuple[mx.array, mx.array]] = []
+        for cross_attn, block, cache in zip(self.cross_attn_layers, self.blocks, caches):
+            # Cross-attn over frozen latents is pointwise in query length; run only
+            # on the new rows. For k=1 gather, only the new patch_ids matter.
+            hidden = (
+                cross_attn(hidden, latent, mask=cross_mask)
+                if self.cross_attn_k > 1
+                else cross_attn(hidden, latent, patch_ids, valid=cross_valid)
+            )
+            hidden, cache = block.extend(hidden, cache, offset=offset)
+            new_caches.append(cache)
+        return self.output_norm(hidden), new_caches
 
 
 class MLXTernaryBLTModel(nn.Module):

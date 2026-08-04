@@ -331,7 +331,7 @@ class MLXTernarySelfAttention(nn.Module):
         context = mx.concatenate([head_context[:, :, None], tail_context.transpose(0, 2, 1, 3, 4)], axis=2)
         return context.reshape(batch, heads, seq_len, head_dim)
 
-    def __call__(self, x: mx.array, attention_mask: mx.array | None = None) -> mx.array:
+    def _project_qkv(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         batch_size, seq_len, _ = x.shape
 
         def heads(t):
@@ -347,6 +347,11 @@ class MLXTernarySelfAttention(nn.Module):
             heads(layer(x) if prepared is None else layer.forward_prepared(prepared))
             for layer in (self.q_proj, self.k_proj, self.v_proj)
         )
+        return q, k, v
+
+    def __call__(self, x: mx.array, attention_mask: mx.array | None = None) -> mx.array:
+        batch_size, seq_len, _ = x.shape
+        q, k, v = self._project_qkv(x)
         cos, sin = build_rope_cache(seq_len, self.head_dim, theta=self.rope_theta)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -370,6 +375,55 @@ class MLXTernarySelfAttention(nn.Module):
             context = _attend(q, k, v, bias, valid)
         context = context.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.dim)
         return self.o_proj(context)
+
+    def prefill(self, x: mx.array) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+        """Full-prefix attention; return output and (K, V) cache for later extend.
+
+        Generation only, no padding mask. Matches ``__call__`` with mask=None.
+        """
+        batch_size, seq_len, _ = x.shape
+        q, k, v = self._project_qkv(x)
+        cos, sin = build_rope_cache(seq_len, self.head_dim, theta=self.rope_theta)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        if self._chunkable(seq_len, None):
+            context = self._windowed_attend(q, k, v)
+        else:
+            base_bias = (
+                causal_window_attention_bias(seq_len, self.local_window, dtype=q.dtype)
+                if self.causal
+                else None
+            )
+            context = _attend(q, k, v, base_bias, None)
+        context = context.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.dim)
+        return self.o_proj(context), (k, v)
+
+    def extend(
+        self, x: mx.array, cache: tuple[mx.array, mx.array], *, offset: int
+    ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+        """One (or few) new positions with prior K/V; returns last-chunk output + cache.
+
+        ``offset`` is the absolute position of the first new token (for RoPE).
+        Keys are past-or-self only, so a causal mask is unnecessary for the
+        extension query rows.
+        """
+        batch_size, new_len, _ = x.shape
+        q, k_new, v_new = self._project_qkv(x)
+        total = offset + new_len
+        cos, sin = build_rope_cache(total, self.head_dim, theta=self.rope_theta)
+        cos = cos[offset:total]
+        sin = sin[offset:total]
+        q = apply_rotary_emb(q, cos, sin)
+        k_new = apply_rotary_emb(k_new, cos, sin)
+        k = mx.concatenate([cache[0], k_new], axis=2)
+        v = mx.concatenate([cache[1], v_new], axis=2)
+        window = self.local_window
+        if window is not None and window > 0 and k.shape[2] > window:
+            k = k[:, :, -window:]
+            v = v[:, :, -window:]
+        context = _attend(q, k, v, None, None)
+        context = context.transpose(0, 2, 1, 3).reshape(batch_size, new_len, self.dim)
+        return self.o_proj(context), (k, v)
 
 
 class MLXTernaryMLP(nn.Module):
@@ -431,6 +485,18 @@ class MLXTransformerBlock(nn.Module):
     def __call__(self, x: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         x = x + self.attn(self.attn_norm(x), attention_mask=attention_mask)
         return x + self.mlp(self.mlp_norm(x))
+
+    def prefill(self, x: mx.array) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+        attn_out, cache = self.attn.prefill(self.attn_norm(x))
+        x = x + attn_out
+        return x + self.mlp(self.mlp_norm(x)), cache
+
+    def extend(
+        self, x: mx.array, cache: tuple[mx.array, mx.array], *, offset: int
+    ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+        attn_out, cache = self.attn.extend(self.attn_norm(x), cache, offset=offset)
+        x = x + attn_out
+        return x + self.mlp(self.mlp_norm(x)), cache
 
 
 class MLXTernaryCrossAttention(nn.Module):

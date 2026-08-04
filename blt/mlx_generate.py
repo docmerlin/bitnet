@@ -116,34 +116,57 @@ def _run_global(
     return latents, patch_ids
 
 
-def _decoder_next(
+@dataclass
+class _DraftCache:
+    """Self-attn K/V for encoder and decoder while drafting against frozen latents.
+
+    Invalidated after every global pass. ``last_logits`` holds the head input
+    (decoder hidden at the last committed position) for the next argmax.
+    """
+
+    encoder: list[tuple[mx.array, mx.array]] | None = None
+    decoder: list[tuple[mx.array, mx.array]] | None = None
+    length: int = 0
+    last_hidden: mx.array | None = None
+
+
+def _decoder_patches(latents: mx.array) -> mx.array:
+    # Shift by one so a byte in patch i reads latents[i-1], matching the model's
+    # forward. Shifting rather than truncating leaves room for patch index
+    # len(latents) -- the not-yet-encoded patch freshly drafted bytes belong to.
+    leading = mx.zeros((latents.shape[0], 1, latents.shape[2]), dtype=latents.dtype)
+    return mx.concatenate([leading, latents], axis=1)
+
+
+def _ensure_draft_prefill(
     model: MLXTernaryBLTModel,
     tokens: mx.array,
     latents: mx.array,
     patch_ids: mx.array,
     stats: GenerationStats,
-) -> mx.array:
-    """One byte from the local decoder against frozen patch latents.
-
-    ponytail: no KV cache -- every draft byte re-runs the encoder and decoder
-    over the whole prefix, so this is O(L^2). Add caching when generation length
-    rather than global-model calls becomes the cost.
-    """
+    draft_cache: _DraftCache,
+) -> None:
+    """Prefill encoder+decoder caches when missing or desynced from ``tokens``."""
+    length = tokens.shape[1]
+    if (
+        draft_cache.encoder is not None
+        and draft_cache.decoder is not None
+        and draft_cache.last_hidden is not None
+        and draft_cache.length == length
+    ):
+        return
     attention_mask = _ones_mask(tokens)
-    hidden = model.local_encoder.encode_bytes(
-        model.embed_bytes(tokens, attention_mask), attention_mask=attention_mask
-    )
+    embeds = model.embed_bytes(tokens, attention_mask)
+    hidden, enc_caches = model.local_encoder.encode_bytes_prefill(embeds)
     stats.draft_encoder += 1
-    # Shift by one so a byte in patch i reads latents[i-1], matching the model's
-    # forward. Shifting rather than truncating leaves room for patch index
-    # len(latents) -- the not-yet-encoded patch freshly drafted bytes belong to.
-    # new_zeros, not zeros_like(latents[:, :1]): after a rollback ``latents`` can
-    # hold zero patches, and slicing an empty array stays empty.
-    leading = mx.zeros((latents.shape[0], 1, latents.shape[2]), dtype=latents.dtype)
-    decoder_patches = mx.concatenate([leading, latents], axis=1)
-    decoded = model.local_decoder(hidden, decoder_patches, patch_ids, attention_mask=attention_mask)
+    decoded, dec_caches = model.local_decoder.prefill(
+        hidden, _decoder_patches(latents), patch_ids
+    )
     stats.decoder += 1
-    return mx.argmax(model.output_head(decoded[:, -1:]), axis=-1)
+    draft_cache.encoder = enc_caches
+    draft_cache.decoder = dec_caches
+    draft_cache.length = length
+    draft_cache.last_hidden = decoded[:, -1:]
 
 
 def _draft(
@@ -155,14 +178,48 @@ def _draft(
     next_id: int,
     count: int,
     stats: GenerationStats,
+    draft_cache: _DraftCache | None = None,
 ) -> mx.array:
-    """Extend ``tokens`` by ``count`` bytes, all charged to patch ``next_id``."""
+    """Extend ``tokens`` by ``count`` bytes, all charged to patch ``next_id``.
+
+    Reuses self-attn K/V across drafted bytes. Pass a persistent ``draft_cache``
+    from the outer generate loop so single-byte drafts still hit the fast path.
+    """
+    if draft_cache is None:
+        draft_cache = _DraftCache()
+    decoder_patches = _decoder_patches(latents)
+
     for _ in range(count):
-        byte = _decoder_next(model, tokens, latents, patch_ids, stats)
+        _ensure_draft_prefill(model, tokens, latents, patch_ids, stats, draft_cache)
+        assert draft_cache.last_hidden is not None
+        byte = mx.argmax(model.output_head(draft_cache.last_hidden), axis=-1)
         tokens = mx.concatenate([tokens, byte.astype(tokens.dtype)], axis=1)
         patch_ids = mx.concatenate(
             [patch_ids, mx.full((1, 1), next_id, dtype=patch_ids.dtype)], axis=1
         )
+        # Fold the newly committed byte into the caches and refresh last_hidden
+        # for the next prediction. Embed over the *full* prefix: hash n-grams
+        # need the preceding bytes (a lone tail token hashes as if padded).
+        offset = tokens.shape[1] - 1
+        full_embed = model.embed_bytes(tokens, _ones_mask(tokens))
+        new_embed = full_embed[:, -1:]
+        new_hidden, enc_caches = model.local_encoder.encode_bytes_extend(
+            new_embed, draft_cache.encoder, offset=offset
+        )
+        stats.draft_encoder += 1
+        decoded, dec_caches = model.local_decoder.extend(
+            new_hidden,
+            decoder_patches,
+            patch_ids[:, -1:],
+            draft_cache.decoder,
+            offset=offset,
+        )
+        stats.decoder += 1
+        draft_cache.encoder = enc_caches
+        draft_cache.decoder = dec_caches
+        draft_cache.length = tokens.shape[1]
+        draft_cache.last_hidden = decoded
+
     return tokens
 
 
@@ -289,6 +346,8 @@ def _generate_pinned(
 ) -> tuple[mx.array, GenerationStats]:
     latents, patch_ids = _run_global(model, tokens, patching, stats)
     next_id = int(patch_ids[0, -1].item()) + int(patching.opens_new_patch(tokens))
+    # Self-attn K/V live across drafted bytes; drop after each global pass.
+    draft_cache = _DraftCache()
 
     while tokens.shape[1] - prompt_length < max_new_bytes:
         budget = max_new_bytes - (tokens.shape[1] - prompt_length)
@@ -297,7 +356,14 @@ def _generate_pinned(
         if speculation_window == 0:
             while budget > 0:
                 tokens = _draft(
-                    model, tokens, latents, patch_ids, next_id=next_id, count=1, stats=stats
+                    model,
+                    tokens,
+                    latents,
+                    patch_ids,
+                    next_id=next_id,
+                    count=1,
+                    stats=stats,
+                    draft_cache=draft_cache,
                 )
                 patch_ids = mx.concatenate(
                     [patch_ids, mx.full((1, 1), next_id, dtype=patch_ids.dtype)], axis=1
@@ -320,8 +386,10 @@ def _generate_pinned(
                 next_id=next_id,
                 count=min(speculation_window, budget),
                 stats=stats,
+                draft_cache=draft_cache,
             )
             tokens, latents, patch_ids, next_id = _verify(model, tokens, candidate, patching, stats)
+            draft_cache = _DraftCache()  # verify rebuilt latents; caches are stale
 
         tokens, finished = _trim_at_eos(tokens, prompt_length, eos_id)
         if finished:
@@ -330,6 +398,7 @@ def _generate_pinned(
         if speculation_window == 0 and tokens.shape[1] - prompt_length < max_new_bytes:
             latents, patch_ids = _run_global(model, tokens, patching, stats)
             next_id = int(patch_ids[0, -1].item()) + int(opened)
+            draft_cache = _DraftCache()
 
     tokens = tokens[:, : prompt_length + max_new_bytes]
     stats.committed = tokens.shape[1] - prompt_length
