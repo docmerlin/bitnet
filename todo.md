@@ -583,11 +583,19 @@ regressions can be reverted.**
 
 **Training throughput (Metal / M1 Max):**
 
-- [ ] **Fuse BLT QKV and SwiGLU gate+up.** BitNet already uses `qkv: H→3H` and `up: H→2I`.
-  BLT locals still run separate `q/k/v` and `gate/up` matmuls (prep is shared; GEMMs are
-  not). Per-row ternary scales make vertical concat bit-identical. Apply to both torch and
-  MLX so parity tests and checkpoints stay aligned. Biggest expected win on the 7-layer
-  decoder at production width.
+- [x] **Rejected: fuse BLT QKV and SwiGLU gate+up.** Implemented both stacks (torch+MLX),
+  bit-identical layout (per-row ternary scales), then measured. Decoder-shaped 7× block
+  stack, batch 16 × 1024 × h512, interleaved A/B on M1 Max:
+
+  | mode | fwd 7-block | train fwd+bwd | small launch |
+  |---|---|---|---|
+  | separate (baseline) | 411–421 ms | 1184–1307 ms | 23.5–23.8 ms |
+  | fused QKV+gate/up | 411–421 ms | 1197–1198 ms | 22.7–23.2 ms |
+
+  Steady-state train step: baseline 1184 ms vs fused 1197 ms — **noise / slightly
+  slower**, not a win. Forward is flat. Shared `prepare_input` (already landed) was the
+  real duplicate-work fix; fewer GEMM launches do not convert at these Metal sizes.
+  Checkpoint rename churn not worth zero speedup. Reverted 2026-08-04.
 - [ ] **Unify BLT `MLXHBitLinear` with BitNet's.** Inherit packed ternary matmul, fused M=1
   decode, `pin_inference_weights`, and training-time `effective_weight` cache. Blocker:
   BitNet's layer takes `MLXBitNetConfig`; factor a shared protocol (activation bits, mixes,
