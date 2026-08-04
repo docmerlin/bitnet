@@ -278,6 +278,48 @@ class MLXTernaryBLTModel(nn.Module):
         if backbone is not None and hasattr(backbone, "set_quantization_state"):
             backbone.set_quantization_state(weight_mix, activation_mix, bits)
 
+    def pin_inference_weights(self) -> None:
+        """Pin effective ternary weights for generation; skip per-token rematerialize.
+
+        Also pins the BitNet global backbone when present (packed path when enabled).
+        """
+        from blt.mlx_layers import MLXHBitLinear as _BLTHBitLinear
+
+        def pin(_, module):
+            if isinstance(module, _BLTHBitLinear):
+                module.pin_inference_weight()
+
+        self.apply_to_modules(pin)
+        pinned = [
+            module._pinned_weight
+            for _, module in self.named_modules()
+            if isinstance(module, _BLTHBitLinear) and module._pinned_weight is not None
+        ]
+        if pinned:
+            mx.eval(*pinned)
+        backbone = getattr(self.global_transformer, "backbone", None)
+        if backbone is not None and hasattr(backbone, "pin_inference_weights"):
+            backbone.pin_inference_weights()
+
+    def clear_pinned_inference_weights(self) -> None:
+        from blt.mlx_layers import MLXHBitLinear as _BLTHBitLinear
+
+        def clear(_, module):
+            if isinstance(module, _BLTHBitLinear):
+                module.clear_pinned_inference_weight()
+
+        self.apply_to_modules(clear)
+        backbone = getattr(self.global_transformer, "backbone", None)
+        if backbone is not None and hasattr(backbone, "clear_pinned_inference_weights"):
+            backbone.clear_pinned_inference_weights()
+        elif backbone is not None:
+
+            def clear_backbone(_, module):
+                if hasattr(module, "clear_pinned_inference_weight"):
+                    module.clear_pinned_inference_weight()
+
+            backbone.apply_to_modules(clear_backbone)
+
     def embed_bytes(self, input_ids: mx.array, attention_mask: mx.array | None = None) -> mx.array:
         """Byte embeddings, plus hashed n-gram embeddings when enabled.
 

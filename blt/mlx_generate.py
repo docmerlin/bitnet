@@ -258,6 +258,35 @@ def generate(
     prompt_length = input_ids.shape[1]
     tokens = input_ids
 
+    # Materialize ternarized weights once for the whole generate call. Without
+    # this every draft byte re-scales and thresholds every HBitLinear.
+    model.pin_inference_weights()
+    try:
+        return _generate_pinned(
+            model,
+            tokens,
+            patching=patching,
+            max_new_bytes=max_new_bytes,
+            speculation_window=speculation_window,
+            eos_id=eos_id,
+            prompt_length=prompt_length,
+            stats=stats,
+        )
+    finally:
+        model.clear_pinned_inference_weights()
+
+
+def _generate_pinned(
+    model: MLXTernaryBLTModel,
+    tokens: mx.array,
+    *,
+    patching: _Patching,
+    max_new_bytes: int,
+    speculation_window: int,
+    eos_id: int,
+    prompt_length: int,
+    stats: GenerationStats,
+) -> tuple[mx.array, GenerationStats]:
     latents, patch_ids = _run_global(model, tokens, patching, stats)
     next_id = int(patch_ids[0, -1].item()) + int(patching.opens_new_patch(tokens))
 

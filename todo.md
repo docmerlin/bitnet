@@ -597,12 +597,18 @@ regressions can be reverted.**
   real duplicate-work fix; fewer GEMM launches do not convert at these Metal sizes.
   Checkpoint rename churn not worth zero speedup. Reverted 2026-08-04.
 - [ ] **Unify BLT `MLXHBitLinear` with BitNet's.** Inherit packed ternary matmul, fused M=1
-  decode, `pin_inference_weights`, and training-time `effective_weight` cache. Blocker:
-  BitNet's layer takes `MLXBitNetConfig`; factor a shared protocol (activation bits, mixes,
-  hadamard) so both configs work. Torch `HBitLinear` can stay separate.
-- [ ] **Step-scoped effective-weight cache on BLT locals.** Even without full unify: cache
-  ternarized weights once per step (or once per forward) across encoder/decoder projections.
-  BitNet loop reuse measured +5.8% at 1B; locals recompute every matmul today.
+  decode, and training-time `effective_weight` cache. Blocker: BitNet's layer takes
+  `MLXBitNetConfig`; factor a shared protocol so both configs work. Torch `HBitLinear`
+  can stay separate. Dense pin already landed separately (below).
+- [x] **Pin BLT inference ternary weights.** `MLXHBitLinear.pin_inference_weight` +
+  `MLXTernaryBLTModel.pin_inference_weights` (also forwards to BitNet global backbone).
+  `blt/mlx_generate.generate` pins for the call lifetime. Interleaved A/B, h256 / 1+4+4
+  layers, prompt 32 + 64 new bytes, uniform patch 4, M1 Max: unpinned 101–104 B/s vs
+  pinned 140–145 B/s (**~1.39×** geo mean). Logit-identical to unpinned (max abs 0).
+- [ ] **Step-scoped effective-weight cache on BLT training locals.** BitNet loop reuse
+  measured +5.8% at 1B because the same block runs R times; BLT locals each fire once
+  per forward so a per-step cache only helps under grad accum if the same graph reuses
+  arrays. Measure before adopting; prefer full unify + packed path for train.
 - [ ] **Gate `--recurrent-quantized-matmul` by scale.** Packed path loses at every small
   training token count measured and wins at full 1B seq 256 (+25%). Defaulting always-on
   (or always-off) is wrong for one of the two regimes. Gate on token count / width; validate

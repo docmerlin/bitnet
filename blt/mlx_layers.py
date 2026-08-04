@@ -159,6 +159,9 @@ class MLXHBitLinear(nn.Module):
         # kaiming_uniform_(a=sqrt(5)) reduces to U(-1/sqrt(fan_in), 1/sqrt(fan_in)).
         bound = 1.0 / math.sqrt(in_features)
         self.weight = mx.random.uniform(low=-bound, high=bound, shape=(out_features, in_features))
+        # Generation-only: materialize ternarized weight once per generate() call
+        # instead of redoing abs-mean scale + threshold every matmul. None while training.
+        self._pinned_weight: mx.array | None = None
 
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
         """Ramp quantisation strength. 0.0 is full precision, 1.0 fully quantised."""
@@ -193,6 +196,8 @@ class MLXHBitLinear(nn.Module):
         return x + self.activation_mix_value * mx.stop_gradient(quantized - x)
 
     def effective_weight(self) -> mx.array:
+        if self._pinned_weight is not None:
+            return self._pinned_weight
         weight = self.weight
         if self.weight_mix <= 0.0:
             return weight
@@ -206,6 +211,14 @@ class MLXHBitLinear(nn.Module):
             # so that subtraction loses most of its significant digits.
             return mx.stop_gradient(ternary * scale) + (weight - mx.stop_gradient(weight))
         return weight + self.weight_mix_value * mx.stop_gradient(ternary * scale - weight)
+
+    def pin_inference_weight(self) -> None:
+        """Materialize one effective weight for the generation lifetime."""
+        self._pinned_weight = None  # force recompute from current master
+        self._pinned_weight = self.effective_weight()
+
+    def clear_pinned_inference_weight(self) -> None:
+        self._pinned_weight = None
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.forward_prepared(self.prepare_input(x))
