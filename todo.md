@@ -509,12 +509,10 @@ Superseded detail from the earlier pass:
   86M, batch 4, sequence 512: 4-bit 354.6ms/step, 8-bit 345.4ms, 16-bit 348.3ms, no
   quantisation 345.9ms -- and on the forward alone, skipping quantisation entirely is
   1.29x (110.3ms -> 85.5ms). `TernaryBLTConfig.activation_bits` now defaults to 8.
-- [ ] **Decide the BitNet stack's activation width separately.** `TernaryConfig` still
-  defaults to 4 and `mlx_train.py --final-activation-bits` to 4, unchanged here because
-  that stack has trained checkpoints whose behaviour would shift. The same argument
-  applies -- 4-bit buys no training speed -- so it is worth switching unless inference
-  really runs 4-bit activation kernels (`ternary_fused_linear_m1`, the M=1 decode path,
-  is the only place low-bit activations become real compute).
+- [x] **BitNet activation width defaulted to 8** (see performance backlog). CLI
+  `--final-activation-bits` and `MLXBitNetConfig.activation_bits` are 8; checkpoints that
+  saved 4 still load that value.
+
 - [ ] **Padding is not inert for the BitNet backbone.** Zero-length patches perturb it:
   measured drift 0.0 / 1.4e-3 / 2.2e-1 at 1 / 2 / 8 layers, the last a relative error of
   1.0. It does not grow with the amount of padding, so a small perturbation is being
