@@ -574,6 +574,52 @@ Superseded detail from the earlier pass:
   shows 3–8 points on the likelihood benchmarks before decoding starts. Not worth it unless
   generation speed becomes the binding constraint and the quality loss is acceptable.
 
+#### Performance backlog (2026-08-04 audit)
+
+Prioritized after the BLT + BitNet throughput pass. Byte-level encoder/decoder still own ~⅔ of
+forward time; generation is O(L²) without a KV cache; several NanoGPT-speedrun knobs and
+default gates remain unmeasured. **Bench after each big change; commit between goals so
+regressions can be reverted.**
+
+**Training throughput (Metal / M1 Max):**
+
+- [ ] **Fuse BLT QKV and SwiGLU gate+up.** BitNet already uses `qkv: H→3H` and `up: H→2I`.
+  BLT locals still run separate `q/k/v` and `gate/up` matmuls (prep is shared; GEMMs are
+  not). Per-row ternary scales make vertical concat bit-identical. Apply to both torch and
+  MLX so parity tests and checkpoints stay aligned. Biggest expected win on the 7-layer
+  decoder at production width.
+- [ ] **Unify BLT `MLXHBitLinear` with BitNet's.** Inherit packed ternary matmul, fused M=1
+  decode, `pin_inference_weights`, and training-time `effective_weight` cache. Blocker:
+  BitNet's layer takes `MLXBitNetConfig`; factor a shared protocol (activation bits, mixes,
+  hadamard) so both configs work. Torch `HBitLinear` can stay separate.
+- [ ] **Step-scoped effective-weight cache on BLT locals.** Even without full unify: cache
+  ternarized weights once per step (or once per forward) across encoder/decoder projections.
+  BitNet loop reuse measured +5.8% at 1B; locals recompute every matmul today.
+- [ ] **Gate `--recurrent-quantized-matmul` by scale.** Packed path loses at every small
+  training token count measured and wins at full 1B seq 256 (+25%). Defaulting always-on
+  (or always-off) is wrong for one of the two regimes. Gate on token count / width; validate
+  at both 50M and 1B before flipping production.
+- [ ] **Wall-clock curricula:** batch-size schedule, max-seq schedule, and re-check attention
+  window curriculum direction (`initial-blocks`/`final-blocks` may shrink windows; speedrun
+  grows them). Prefer measured bytes/hour over step ms alone.
+- [ ] **Drop first prelude MLP / first attention (R30/R35).** Free A/B given the
+  prelude/recurrent/coda split.
+- [ ] **BitNet activation width → 8-bit default.** BLT already at 8 (4-bit collapses after
+  ramp; fake-quant so train speed is flat). BitNet still defaults 4 for checkpoint continuity;
+  switch unless M=1 decode truly needs 4-bit acts.
+
+**Generation:**
+
+- [ ] **KV cache on BLT decode** (same item as above under BLT generation performance).
+  Highest remaining inference-algorithm win; blocks realistic BLT-S measurement.
+- [ ] **Generate-only FFN simplification** for BitNet (skip or fuse mid when quality allows);
+  scale Infini/PaTH geometry for probe models.
+
+**Quality-per-token (not step ms):**
+
+- [ ] Embedding LR sweep (10–30× body); `--mud-neuron-norm` / C-NorMUD A/B; logit softcap;
+  value embeddings in the byte encoder; sampled byte MTP on BLT (in progress).
+
 ---
 
 ## RFMoE design reference
