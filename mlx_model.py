@@ -2596,10 +2596,15 @@ class MLXBitNet(nn.Module):
     def mtp_logits(self, hidden: mx.array) -> list[mx.array]:
         return [self.logits_from(transform(hidden)) for transform in self.mtp_transforms]
 
-    def selected_mtp_logits(self, hidden: mx.array, selector: mx.array) -> mx.array:
-        transformed = mx.stack([transform(hidden) for transform in self.mtp_transforms], axis=2)
-        selected = mx.sum(transformed * selector[None, None, :, None], axis=2)
-        return self.logits_from(selected)
+    def selected_mtp_logits(self, hidden: mx.array, index: mx.array) -> mx.array:
+        norm_weight = self.mtp_transforms[0].layers[0].weight
+        linear_weight = self.mtp_transforms[0].layers[1].weight
+        for head_index, transform in enumerate(self.mtp_transforms[1:], start=1):
+            selected = index == head_index
+            norm_weight = mx.where(selected, transform.layers[0].weight, norm_weight)
+            linear_weight = mx.where(selected, transform.layers[1].weight, linear_weight)
+        transformed = mx.fast.rms_norm(hidden, norm_weight, self.config.rms_norm_eps)
+        return self.logits_from(transformed @ linear_weight.T)
 
     def draft_logits(self, hidden: mx.array) -> mx.array:
         last = hidden[:, -1:]

@@ -133,6 +133,12 @@ def test_global_config_refuses_engram():
         )
 
 
+def test_global_config_refuses_patch_level_mtp():
+    config = _config(mtp_depth=2)
+    with pytest.raises(ValueError, match="patch latents have no discrete future-token targets"):
+        MLXBitNetGlobalTransformer(config, global_config_for(config, mtp_depth=2))
+
+
 def test_padded_patches_are_refused_not_silently_absorbed():
     # PaTH chunks by count, so its boundaries move with sequence length and
     # padding perturbs the real patches by ~1e-4 -- which the decoder's 4-bit
@@ -170,6 +176,22 @@ def test_fixed_patch_count_needs_no_padding():
         assert bool(mx.all(lengths > 0))  # no padding, so the backbone accepts it
     assert shapes == {(2, 16)}
     assert totals == {(64, 64)}
+
+
+def test_fixed_patch_count_takes_precedence_over_length_cap(monkeypatch):
+    from blt.mlx_entropy_model import MLXByteEntropyModel
+
+    config = _config(max_patch_length=2)
+    patcher = MLXByteEntropyModel(config, dim=64, num_layers=1, num_heads=4, max_seq_len=64)
+    entropy = mx.array([[10.0, 9.0, 8.0, 7.0] + [0.0] * 12])
+    monkeypatch.setattr(patcher, "entropy", lambda _: entropy)
+
+    lengths = patcher.predict_patch_lengths(mx.zeros((1, 16), dtype=mx.int32), num_patches=4)
+    mx.eval(lengths)
+
+    assert lengths.shape == (1, 4)
+    assert bool(mx.all(lengths > 0))
+    assert int(mx.sum(lengths)) == 16
 
 
 def test_boundaries_by_count_picks_the_highest_entropy_positions():

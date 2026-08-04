@@ -161,3 +161,24 @@ def test_torch_state_dict_loads_without_renaming():
         if not name.endswith(runtime_state)
     }
     assert torch_names == mlx_names
+
+
+def test_byte_mtp_heads_match_torch_and_selected_path():
+    config = _config(mtp_depth=2)
+    torch_model, mlx_model = _pair(config)
+    tokens = _tokens(config)
+
+    with torch.no_grad():
+        torch_output = torch_model(torch.from_numpy(tokens))
+        expected = torch_model.mtp_logits(torch_output.decoder_hidden)
+    mlx_output = mlx_model(mx.array(tokens))
+    actual = mlx_model.mtp_logits(mlx_output.decoder_hidden)
+    selected = [
+        mlx_model.selected_mtp_logits(mlx_output.decoder_hidden, mx.array(index, dtype=mx.int32))
+        for index in range(config.mtp_depth)
+    ]
+    mx.eval(actual, selected)
+
+    for torch_logits, mlx_logits, selected_logits in zip(expected, actual, selected):
+        _close(torch_logits, mlx_logits)
+        assert mx.allclose(selected_logits, mlx_logits, rtol=1e-5, atol=1e-5).item()

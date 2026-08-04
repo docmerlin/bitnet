@@ -73,7 +73,14 @@ class MLXBitNetGlobalTransformer(nn.Module):
     #: this rather than isinstance, so an alternative backbone can say otherwise.
     accepts_padding = False
 
-    def __init__(self, config: TernaryBLTConfig, global_config: MLXBitNetConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: TernaryBLTConfig,
+        global_config: MLXBitNetConfig | None = None,
+        *,
+        checkpoint_activations: bool | str = False,
+        recurrent_quantized_matmul: bool = False,
+    ) -> None:
         super().__init__()
         self.global_config = global_config or global_config_for(config)
         if self.global_config.hidden_size != config.global_dim:
@@ -85,7 +92,16 @@ class MLXBitNetGlobalTransformer(nn.Module):
                 "Engram needs token ids and patches have none; build the global "
                 "config with use_engram=False"
             )
-        self.backbone = MLXBitNet(self.global_config)
+        if self.global_config.mtp_depth:
+            raise ValueError(
+                "patch latents have no discrete future-token targets; configure "
+                "byte-level MTP on TernaryBLTConfig instead"
+            )
+        self.checkpoint_activations = checkpoint_activations
+        self.backbone = MLXBitNet(
+            self.global_config,
+            recurrent_quantized_matmul=recurrent_quantized_matmul,
+        )
         # Reading the mask to detect padding forces a GPU sync, which makes the
         # step uncompilable. On by default so a stray padded batch is caught; a
         # caller that guarantees unpadded patches by construction (a fixed patch
@@ -130,5 +146,6 @@ class MLXBitNetGlobalTransformer(nn.Module):
             inputs_embeds=patch_states,
             segment_ids=segment_ids,
             num_loops=num_loops,
+            checkpoint_activations=self.checkpoint_activations,
         )
         return self.output_norm(hidden)

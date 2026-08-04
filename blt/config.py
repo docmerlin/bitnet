@@ -111,6 +111,10 @@ class TernaryBLTConfig:
     # quantise activations to 4 bits in its kernels.
     activation_bits: int = 8
 
+    # Auxiliary byte-level future heads. These operate after the causal local
+    # decoder; patch-level MTP is undefined because patches have variable widths.
+    mtp_depth: int = 0
+
     distill_temperature: float = 1.0
 
     def __post_init__(self) -> None:
@@ -128,6 +132,8 @@ class TernaryBLTConfig:
             raise ValueError("cross_attn_k must be positive")
         if self.activation_bits < 2:
             raise ValueError("activation_bits must be at least 2")
+        if self.mtp_depth < 0:
+            raise ValueError("mtp_depth must be non-negative")
         if self.use_ngram_embeddings:
             sizes = tuple(int(size) for size in self.ngram_sizes)
             if not sizes or min(sizes) < 1:

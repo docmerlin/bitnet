@@ -17,6 +17,7 @@ from mlx_rfmoe_kernel import masked_grouped_linear
 from mlx_ternary_kernel import pack_ternary_weight, ternary_quantized_linear
 from mlx_train import (
     _gradient_compile_safe,
+    accumulate_gradients,
     build_validation_batches,
     build_parser,
     create_apply_step,
@@ -92,6 +93,7 @@ def test_mlx_training_step_is_finite() -> None:
         warmup_steps=0,
         batch_size=1,
         sequence_length=4,
+        grad_accumulation_steps=1,
         vocab_size=32,
         hidden_size=8,
         num_heads=2,
@@ -101,6 +103,7 @@ def test_mlx_training_step_is_finite() -> None:
         num_coda_layers=0,
         num_loops=1,
         active_loops=None,
+        mtp_depth=0,
         path_window_size=4,
         learning_rate=1e-3,
         mud_block_size=4,
@@ -122,6 +125,30 @@ def test_mlx_training_step_is_finite() -> None:
     assert metrics["profile_sync_wait_seconds"] > 0
     assert metrics["profile_validation_seconds"] > 0
     assert metrics["tokens_per_second"] > 0
+    args.profile_phases = False
+    args.grad_accumulation_steps = 2
+    args.mtp_depth = 1
+    accumulated_metrics = run_mlx(args)
+    assert accumulated_metrics["loss"] > 0
+    assert accumulated_metrics["tokens_per_second"] > 0
+    args.mtp_depth = 0
+    args.backend = "torch"
+    args.optimizer = "adamw"
+    with pytest.raises(ValueError, match="Gradient accumulation benchmark is only available with MLX"):
+        validate_args(args)
+    args.backend = "mlx"
+    args.optimizer = "cmud"
+    args.grad_accumulation_steps = 1
+    args.backend = "torch"
+    args.mtp_depth = 1
+    with pytest.raises(ValueError, match="MTP benchmark is only available with MLX"):
+        validate_args(args)
+    args.backend = "mlx"
+    args.mtp_depth = 0
+    args.grad_accumulation_steps = 0
+    with pytest.raises(ValueError, match="grad-accumulation-steps must be positive"):
+        validate_args(args)
+    args.grad_accumulation_steps = 1
     args.num_loops = 0
     with pytest.raises(ValueError, match="num-loops must be positive"):
         validate_args(args)
@@ -146,6 +173,24 @@ def test_mlx_training_defaults_use_fast_local_batch() -> None:
     args.loop_curriculum_start_ratio = 0.3
     with pytest.raises(ValueError, match="0 <= start <= end <= 1"):
         validate_training_args(args)
+
+
+def test_mlx_materialized_gradient_accumulation_matches_deferred_mean() -> None:
+    gradients = [
+        {"weight": mx.array([[1.0, 2.0], [3.0, 4.0]])},
+        {"weight": mx.array([[5.0, 6.0], [7.0, 8.0]])},
+        {"weight": mx.array([[9.0, 10.0], [11.0, 12.0]])},
+    ]
+    deferred = tree_map(lambda *values: mx.mean(mx.stack(values), axis=0), *gradients)
+    accumulated = None
+    for current in gradients:
+        accumulated = accumulate_gradients(accumulated, current)
+        mx.eval(accumulated)
+    materialized = tree_map(lambda value: value / len(gradients), accumulated)
+    mx.eval(deferred, materialized)
+
+    for (_, expected), (_, actual) in zip(tree_flatten(deferred), tree_flatten(materialized)):
+        assert mx.array_equal(actual, expected).item()
 
 
 def test_mlx_validation_batches_are_materialized_once(monkeypatch) -> None:
@@ -620,6 +665,45 @@ def test_mlx_sampled_mtp_matches_exact_depth_mean() -> None:
     for (_, exact), (_, sampled_mean) in zip(tree_flatten(exact_gradients), tree_flatten(mean_gradients)):
         assert mx.allclose(sampled_mean, exact, rtol=1e-4, atol=1e-5).item()
 
+
+@pytest.mark.parametrize("index", [0, 1])
+def test_mlx_selected_mtp_matches_direct_head_gradients(index: int) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_attention_heads=2,
+        intermediate_size=16,
+        num_prelude_layers=0,
+        num_recurrent_layers=0,
+        num_coda_layers=0,
+        use_engram=False,
+        mtp_depth=2,
+    )
+    model = MLXBitNet(config)
+    hidden = mx.random.normal((1, 4, config.hidden_size))
+
+    selected_step = nn.value_and_grad(
+        model,
+        lambda values: mx.mean(
+            model.selected_mtp_logits(values, mx.array(index, dtype=mx.int32)).astype(mx.float32) ** 2
+        ),
+    )
+    direct_step = nn.value_and_grad(
+        model,
+        lambda values: mx.mean(
+            model.logits_from(model.mtp_transforms[index](values)).astype(mx.float32) ** 2
+        ),
+    )
+    selected_loss, selected_gradients = selected_step(hidden)
+    direct_loss, direct_gradients = direct_step(hidden)
+    mx.eval(selected_loss, selected_gradients, direct_loss, direct_gradients)
+
+    assert mx.allclose(selected_loss, direct_loss, rtol=1e-5, atol=1e-6).item()
+    for (_, expected), (_, actual) in zip(
+        tree_flatten(direct_gradients),
+        tree_flatten(selected_gradients),
+    ):
+        assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-5).item()
 
 def test_mlx_mtp_head_schedule_is_resume_stable() -> None:
     assert [mtp_head_index(1, index, 4, 3) for index in range(4)] == [0, 1, 2, 0]

@@ -41,6 +41,16 @@ class MLXTernaryBLTOutput:
     decoder_hidden: mx.array
 
 
+class MLXBLTMTPTransform(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, eps=1.1920928955078125e-07)
+        self.projection = nn.Linear(dim, dim, bias=False)
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        return self.projection(self.norm(hidden))
+
+
 def _validate_suffix_padded_mask(attention_mask: mx.array) -> None:
     """Padding must be a suffix; a hole in the middle breaks the patch arithmetic.
 
@@ -260,7 +270,6 @@ class MLXLocalDecoder(nn.Module):
             hidden = mx.where(byte_mask[..., None], hidden, 0.0)
         return hidden
 
-
     def _prepare_latents(self, patch_states: mx.array) -> mx.array:
         latent = self.patch_state_proj(patch_states) if self.patch_state_proj is not None else patch_states
         if self.cross_attn_k > 1:
@@ -348,6 +357,9 @@ class MLXTernaryBLTModel(nn.Module):
         self.global_transformer = global_transformer or MLXGlobalTransformer(config)
         self.local_decoder = MLXLocalDecoder(config)
         self.output_head = MLXHBitLinear(config.decoder_dim, config.vocab_size, config=config)
+        self.mtp_transforms = [
+            MLXBLTMTPTransform(config.decoder_dim) for _ in range(config.mtp_depth)
+        ]
         self.patch_size = config.patch_size
         # Input validation reads array contents, which forces a GPU sync and
         # makes the forward uncompilable ("Attempting to eval an array during
@@ -355,6 +367,23 @@ class MLXTernaryBLTModel(nn.Module):
         # caught; a training loop that validates its own batches -- cheaply, in
         # numpy, before they ever reach the GPU -- turns it off to compile.
         self.validate_inputs = True
+
+    def mtp_logits(self, decoder_hidden: mx.array) -> list[mx.array]:
+        return [self.output_head(transform(decoder_hidden)) for transform in self.mtp_transforms]
+
+    def selected_mtp_logits(self, decoder_hidden: mx.array, index: mx.array) -> mx.array:
+        norm_weight = self.mtp_transforms[0].norm.weight
+        projection_weight = self.mtp_transforms[0].projection.weight
+        for head_index, transform in enumerate(self.mtp_transforms[1:], start=1):
+            selected = index == head_index
+            norm_weight = mx.where(selected, transform.norm.weight, norm_weight)
+            projection_weight = mx.where(selected, transform.projection.weight, projection_weight)
+        transformed = mx.fast.rms_norm(
+            decoder_hidden,
+            norm_weight,
+            1.1920928955078125e-07,
+        )
+        return self.output_head(transformed @ projection_weight.T)
 
     def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
         """Ramp quantisation across every ternary projection, backbone included.
@@ -408,7 +437,6 @@ class MLXTernaryBLTModel(nn.Module):
         if backbone is not None and hasattr(backbone, "clear_pinned_inference_weights"):
             backbone.clear_pinned_inference_weights()
         elif backbone is not None:
-
             def clear_backbone(_, module):
                 if hasattr(module, "clear_pinned_inference_weight"):
                     module.clear_pinned_inference_weight()

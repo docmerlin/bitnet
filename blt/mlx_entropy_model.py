@@ -230,30 +230,22 @@ class MLXByteEntropyModel(nn.Module):
         is not safe with the BitNet global backbone, where the perturbation
         amplifies through depth (see :mod:`blt.mlx_global`). Same segmentation
         rule, different knob: pick the most surprising boundaries rather than all
-        boundaries above a cutoff.
+        boundaries above a cutoff. Fixed count takes precedence over
+        ``max_patch_length`` because adding cap-forced boundaries would destroy
+        the shape guarantee it exists to provide.
         """
         entropy = self.entropy(input_ids)
         if num_patches is not None:
             starts = boundaries_by_count(entropy, num_patches)
-        else:
-            threshold = self.default_threshold if threshold is None else threshold
-            starts = boundaries_from_entropy(
-                entropy, threshold=threshold, relative_threshold=relative_threshold
-            )
-        capped = cap_patch_lengths(starts, self.max_patch_length)
-        lengths = patch_lengths_from_starts(capped)
-        if num_patches is not None and lengths.shape[1] != num_patches:
-            # max_patch_length can force extra boundaries past the requested
-            # count. Pad rather than drop: dropping would lose bytes.
-            if lengths.shape[1] < num_patches:
-                lengths = mx.concatenate(
-                    [
-                        lengths,
-                        mx.zeros((lengths.shape[0], num_patches - lengths.shape[1]), dtype=lengths.dtype),
-                    ],
-                    axis=1,
-                )
-        return lengths
+            # Fixed count exists to give the BitNet global backbone one stable,
+            # unpadded shape. Re-applying the length cap can only add boundaries,
+            # violating that contract and forcing the whole model eager.
+            return patch_lengths_from_starts(starts)
+        threshold = self.default_threshold if threshold is None else threshold
+        starts = boundaries_from_entropy(
+            entropy, threshold=threshold, relative_threshold=relative_threshold
+        )
+        return patch_lengths_from_starts(cap_patch_lengths(starts, self.max_patch_length))
 
     def opens_new_patch(self, input_ids: mx.array, *, threshold: float | None = None) -> mx.array:
         """Would the byte *after* ``input_ids`` begin a patch?"""

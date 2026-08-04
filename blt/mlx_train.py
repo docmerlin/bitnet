@@ -25,12 +25,12 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from blt.config import TernaryBLTConfig
 from blt.mlx_data import ByteCorpus
 from blt.mlx_entropy_model import MLXByteEntropyModel, load_entropy_model
-from blt.mlx_losses import MLXDistillationLossWeights, blt_distillation_loss
+from blt.mlx_losses import MLXDistillationLossWeights, blt_distillation_loss, masked_mean
 from blt.mlx_model import MLXTernaryBLTModel
 from blt.mlx_patching import build_uniform_patch_lengths, pad_patch_lengths_to_bucket
 from blt.teacher_cache import TeacherCache
@@ -98,6 +98,8 @@ class TrainingConfig:
     activation_mix_start: float = 0.0
     activation_bits_start: int = 16
     activation_bits_final: int = 8
+    grad_accumulation_steps: int = 1
+    mtp_loss_coef: float = 0.3
 
 
 def learning_rate_at(step: int, config: TrainingConfig) -> float:
@@ -130,6 +132,27 @@ def shifted_labels(tokens: mx.array, mask: mx.array, pad_id: int) -> tuple[mx.ar
     return labels.astype(mx.int32), loss_mask & mask
 
 
+def mtp_head_index(step_index: int, microbatch_index: int, accumulation_steps: int, depth: int) -> int:
+    return (step_index * accumulation_steps + microbatch_index) % depth
+
+
+def shifted_mtp_labels(
+    labels: mx.array,
+    loss_mask: mx.array,
+    index: int,
+) -> tuple[mx.array, mx.array]:
+    shift = index + 1
+    shifted = mx.concatenate(
+        [labels[:, shift:], mx.zeros_like(labels[:, :shift])],
+        axis=1,
+    )
+    valid = mx.concatenate(
+        [loss_mask[:, shift:], mx.zeros(loss_mask[:, :shift].shape, dtype=mx.bool_)],
+        axis=1,
+    )
+    return mx.where(valid, shifted, 0).astype(mx.int32), valid
+
+
 class MLXBLTTrainer:
     def __init__(
         self,
@@ -143,6 +166,10 @@ class MLXBLTTrainer:
         self.model = model
         self.source = source
         self.config = config
+        if config.grad_accumulation_steps < 1:
+            raise ValueError("grad_accumulation_steps must be positive")
+        if config.mtp_loss_coef < 0:
+            raise ValueError("mtp_loss_coef must be non-negative")
         self.patcher = patcher
         self.weights = MLXDistillationLossWeights(
             hard_ce=config.hard_ce, logits_kl=config.logits_kl
@@ -200,7 +227,7 @@ class MLXBLTTrainer:
             attention_mask=batch["mask"],
             patch_lengths=batch["patch_lengths"],
         )
-        return blt_distillation_loss(
+        loss, metrics = blt_distillation_loss(
             output.logits,
             labels=batch["labels"],
             attention_mask=batch["loss_mask"],
@@ -209,6 +236,18 @@ class MLXBLTTrainer:
             teacher_topk_indices=batch.get("topk_indices"),
             teacher_topk_logits=batch.get("topk_logits"),
         )
+        if self.model.config.mtp_depth > 0 and self.config.mtp_loss_coef > 0:
+            mtp_logits = self.model.selected_mtp_logits(output.decoder_hidden, batch["mtp_index"])
+            mtp_token_ce = nn.losses.cross_entropy(
+                mtp_logits,
+                batch["mtp_labels"],
+                reduction="none",
+            )
+            mtp_ce = masked_mean(mtp_token_ce, batch["mtp_loss_mask"])
+            loss = loss + self.config.mtp_loss_coef * mtp_ce
+            metrics["mtp_ce"] = mtp_ce
+            metrics["loss"] = loss
+        return loss, metrics
 
     def _loss(self, batch: dict[str, mx.array]):
         """Return scalar loss with metric arrays as gradient auxiliaries."""
@@ -247,11 +286,16 @@ class MLXBLTTrainer:
             return lengths
         return pad_patch_lengths_to_bucket(lengths, self.config.patch_bucket)
 
-    def sample_batch(self) -> dict[str, mx.array]:
+    def sample_batch(self, mtp_index: int = 0) -> dict[str, mx.array]:
         indices = self._rng.integers(0, len(self.source), size=self.config.batch_size)
         raw = self.source.batch(indices)
         tokens = mx.array(raw["tokens"])
         mask = mx.array(raw["mask"])
+        if self.model.config.mtp_depth > 0:
+            if self.model.config.mtp_depth >= tokens.shape[1] - 1:
+                raise ValueError("mtp_depth must leave at least one valid future-byte target")
+            if not 0 <= mtp_index < self.model.config.mtp_depth:
+                raise ValueError("mtp_index must be within configured MTP depth")
         labels, loss_mask = shifted_labels(tokens, mask, self.model.config.pad_id)
         batch = {
             "tokens": tokens,
@@ -267,6 +311,11 @@ class MLXBLTTrainer:
         if self.has_teacher:
             batch["topk_indices"] = mx.array(raw["topk_indices"])
             batch["topk_logits"] = mx.array(raw["topk_logits"])
+        if self.model.config.mtp_depth > 0 and self.config.mtp_loss_coef > 0:
+            mtp_labels, mtp_loss_mask = shifted_mtp_labels(labels, loss_mask, mtp_index)
+            batch["mtp_labels"] = mtp_labels
+            batch["mtp_loss_mask"] = mtp_loss_mask
+            batch["mtp_index"] = mx.array(mtp_index, dtype=mx.int32)
         return batch
 
     def quantization_at(self, step_index: int) -> tuple[float, float, int]:
@@ -312,19 +361,76 @@ class MLXBLTTrainer:
             metrics.update({name: float(value) for name, value in loss_metrics.items()})
         return metrics
 
+    def accumulated_step(
+        self,
+        batches: list[dict[str, mx.array]],
+        step_index: int,
+        *,
+        breakdown: bool = False,
+    ) -> dict[str, float]:
+        if not batches:
+            raise ValueError("accumulated_step needs at least one batch")
+        rate = learning_rate_at(step_index, self.config)
+        multiplier = rate / self.config.learning_rate if self.config.learning_rate else 0.0
+        if hasattr(self.optimizer, "set_lr_multiplier"):
+            self.optimizer.set_lr_multiplier(multiplier)
+        else:
+            self.optimizer.learning_rate = rate
+        self.model.set_quantization_state(*self.quantization_at(step_index))
+
+        accumulated = None
+        metric_sums: dict[str, float] = {}
+        for batch in batches:
+            (loss, loss_metrics), gradients = self._loss_and_grad(batch)
+            accumulated = gradients if accumulated is None else tree_map(
+                lambda total, current: total + current,
+                accumulated,
+                gradients,
+            )
+            mx.eval(accumulated, *(loss_metrics.values() if breakdown else (loss,)))
+            values = loss_metrics if breakdown else {"loss": loss}
+            for name, value in values.items():
+                metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
+
+        accumulated = tree_map(lambda gradient: gradient / len(batches), accumulated)
+        accumulated, grad_norm = clip_gradients(accumulated, self.config.grad_clip)
+        self.optimizer.update(self.model, accumulated)
+        mx.eval(self.model.parameters(), self.optimizer.state, grad_norm)
+
+        metrics = {name: value / len(batches) for name, value in metric_sums.items()}
+        metrics.update({"grad_norm": float(grad_norm), "learning_rate": rate})
+        return metrics
+
     def train(self, *, log=print) -> list[dict[str, float]]:
         history = []
         started = time.perf_counter()
         for step_index in range(self.config.steps):
             logging = bool(self.config.log_every) and step_index % self.config.log_every == 0
-            metrics = self.step(self.sample_batch(), step_index, breakdown=logging)
+            if self.config.grad_accumulation_steps <= 1:
+                mtp_index = step_index % max(self.model.config.mtp_depth, 1)
+                metrics = self.step(self.sample_batch(mtp_index), step_index, breakdown=logging)
+            else:
+                batches = []
+                for microbatch_index in range(self.config.grad_accumulation_steps):
+                    mtp_index = (
+                        mtp_head_index(
+                            step_index,
+                            microbatch_index,
+                            self.config.grad_accumulation_steps,
+                            self.model.config.mtp_depth,
+                        )
+                        if self.model.config.mtp_depth
+                        else 0
+                    )
+                    batches.append(self.sample_batch(mtp_index))
+                metrics = self.accumulated_step(batches, step_index, breakdown=logging)
             metrics["step"] = step_index
             history.append(metrics)
             if self.config.log_every and step_index % self.config.log_every == 0:
                 elapsed = time.perf_counter() - started
                 parts = " ".join(
                     f"{name}={metrics[name]:.4f}"
-                    for name in ("loss", "hard_ce", "logits_kl", "grad_norm")
+                    for name in ("loss", "hard_ce", "logits_kl", "mtp_ce", "grad_norm")
                     if name in metrics
                 )
                 log(f"step {step_index:>6} {parts} lr={metrics['learning_rate']:.2e} {elapsed:.1f}s")
@@ -364,6 +470,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-ce", type=float, default=1.0)
     parser.add_argument("--logits-kl", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--grad-accumulation-steps", type=int, default=1)
+    parser.add_argument("--mtp-depth", type=int, default=0)
+    parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -387,6 +496,7 @@ def main(argv: list[str] | None = None) -> None:
         global_dim=args.global_dim,
         decoder_dim=args.decoder_dim,
         patch_size=args.patch_size,
+        mtp_depth=args.mtp_depth,
     )
     mx.random.seed(args.seed)
 
@@ -440,6 +550,8 @@ def main(argv: list[str] | None = None) -> None:
         log_every=args.log_every,
         seed=args.seed,
         mud_block_size=args.mud_block_size,
+        grad_accumulation_steps=args.grad_accumulation_steps,
+        mtp_loss_coef=args.mtp_loss_coef,
     )
     trainer = MLXBLTTrainer(model, source, training, patcher=patcher)
     trainer.train()

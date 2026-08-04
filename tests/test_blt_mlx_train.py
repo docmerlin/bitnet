@@ -22,7 +22,9 @@ from blt.mlx_train import (
     TrainingConfig,
     clip_gradients,
     learning_rate_at,
+    mtp_head_index,
     shifted_labels,
+    shifted_mtp_labels,
 )
 from blt.teacher_cache import TeacherCache, TeacherCacheWriter
 
@@ -73,8 +75,8 @@ def _cache(tmp_path, config, sequences=4, seed=0):
     return TeacherCache(tmp_path)
 
 
-def _trainer(tmp_path, *, cross_attn_k=2, **training_overrides):
-    config = _config(cross_attn_k=cross_attn_k)
+def _trainer(tmp_path, *, cross_attn_k=2, mtp_depth=0, **training_overrides):
+    config = _config(cross_attn_k=cross_attn_k, mtp_depth=mtp_depth)
     mx.random.seed(0)
     model = MLXTernaryBLTModel(config)
     mx.eval(model.parameters())
@@ -140,6 +142,55 @@ def test_shifted_labels_respect_existing_padding():
     mask = mx.array([[True, True, False, False]])
     _, loss_mask = shifted_labels(tokens, mask, pad_id=-1)
     assert np.array_equal(np.asarray(loss_mask)[0], [True, False, False, False])
+
+
+def test_shifted_mtp_labels_move_targets_and_clear_tail():
+    labels = mx.array([[6, 7, 8, -1]], dtype=mx.int32)
+    mask = mx.array([[True, True, True, False]])
+    targets, valid = shifted_mtp_labels(labels, mask, index=1)
+
+    assert np.array_equal(np.asarray(targets)[0], [8, 0, 0, 0])
+    assert np.array_equal(np.asarray(valid)[0], [True, False, False, False])
+
+
+def test_mtp_head_schedule_is_resume_stable():
+    assert [mtp_head_index(3, index, 4, 3) for index in range(4)] == [0, 1, 2, 0]
+
+
+def test_mtp_depth_requires_a_valid_future_target(tmp_path):
+    trainer = _trainer(tmp_path, mtp_depth=15, compile_step=False)
+    with pytest.raises(ValueError, match="at least one valid future-byte target"):
+        trainer.sample_batch(0)
+
+
+def test_sampled_mtp_routes_gradient_to_selected_head(tmp_path):
+    trainer = _trainer(tmp_path, mtp_depth=2, compile_step=False)
+    for index in range(2):
+        _, gradients = trainer._loss_and_grad(trainer.sample_batch(index))
+        mx.eval(gradients)
+        flat = dict(tree_flatten(gradients))
+        selected = float(mx.sum(mx.abs(flat[f"mtp_transforms.{index}.projection.weight"])))
+        other = float(mx.sum(mx.abs(flat[f"mtp_transforms.{1 - index}.projection.weight"])))
+        assert selected > 0.0
+        assert other == 0.0
+
+
+def test_accumulation_updates_each_sampled_mtp_head(tmp_path):
+    trainer = _trainer(
+        tmp_path,
+        mtp_depth=2,
+        compile_step=False,
+        grad_accumulation_steps=2,
+    )
+    before = {
+        name: np.array(value)
+        for name, value in tree_flatten(trainer.model.parameters())
+        if name.startswith("mtp_transforms.")
+    }
+    trainer.train(log=lambda *_: None)
+    after = dict(tree_flatten(trainer.model.parameters()))
+
+    assert all(not np.array_equal(value, np.asarray(after[name])) for name, value in before.items())
 
 
 def test_gradient_clipping_caps_the_norm():

@@ -28,6 +28,16 @@ class TernaryBLTOutput:
     decoder_hidden: torch.Tensor
 
 
+class BLTMTPTransform(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, eps=1.1920928955078125e-07)
+        self.projection = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.projection(self.norm(hidden))
+
+
 class TernaryBLTModel(nn.Module):
     def __init__(self, config: TernaryBLTConfig) -> None:
         super().__init__()
@@ -39,7 +49,13 @@ class TernaryBLTModel(nn.Module):
         self.global_transformer = GlobalTransformer(config)
         self.local_decoder = LocalDecoder(config)
         self.output_head = HBitLinear(config.decoder_dim, config.vocab_size, config=config)
+        self.mtp_transforms = nn.ModuleList(
+            BLTMTPTransform(config.decoder_dim) for _ in range(config.mtp_depth)
+        )
         self.fallback_patcher = UniformPatcher(config.patch_size)
+
+    def mtp_logits(self, decoder_hidden: torch.Tensor) -> list[torch.Tensor]:
+        return [self.output_head(transform(decoder_hidden)) for transform in self.mtp_transforms]
 
     def embed_bytes(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None

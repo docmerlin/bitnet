@@ -316,8 +316,7 @@ def prepare_mtp_batch(targets, segment_ids, label_segment_ids, index: int, depth
     shifted_targets = mx.concatenate((targets[:, shift:], mx.zeros_like(targets[:, :shift])), axis=1)
     valid = segment_ids[:, :-shift] == label_segment_ids[:, shift:]
     valid = mx.concatenate((valid, mx.zeros(segment_ids[:, :shift].shape, dtype=mx.bool_)), axis=1)
-    selector = mx.arange(depth) == index
-    return shifted_targets, valid, selector
+    return shifted_targets, valid, mx.array(index, dtype=mx.int32)
 
 
 def create_gradient_step(
@@ -341,10 +340,10 @@ def create_gradient_step(
         rfmoe_alpha,
         mtp_targets=None,
         mtp_valid=None,
-        mtp_selector=None,
+        mtp_index=None,
     ):
-        return_mtp = model.config.mtp_depth > 0
-        if return_mtp and mtp_selector is not None:
+        return_mtp = model.config.mtp_depth > 0 and mtp_loss_coef > 0
+        if return_mtp and mtp_index is not None:
             hidden = model.hidden_states(
                 inputs,
                 segment_ids,
@@ -352,7 +351,7 @@ def create_gradient_step(
                 checkpoint_activations=gradient_checkpointing,
             )
             logits = model.logits_from(hidden)
-            selected_mtp_logits = model.selected_mtp_logits(hidden, mtp_selector)
+            selected_mtp_logits = model.selected_mtp_logits(hidden, mtp_index)
             mtp_logits = []
         else:
             output = model(
@@ -373,7 +372,7 @@ def create_gradient_step(
             # ~1.8 on the term the regulariser is trying to control.
             log_z = mx.logsumexp(logits.astype(mx.float32), axis=-1)
             loss = loss + z_loss_coef * mx.sum(mx.square(log_z) * valid) / mx.maximum(mx.sum(valid), 1)
-        if return_mtp and mtp_selector is not None:
+        if return_mtp and mtp_index is not None:
             loss = loss + mtp_loss_coef * _masked_ce(selected_mtp_logits, mtp_targets, mtp_valid)
         else:
             mtp_losses = []
@@ -443,6 +442,16 @@ def create_apply_step(
     if compile_step:
         apply_step = partial(mx.compile, inputs=state, outputs=state)(apply_step)
     return apply_step, state
+
+
+def accumulate_gradients(accumulated, gradients):
+    if accumulated is None:
+        return gradients
+    return tree_map(
+        lambda total, current: total + current,
+        accumulated,
+        gradients,
+    )
 
 
 def convert_batch(batch) -> tuple[mx.array, mx.array, mx.array, mx.array]:
@@ -947,17 +956,18 @@ def main() -> None:
                 mx.array(rf_s),
                 mx.array(rf_alpha),
             ]
-            if config.mtp_depth > 0:
+            if config.mtp_depth > 0 and args.mtp_loss_coef > 0:
                 index = mtp_head_index(step, microbatch_index, args.grad_accumulation_steps, config.mtp_depth)
                 gradient_args.extend(prepare_mtp_batch(batch[1], batch[2], batch[3], index, config.mtp_depth))
             if args.profile_phases:
                 phase_started = time.perf_counter()
             loss, gradients = gradient_step(*gradient_args)
             hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
+            next_accumulated_gradients = accumulate_gradients(accumulated_gradients, gradients)
             if args.profile_phases:
                 sync_started = time.perf_counter()
             try:
-                mx.eval(loss, gradients, hard_density, model.state)
+                mx.eval(loss, next_accumulated_gradients, hard_density, model.state)
             except RuntimeError as error:
                 if not gradient_is_compiled or "exhausted the available argument buffers" not in str(error):
                     raise
@@ -980,17 +990,14 @@ def main() -> None:
                 gradient_is_compiled = False
                 loss, gradients = gradient_step(*gradient_args)
                 hard_density = model.rfmoe_aux_losses(rf_s, rf_alpha)[3]
-                mx.eval(loss, gradients, hard_density, model.state)
+                next_accumulated_gradients = accumulate_gradients(accumulated_gradients, gradients)
+                mx.eval(loss, next_accumulated_gradients, hard_density, model.state)
             if args.profile_phases:
                 profile_totals["forward_backward"] += time.perf_counter() - phase_started
                 profile_totals["sync_wait"] += time.perf_counter() - sync_started
             losses.append(float(loss.item()))
             hard_densities.append(float(hard_density.item()))
-            accumulated_gradients = gradients if accumulated_gradients is None else tree_map(
-                lambda total, current: total + current,
-                accumulated_gradients,
-                gradients,
-            )
+            accumulated_gradients = next_accumulated_gradients
         if args.profile_phases:
             phase_started = time.perf_counter()
         accumulated_gradients = tree_map(

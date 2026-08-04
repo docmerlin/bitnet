@@ -88,6 +88,8 @@ class BLTDistillationTrainer:
         self.student = student
         self.optimizer = optimizer
         self.config = config
+        if config.mtp_depth:
+            raise ValueError("byte-level MTP training is currently implemented only by blt.mlx_train")
         self.teacher = teacher
         self.weights = weights or DistillationLossWeights()
         self.device = device or next(student.parameters()).device

@@ -14,6 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=64)
+    parser.add_argument("--grad-accumulation-steps", type=int, default=1)
     parser.add_argument("--vocab-size", type=int, default=2048)
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
@@ -23,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-coda-layers", type=int, default=0)
     parser.add_argument("--num-loops", type=int, default=1)
     parser.add_argument("--active-loops", type=int, default=None)
+    parser.add_argument("--mtp-depth", type=int, default=0)
     parser.add_argument("--path-window-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--mud-block-size", type=int, default=64)
@@ -44,10 +46,16 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     if args.steps < 1 or args.warmup_steps < 0:
         raise ValueError("steps must be positive and warmup-steps non-negative")
+    if args.grad_accumulation_steps < 1:
+        raise ValueError("grad-accumulation-steps must be positive")
     if args.hidden_size % args.num_heads:
         raise ValueError("hidden-size must be divisible by num-heads")
     if args.num_loops < 1:
         raise ValueError("num-loops must be positive")
+    if args.mtp_depth < 0:
+        raise ValueError("mtp-depth must be non-negative")
+    if args.mtp_depth >= args.sequence_length:
+        raise ValueError("mtp-depth must be smaller than sequence-length")
     if args.active_loops is not None and not 1 <= args.active_loops <= args.num_loops:
         raise ValueError("active-loops must be between one and num-loops")
     if min(args.num_prelude_layers, args.num_coda_layers) < 0:
@@ -56,12 +64,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("sequence-length must be divisible by path-window-size")
     if args.mud_block_size < 1:
         raise ValueError("mud-block-size must be positive")
+    if args.backend != "mlx" and args.mtp_depth > 0:
+        raise ValueError("MTP benchmark is only available with MLX")
     if args.backend != "mlx" and args.optimizer != "adamw":
         raise ValueError("CMUD benchmark is only available with MLX")
     if args.backend != "mlx" and args.gradient_checkpoint_scope != "none":
         raise ValueError("Activation checkpoint benchmark is only available with MLX")
+    if args.backend != "mlx" and args.grad_accumulation_steps != 1:
+        raise ValueError("Gradient accumulation benchmark is only available with MLX")
     if args.profile_phases and (args.backend != "mlx" or args.optimizer != "cmud"):
         raise ValueError("Phase profiling requires MLX CMUD")
+    if args.profile_phases and args.grad_accumulation_steps != 1:
+        raise ValueError("Phase profiling requires one gradient accumulation step")
 
 
 def run_mlx(args: argparse.Namespace) -> dict[str, float]:
@@ -70,10 +84,11 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
-    from mlx.utils import tree_flatten
+    from mlx.utils import tree_flatten, tree_map
 
     from mlx_model import MLXBitNet, MLXBitNetConfig
     from mlx_optim import CMUD
+    from mlx_train import accumulate_gradients, mtp_head_index, prepare_mtp_batch
 
     dtype = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}[args.mlx_dtype]
     mx.random.seed(1337)
@@ -91,6 +106,7 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
         use_path_kernel=args.mlx_path_kernel,
         use_engram=False,
         use_rfmoe=False,
+        mtp_depth=args.mtp_depth,
         attn_res_mode=getattr(args, "attn_res_mode", "kimi"),
         attn_res_group_size=getattr(args, "attn_res_group_size", None),
     )
@@ -114,52 +130,145 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
         else optim.AdamW(learning_rate=args.learning_rate, weight_decay=0.01)
     )
 
-    def loss_fn(inputs: mx.array, targets: mx.array, segment_ids: mx.array) -> mx.array:
-        logits = model(
+    def loss_fn(
+        inputs: mx.array,
+        targets: mx.array,
+        segment_ids: mx.array,
+        mtp_targets: mx.array,
+        mtp_valid: mx.array,
+        mtp_index: mx.array,
+    ) -> mx.array:
+        hidden = model.hidden_states(
             inputs,
             segment_ids,
             num_loops=args.active_loops,
             checkpoint_activations=args.gradient_checkpoint_scope,
-        ).astype(mx.float32)
-        return nn.losses.cross_entropy(logits, targets, reduction="mean")
+        )
+        logits = model.logits_from(hidden).astype(mx.float32)
+        loss = nn.losses.cross_entropy(logits, targets, reduction="mean")
+        if args.mtp_depth:
+            future_logits = model.selected_mtp_logits(hidden, mtp_index).astype(mx.float32)
+            future_losses = nn.losses.cross_entropy(
+                future_logits,
+                mtp_targets,
+                reduction="none",
+            )
+            loss = loss + 0.3 * mx.sum(future_losses * mtp_valid) / mx.maximum(mx.sum(mtp_valid), 1)
+        return loss
+
+    def mtp_args(targets: mx.array, segment_ids: mx.array, index: int):
+        if args.mtp_depth:
+            return prepare_mtp_batch(
+                targets,
+                segment_ids,
+                segment_ids,
+                index % args.mtp_depth,
+                args.mtp_depth,
+            )
+        return targets, mx.ones(targets.shape, dtype=mx.bool_), mx.array(0, dtype=mx.int32)
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
     optimizer.init(model.trainable_parameters())
     state = [model.state, optimizer.state]
 
     @partial(mx.compile, inputs=model.state, outputs=model.state)
-    def gradient_step(inputs: mx.array, targets: mx.array, segment_ids: mx.array):
-        return loss_and_grad(inputs, targets, segment_ids)
+    def gradient_step(inputs: mx.array, targets: mx.array, segment_ids: mx.array, *mtp):
+        return loss_and_grad(inputs, targets, segment_ids, *mtp)
 
     @partial(mx.compile, inputs=state, outputs=state)
     def apply_step(gradients):
         optimizer.update(model, gradients)
 
     @partial(mx.compile, inputs=state, outputs=state)
-    def train_step(inputs: mx.array, targets: mx.array, segment_ids: mx.array) -> mx.array:
-        loss, gradients = loss_and_grad(inputs, targets, segment_ids)
+    def train_step(inputs: mx.array, targets: mx.array, segment_ids: mx.array, *mtp) -> mx.array:
+        loss, gradients = loss_and_grad(inputs, targets, segment_ids, *mtp)
         optimizer.update(model, gradients)
         return loss
 
-    tokens = mx.random.randint(0, args.vocab_size, (args.batch_size, args.sequence_length + 1))
-    inputs, targets = tokens[:, :-1], tokens[:, 1:]
+    def accumulated_train_step(
+        inputs: mx.array,
+        targets: mx.array,
+        segment_ids: mx.array,
+        optimizer_step: int,
+    ) -> mx.array:
+        accumulated_gradients = None
+        losses = []
+        for index in range(args.grad_accumulation_steps):
+            head_index = (
+                mtp_head_index(
+                    optimizer_step + 1,
+                    index,
+                    args.grad_accumulation_steps,
+                    args.mtp_depth,
+                )
+                if args.mtp_depth
+                else 0
+            )
+            loss, gradients = gradient_step(
+                inputs[index],
+                targets[index],
+                segment_ids[index],
+                *mtp_args(targets[index], segment_ids[index], head_index),
+            )
+            next_accumulated_gradients = accumulate_gradients(accumulated_gradients, gradients)
+            mx.eval(loss, next_accumulated_gradients, model.state)
+            accumulated_gradients = next_accumulated_gradients
+            losses.append(loss)
+        accumulated_gradients = tree_map(
+            lambda gradient: gradient / args.grad_accumulation_steps,
+            accumulated_gradients,
+        )
+        apply_step(accumulated_gradients)
+        mean_loss = mx.mean(mx.stack(losses))
+        mx.eval(mean_loss, state)
+        return mean_loss
+
+    tokens = mx.random.randint(
+        0,
+        args.vocab_size,
+        (args.grad_accumulation_steps, args.batch_size, args.sequence_length + 1),
+    )
+    inputs, targets = tokens[:, :, :-1], tokens[:, :, 1:]
     segment_ids = mx.zeros(inputs.shape, dtype=mx.int32)
-    for _ in range(args.warmup_steps):
+    for warmup_index in range(args.warmup_steps):
+        head_index = warmup_index % max(args.mtp_depth, 1)
         if args.profile_phases:
-            loss, gradients = gradient_step(inputs, targets, segment_ids)
+            loss, gradients = gradient_step(
+                inputs[0],
+                targets[0],
+                segment_ids[0],
+                *mtp_args(targets[0], segment_ids[0], head_index),
+            )
             mx.eval(loss, gradients, model.state)
             apply_step(gradients)
             mx.eval(state)
+        elif args.grad_accumulation_steps > 1:
+            accumulated_train_step(inputs, targets, segment_ids, warmup_index)
         else:
-            mx.eval(train_step(inputs, targets, segment_ids), state)
+            mx.eval(
+                train_step(
+                    inputs[0],
+                    targets[0],
+                    segment_ids[0],
+                    *mtp_args(targets[0], segment_ids[0], head_index),
+                ),
+                state,
+            )
     mx.reset_peak_memory()
     start = time.perf_counter()
     loss = None
     phase_totals = {"forward_backward": 0.0, "mud": 0.0, "sync_wait": 0.0}
-    for _ in range(args.steps):
+    for step_index in range(args.steps):
+        optimizer_step = args.warmup_steps + step_index
+        head_index = optimizer_step % max(args.mtp_depth, 1)
         if args.profile_phases:
             phase_started = time.perf_counter()
-            loss, gradients = gradient_step(inputs, targets, segment_ids)
+            loss, gradients = gradient_step(
+                inputs[0],
+                targets[0],
+                segment_ids[0],
+                *mtp_args(targets[0], segment_ids[0], head_index),
+            )
             sync_started = time.perf_counter()
             mx.eval(loss, gradients, model.state)
             phase_totals["forward_backward"] += time.perf_counter() - phase_started
@@ -171,8 +280,15 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
             mx.eval(state)
             phase_totals["mud"] += time.perf_counter() - phase_started
             phase_totals["sync_wait"] += time.perf_counter() - sync_started
+        elif args.grad_accumulation_steps > 1:
+            loss = accumulated_train_step(inputs, targets, segment_ids, optimizer_step)
         else:
-            loss = train_step(inputs, targets, segment_ids)
+            loss = train_step(
+                inputs[0],
+                targets[0],
+                segment_ids[0],
+                *mtp_args(targets[0], segment_ids[0], head_index),
+            )
             mx.eval(loss, state)
     elapsed = time.perf_counter() - start
     peak_memory = mx.get_peak_memory()
@@ -183,11 +299,22 @@ def run_mlx(args: argparse.Namespace) -> dict[str, float]:
         "parameters": float(parameters),
         "peak_memory_gib": peak_memory / 1024**3,
         "steps_per_second": args.steps / elapsed,
-        "tokens_per_second": args.steps * args.batch_size * args.sequence_length / elapsed,
+        "tokens_per_second": (
+            args.steps
+            * args.batch_size
+            * args.sequence_length
+            * args.grad_accumulation_steps
+            / elapsed
+        ),
     }
     if args.profile_phases:
         validation_started = time.perf_counter()
-        validation_loss = loss_fn(inputs, targets, segment_ids)
+        validation_loss = loss_fn(
+            inputs[0],
+            targets[0],
+            segment_ids[0],
+            *mtp_args(targets[0], segment_ids[0], 0),
+        )
         mx.eval(validation_loss, model.state)
         metrics.update(
             {f"profile_{phase}_seconds": value / args.steps for phase, value in phase_totals.items()}
