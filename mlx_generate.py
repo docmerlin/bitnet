@@ -189,7 +189,7 @@ def load_model(
         1.0 - training_args.get("stage1_activation_mix_start", 0.0)
     )
     stage_bits = training_args.get("stage1_activation_bits", 8)
-    final_bits = training_args.get("final_activation_bits", 4)
+    final_bits = training_args.get("final_activation_bits", 8)
     model.set_quantization_state(weight_mix, activation_mix, round(stage_bits - fraction * (stage_bits - final_bits)))
     model.recurrent_quantized_matmul = weight_mix >= 1.0
     model.set_path_decode_mode(path_decode_mode)

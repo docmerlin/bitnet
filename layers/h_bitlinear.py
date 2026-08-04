@@ -129,7 +129,7 @@ class HBitLinear(nn.Module):
         self.weight_quantization_mix = 1.0
         self.activation_quantization_mix = 1.0
         # TernaryBLTConfig carries this; TernaryConfig does not and keeps 4.
-        self.activation_bits = int(getattr(config, "activation_bits", 4))
+        self.activation_bits = int(getattr(config, "activation_bits", 8))
         self.enable_weight_quantization = True
         self.enable_activation_quantization = True
 

@@ -229,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage1-weight-mix-start", type=float, default=0.25)
     parser.add_argument("--stage1-activation-mix-start", type=float, default=0.0)
     parser.add_argument("--stage1-activation-bits", type=int, default=8)
-    parser.add_argument("--final-activation-bits", type=int, default=4)
+    parser.add_argument("--final-activation-bits", type=int, default=8)
     parser.add_argument("--precision", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)

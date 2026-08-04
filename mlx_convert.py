@@ -304,7 +304,7 @@ def _set_quantization_state(model: MLXBitNet, payload: dict) -> None:
     weight_start = args.get("stage1_weight_mix_start", 0.25)
     activation_start = args.get("stage1_activation_mix_start", 0.0)
     stage_bits = args.get("stage1_activation_bits", 8)
-    final_bits = args.get("final_activation_bits", 4)
+    final_bits = args.get("final_activation_bits", 8)
     weight_mix = weight_start + fraction * (1.0 - weight_start)
     activation_mix = activation_start + fraction * (1.0 - activation_start)
     if not payload["model_config"].get("use_4bit_activations", True):

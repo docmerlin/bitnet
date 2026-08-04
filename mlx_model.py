@@ -81,7 +81,10 @@ class MLXBitNetConfig:
     use_topk_blocks: bool = False
     topk_blocks: int = 4
     topk_block_size: int = 64
-    activation_bits: int = 4
+    # 8-bit matches BLT: 4-bit activations collapse after the ramp at cold start
+    # and fake-quant train speed is flat across bit width. M=1 fused decode can
+    # still use whatever width the checkpoint pinned.
+    activation_bits: int = 8
     use_4bit_activations: bool = True
     use_hadamard: bool = True
     use_path_kernel: bool = True

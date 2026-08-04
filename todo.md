@@ -628,9 +628,10 @@ regressions can be reverted.**
   grows them). Prefer measured bytes/hour over step ms alone.
 - [ ] **Drop first prelude MLP / first attention (R30/R35).** Free A/B given the
   prelude/recurrent/coda split.
-- [ ] **BitNet activation width → 8-bit default.** BLT already at 8 (4-bit collapses after
-  ramp; fake-quant so train speed is flat). BitNet still defaults 4 for checkpoint continuity;
-  switch unless M=1 decode truly needs 4-bit acts.
+- [x] **BitNet activation width → 8-bit default.** BLT already at 8 (4-bit collapses after
+  ramp; fake-quant so train speed is flat). `MLXBitNetConfig.activation_bits`,
+  `--final-activation-bits` (torch+MLX trainers), and convert/generate fallbacks now 8.
+  Old checkpoints that saved `final_activation_bits: 4` still load that value.
 
 **Generation:**
 
