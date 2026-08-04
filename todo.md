@@ -609,10 +609,20 @@ regressions can be reverted.**
   measured +5.8% at 1B because the same block runs R times; BLT locals each fire once
   per forward so a per-step cache only helps under grad accum if the same graph reuses
   arrays. Measure before adopting; prefer full unify + packed path for train.
-- [ ] **Gate `--recurrent-quantized-matmul` by scale.** Packed path loses at every small
-  training token count measured and wins at full 1B seq 256 (+25%). Defaulting always-on
-  (or always-off) is wrong for one of the two regimes. Gate on token count / width; validate
-  at both 50M and 1B before flipping production.
+- [x] **Re-measured `--recurrent-quantized-matmul` (2026-08-04); keep default on.** Prior note
+  claimed packed loses at every small training token count and only wins at full 1B. Fresh
+  interleaved A/B on current kernels (train fwd+bwd, weight_mix=1, act 8-bit):
+
+  | setup | dense | packed | packed/dense |
+  |---|---|---|---|
+  | h256 L4×2 b4 s128 (512 tok) | 65.2 ms | 62.7 ms | **0.96×** |
+  | h512 L4×2 b4 s256 (1024 tok) | 145.0 ms | 142.4 ms | **0.98×** |
+  | h1024 L2×1 b1 s256 (256 tok) | 59.8 ms | 53.6 ms | **0.90×** |
+
+  Isolated 1024→2048 GEMM still slows at ≥1024 tokens (1.10–1.12×), but end-to-end steps
+  stay mildly faster with packed on — the old 52M “turn it off → 1.10×” result does not
+  reproduce. Keep CLI default True with existing guards (`seq ≥ 128`, `weight_mix ≥ 1`).
+  No scale gate flip.
 - [ ] **Wall-clock curricula:** batch-size schedule, max-seq schedule, and re-check attention
   window curriculum direction (`initial-blocks`/`final-blocks` may shrink windows; speedrun
   grows them). Prefer measured bytes/hour over step ms alone.
