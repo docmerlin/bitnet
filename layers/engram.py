@@ -46,9 +46,26 @@ class Engram(nn.Module):
         memory_size = num_tables * config.engram_head_dim
         self.key_proj = nn.Linear(memory_size, config.hidden_size, bias=False)
         self.value_proj = nn.Linear(memory_size, config.hidden_size, bias=False)
-        self.key_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.query_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.conv_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        from layers.dyt import make_norm
+
+        self.key_norm = make_norm(
+            config.hidden_size,
+            norm_type=config.norm_type,
+            eps=config.rms_norm_eps,
+            alpha_init=config.dyt_alpha_init,
+        )
+        self.query_norm = make_norm(
+            config.hidden_size,
+            norm_type=config.norm_type,
+            eps=config.rms_norm_eps,
+            alpha_init=config.dyt_alpha_init,
+        )
+        self.conv_norm = make_norm(
+            config.hidden_size,
+            norm_type=config.norm_type,
+            eps=config.rms_norm_eps,
+            alpha_init=config.dyt_alpha_init,
+        )
         self.short_conv = nn.Conv1d(
             config.hidden_size,
             config.hidden_size,

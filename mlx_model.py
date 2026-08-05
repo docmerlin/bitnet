@@ -89,6 +89,10 @@ class MLXBitNetConfig:
     use_hadamard: bool = True
     use_path_kernel: bool = True
     rms_norm_eps: float = 1e-5
+    # Residual-stream norm: "rms" (default) or "dyt" (Dynamic Tanh, arXiv:2503.10622).
+    # QK-norm stays RMSNorm either way.
+    norm_type: str = "rms"
+    dyt_alpha_init: float = 0.5
     use_engram: bool = True
     engram_layer_ids: tuple[int, ...] = (1, 15)
     engram_vocab_size: int | None = None  # None → ~engram_param_fraction of body
@@ -141,6 +145,16 @@ class MLXBitNetConfig:
         if mode not in {"kimi", "sandwich"}:
             raise ValueError("attn_res_mode must be 'kimi' or 'sandwich'")
         object.__setattr__(self, "attn_res_mode", mode)
+        norm = str(self.norm_type).lower()
+        if norm not in {"rms", "rmsnorm", "rms_norm", "dyt", "dynamic_tanh", "dynamictanh"}:
+            raise ValueError("norm_type must be 'rms' or 'dyt'")
+        object.__setattr__(
+            self,
+            "norm_type",
+            "dyt" if norm.startswith("dy") or "tanh" in norm else "rms",
+        )
+        if float(self.dyt_alpha_init) <= 0:
+            raise ValueError("dyt_alpha_init must be positive")
         if self.attn_res_group_size is None:
             object.__setattr__(
                 self, "attn_res_group_size", max(1, self.num_hidden_layers // 8)
@@ -188,13 +202,67 @@ class MLXBitNetConfig:
         return self.num_prelude_layers + self.num_recurrent_layers * self.num_loops + self.num_coda_layers
 
 
-class MLXDepthAttnMix(nn.Module):
-    """Kimi AttnRes depth mix: h = softmax(wᵀ RMSNorm(V)) · V over depth axis."""
+class MLXDynamicTanh(nn.Module):
+    """DyT: γ ⊙ tanh(α x) + β (Zhu et al., arXiv:2503.10622)."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-5):
+    def __init__(self, dims: int, alpha_init: float = 0.5):
+        super().__init__()
+        if dims < 1:
+            raise ValueError("dims must be positive")
+        self.alpha = mx.array(float(alpha_init))
+        self.weight = mx.ones((int(dims),))
+        self.bias = mx.zeros((int(dims),))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.tanh(self.alpha * x) * self.weight + self.bias
+
+
+def mlx_make_norm(
+    dim: int,
+    config: MLXBitNetConfig | None = None,
+    *,
+    norm_type: str | None = None,
+    eps: float | None = None,
+    alpha_init: float | None = None,
+) -> nn.Module:
+    """RMSNorm or DyT for residual-stream sites (not QK-norm)."""
+    kind = (norm_type if norm_type is not None else getattr(config, "norm_type", "rms")).lower()
+    if kind in {"dyt", "dynamic_tanh", "dynamictanh"} or kind.startswith("dy"):
+        init = (
+            float(alpha_init)
+            if alpha_init is not None
+            else float(getattr(config, "dyt_alpha_init", 0.5))
+        )
+        return MLXDynamicTanh(dim, alpha_init=init)
+    return nn.RMSNorm(
+        dim,
+        eps=float(eps if eps is not None else getattr(config, "rms_norm_eps", 1e-5)),
+    )
+
+
+class MLXDepthAttnMix(nn.Module):
+    """Kimi AttnRes depth mix: h = softmax(wᵀ Norm(V)) · V over depth axis."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-5,
+        *,
+        norm_type: str = "rms",
+        dyt_alpha_init: float = 0.5,
+        config: MLXBitNetConfig | None = None,
+    ):
         super().__init__()
         self.proj = nn.Linear(hidden_size, 1, bias=False)
-        self.norm = nn.RMSNorm(hidden_size, eps=eps)
+        if config is not None:
+            self.norm = mlx_make_norm(hidden_size, config)
+        else:
+            self.norm = mlx_make_norm(
+                hidden_size,
+                norm_type=norm_type,
+                eps=eps,
+                alpha_init=dyt_alpha_init,
+            )
         self.proj.weight = mx.zeros_like(self.proj.weight)
 
     def __call__(self, completed: list[mx.array], partial: mx.array) -> mx.array:
@@ -488,9 +556,9 @@ class MLXEngram(nn.Module):
         memory_size = self.num_tables * config.engram_head_dim
         self.key_proj = nn.Linear(memory_size, config.hidden_size, bias=False)
         self.value_proj = nn.Linear(memory_size, config.hidden_size, bias=False)
-        self.key_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.query_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.conv_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.key_norm = mlx_make_norm(config.hidden_size, config)
+        self.query_norm = mlx_make_norm(config.hidden_size, config)
+        self.conv_norm = mlx_make_norm(config.hidden_size, config)
         self.short_conv_weight = mx.random.uniform(
             low=-config.engram_kernel_size**-0.5,
             high=config.engram_kernel_size**-0.5,
@@ -886,7 +954,7 @@ class MLXLoopHyperConnection(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         flat = 4 * config.hidden_size
-        self.norm = nn.RMSNorm(flat, eps=config.rms_norm_eps)
+        self.norm = mlx_make_norm(flat, config)
         self.w_pre = nn.Linear(flat, 4)
         self.w_post = nn.Linear(flat, 4)
         self.w_res = nn.Linear(flat, 4)
@@ -1730,10 +1798,10 @@ class MLXHybridBlock(nn.Module):
         self.layer_id = layer_id
         self.attn_res_mode = config.attn_res_mode
         self.engram = MLXEngram(config, layer_id) if config.use_engram and layer_id in config.engram_layer_ids else None
-        self.attn_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+        self.attn_norm = mlx_make_norm(hidden, config)
         self.attn = MLXPaTHAttention(config)
         self.attn_gate = mx.array([0.0])
-        self.mlp_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+        self.mlp_norm = mlx_make_norm(hidden, config)
         self.moe = MLXRFMoE(config) if config.use_rfmoe else None
         if self.moe is None:
             self.up = MLXHBitLinear(hidden, intermediate * 2, config)
@@ -1754,19 +1822,19 @@ class MLXHybridBlock(nn.Module):
             self.down = MLXHBitLinear(intermediate, hidden, config)
             self.down.weight = self.down.weight * 0.01
         if self.attn_res_mode == "kimi":
-            self.attn_res_mix = MLXDepthAttnMix(hidden, eps=config.rms_norm_eps)
-            self.mlp_res_mix = MLXDepthAttnMix(hidden, eps=config.rms_norm_eps)
+            self.attn_res_mix = MLXDepthAttnMix(hidden, config=config)
+            self.mlp_res_mix = MLXDepthAttnMix(hidden, config=config)
             # Keep sandwich attrs for convert soft-load / sandwich mode compatibility.
-            self.attn_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.attn_post = mlx_make_norm(hidden, config)
             self.attn_scale = mx.array([0.1])
-            self.mlp_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.mlp_post = mlx_make_norm(hidden, config)
             self.mlp_scale = mx.array([0.1])
         else:
             self.attn_res_mix = None
             self.mlp_res_mix = None
-            self.attn_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.attn_post = mlx_make_norm(hidden, config)
             self.attn_scale = mx.array([0.1])
-            self.mlp_post = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
+            self.mlp_post = mlx_make_norm(hidden, config)
             self.mlp_scale = mx.array([0.1])
 
     def _dense_mlp(self, x: mx.array) -> mx.array:
@@ -2080,13 +2148,13 @@ class MLXBitNet(nn.Module):
         )
         if self.lm_head is not None:
             self.lm_head.weight = self.lm_head.weight * 0.01
-        self.subln = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.subln = mlx_make_norm(config.hidden_size, config)
         self.blocks = [MLXHybridBlock(config, layer_id) for layer_id in range(config.num_hidden_layers)]
         self.loop_hc = MLXLoopHyperConnection(config)
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = mlx_make_norm(config.hidden_size, config)
         self.mtp_transforms = [
             nn.Sequential(
-                nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                mlx_make_norm(config.hidden_size, config),
                 nn.Linear(config.hidden_size, config.hidden_size, bias=False),
             )
             for _ in range(config.mtp_depth)

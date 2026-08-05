@@ -58,9 +58,21 @@ class BitNetDeep(nn.Module):
         self.num_recurrent = int(self.config.num_recurrent_layers)
         self.num_coda = int(self.config.num_coda_layers)
 
+        from layers.dyt import make_norm
+
         self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
-        self.norm = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        self.subln = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.norm = make_norm(
+            self.config.hidden_size,
+            norm_type=self.config.norm_type,
+            eps=self.config.rms_norm_eps,
+            alpha_init=self.config.dyt_alpha_init,
+        )
+        self.subln = make_norm(
+            self.config.hidden_size,
+            norm_type=self.config.norm_type,
+            eps=self.config.rms_norm_eps,
+            alpha_init=self.config.dyt_alpha_init,
+        )
 
         self.layers = nn.ModuleList(
             HybridTransformerBlock(self.config, layer_id=layer_id)
@@ -71,6 +83,8 @@ class BitNetDeep(nn.Module):
         self.loop_hc = LoopHyperConnection(
             hidden_size=self.config.hidden_size,
             rms_norm_eps=self.config.rms_norm_eps,
+            norm_type=self.config.norm_type,
+            dyt_alpha_init=self.config.dyt_alpha_init,
         )
 
         # Full-precision output projection; tied to the embedding only when
@@ -81,7 +95,12 @@ class BitNetDeep(nn.Module):
         if self.mtp_depth > 0:
             self.mtp_transforms = nn.ModuleList(
                 nn.Sequential(
-                    nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps),
+                    make_norm(
+                        self.config.hidden_size,
+                        norm_type=self.config.norm_type,
+                        eps=self.config.rms_norm_eps,
+                        alpha_init=self.config.dyt_alpha_init,
+                    ),
                     nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=False),
                 )
                 for _ in range(self.mtp_depth)

@@ -435,11 +435,23 @@ bumps.
   NorMuon's actual mechanism is a second-moment EMA per neuron, so neurons with a
   historically large update get damped over time. Costs one vector per matrix. Only worth
   building if the stateless version above shows a signal.
-- [ ] **Logit softcap (R9, R18, R54).** `23 * sigmoid((logits + 5) / 7.5)` in the current
-  script. Previously dismissed here as redundant with `--z-loss-coef`, which was probably
-  wrong: it entered at R9, was retuned at R18 and R54, and by R60/R79 they had written fused
-  kernels for it — it stayed in the recipe for 70 records. z-loss penalises logit growth but
-  does not bound it.
+- [x] **Logit softcap (R9, R18, R54).** Implemented as Gemma/speedrun form
+  ``cap * tanh(z / cap)`` (not the later sigmoid variant). Train-only; eval CE stays
+  uncapped. Wired in `training/losses.py` + `mlx_train.create_gradient_step`; CLI
+  `--logit-softcap` (default **30** after A/B). Coexists with z-loss (z-loss on capped
+  logits).
+
+  **Small A/B (2026-08-05, same 1.50M setup as DyT, seed 1337, 100k tokens):**
+
+  | step | softcap=0 val (ppl) | softcap=30 val (ppl) |
+  |---|---|---|
+  | 50 | 7.534 (1870) | **7.509 (1825)** |
+  | 100 | 3.791 (44.3) | **3.737 (42.0)** |
+  | 150 | 3.261 (26.1) | **3.240 (25.5)** |
+  | final train | 3.183 | 3.165 |
+
+  Modest but consistent win on uncapped val CE; no throughput regression (~14s both).
+  Logs: `runs/softcap_ab/`. Default on at 30; `--logit-softcap 0` restores old behaviour.
 - [ ] **Tie early, untie at 2/3 of training (R51, R53).** The current head-tying default here
   (untied from step 0) matches R8-R50. Their later refinement re-ties (R51) and then splits at
   2/3 through the run, copying optimizer state from `lm_head` to `embed` at the split. Needs a
@@ -639,8 +651,108 @@ regressions can be reverted.**
 
 **Quality-per-token (not step ms):**
 
-- [ ] Embedding LR sweep (10–30× body); `--mud-neuron-norm` / C-NorMUD A/B; logit softcap;
+- [ ] Embedding LR sweep (10–30× body); `--mud-neuron-norm` / C-NorMUD A/B;
   value embeddings in the byte encoder; sampled byte MTP on BLT (in progress).
+  (Logit softcap done — default 30.)
+
+#### Training efficiency from 2025–26 literature (2026-08-05)
+
+Literature pass after the NanoGPT-speedrun audit and BLT throughput work. Goal: **faster
+time-to-loss** (sample efficiency and wall-clock), not only inference tok/s. Split into
+**best options** (highest expected leverage for this stack) and **lowest risk** (cheap to
+try, hard to regress). Several items compose with MUD/CMUD, ternary BitNet, BLT patches,
+and RFMoE already in-tree.
+
+**Best options (highest expected impact):**
+
+- [ ] **MuonClip-style attention logit control on the MUD path.** Kimi K2 / Moonshot
+  (Muon scaling + MuonClip): per-head negative feedback that rescales Q/K when attention
+  logits explode, unlocking long stable pretrain without loss spikes. Stability *is*
+  training speed here — one spike wastes more wall-clock than most kernel wins. Fits this
+  repo: we already run MUD (triangular whitening, not Newton–Schulz) and QK-norm; add a
+  cheap per-head logit monitor + scale on Q or K after the MUD update (or soft clamp on
+  scores at forward). A/B: steps-to-target-loss and spike count on a 50M-class BitNet or
+  BLT-global run. Refs: Keller Jordan Muon; Moonshot "Muon is Scalable for LLM Training"
+  (arXiv:2502.16982); Kimi K2 / MuonClip writeups.
+- [ ] **Keep pushing BLT patch coarseness + thinner global depth as first-class knobs.**
+  Already the largest measured wall-clock lever on this machine (coarser patches ~+25%,
+  thinner recurrent ~+44%, combo ~1.75× vs 48×3 p128). Treat as ongoing schedule: patch
+  size / `patches_per_sequence`, global R and width, encoder/decoder depth — with
+  equal-byte and equal-wall-clock A/Bs, not only step ms. Complements entropy patching;
+  large patches and BLT-S are substitutes (see generation section).
+- [ ] **Hybrid linear attention on the global path (Gated DeltaNet / KDA style).** 2025
+  production pattern (Qwen3-Next, Kimi Linear): ~3:1 linear-state layers : full attention
+  for long context at near-linear cost while keeping occasional softmax layers for hard
+  dependencies. Best applied to BLT's **global** transformer (or BitNet recurrent core),
+  not the tiny byte locals. Prototype: replace every 4th global block's full/PaTH attn
+  with a Gated DeltaNet (or Mamba-2) block; measure train tokens/s, peak memory at long
+  sequences, and loss vs dense baseline. Higher implementation cost than DyT/MuonClip;
+  high ceiling if patch sequences grow. Refs: Gated DeltaNet (Yang et al.); Kimi Linear
+  (arXiv:2510.26692); Raschka architecture comparison 2025.
+- [ ] **RFMoE quality + fused grouped expert GEMM (train path).** Sparse capacity is the
+  other 2025 default for quality-per-active-FLOP (DeepSeek-style fine-grained MoE + shared
+  experts). We have RFMoE + Metal sparse kernel scaffolding; open work is (1) base-model
+  density/quality after a real train, (2) fused grouped/padded expert body matmuls so
+  sparsity wins wall-clock not only FLOPs, (3) shared+routed split / aux-free balance
+  ideas where they map onto self-gating. Blocked on Phase 2+ base train (Status).
+- [ ] **SOAP (or similar second-order) trial vs MUD at small/medium scale.** SOAP
+  (Shampoo + Adam in eigenbasis) reports ~40% fewer iterations / ~35% wall-clock vs AdamW
+  in large-batch LM pretrain. Heavier optimizer state than MUD; only interesting if
+  step-efficiency beats MUD enough to pay memory. Run a fair equal-token A/B on ~50M with
+  matched LR search before any production swap. Ref: Vyas et al. SOAP (ICLR / arXiv:2409.11321).
+
+**Lowest risk (cheap A/B, additive, or free at decode):**
+
+- [~] **DyT (Dynamic Tanh) as drop-in for residual-stream RMSNorms.** Implemented
+  (`layers/dyt.py`, `MLXDynamicTanh`, `--norm-type {rms,dyt}`, `--dyt-alpha-init`).
+  Replaces pre-attn/pre-mlp, final, subln, AttnRes, Engram, loop-HC, MTP norms; **QK-norm
+  stays RMSNorm**. Paper: arXiv:2503.10622.
+
+  **Small A/B (2026-08-05, M1 Max):** 1.50M BitNet, h128, 1+2×1+1, seq 128, 100k tokens,
+  same seed/data/LR, full quant ramp, no Engram/MTP. Logs under `runs/dyt_ab/`.
+
+  | step | RMS val loss (ppl) | DyT val loss (ppl) |
+  |---|---|---|
+  | 50 | 7.53 (1872) | 7.91 (2736) |
+  | 100 | 3.79 (44) | 6.53 (682) |
+  | 150 | **3.26 (26)** | 4.83 (126) |
+  | final train | **~3.18** | ~4.32 |
+
+  DyT started lower loss (~8.3 vs ~10.9) but **converged much worse**; grad norms stayed
+  elevated (~6 vs ~0.8 late). Mean tok/s step≥20: RMS ~9.6k vs DyT ~7.6k (not faster on
+  this size). Learned DyT α moved off 0.5 (see run). **Keep default `rms`.** Possible
+  follow-ups only if motivated: LR retune for DyT, α init sweep, or DyT only on locals
+  (BLT) while global stays RMS. Derf not worth it until DyT beats RMS.
+- [x] **Logit softcap (speedrun R9/R18/R54)** — landed; default 30. See NanoGPT audit.
+- [ ] **`--mud-neuron-norm` training A/B** — already wired (stateless NorMuon premise on
+  MUD); default off. One flag, no architecture change. See NanoGPT "Worth doing".
+- [ ] **Align MUD block size to head_dim / 2×head_dim (R80-style)** — no-code experiment if
+  defaults already match; else one CLI default tweak. See per-head-pair orthogonalisation
+  note under NanoGPT audit.
+- [ ] **Wall-clock curricula** (batch-size, max-seq, attention-window direction) — already
+  under Training throughput backlog; reaffirm as lowest-risk systems win: measure
+  **bytes/hour to target loss**, not only ms/step.
+- [ ] **BLT-S self-speculation** — already implemented and deferred pending a trained
+  entropy student (see BLT generation performance). Zero train risk; inference-only;
+  quality-preserving under greedy. Revisit when student patches ~2–4 bytes.
+- [ ] **Drop first prelude MLP / first attention (R30/R35)** — already listed; free A/B
+  given prelude/recurrent/coda. Architecture flag, not a new subsystem.
+- [ ] **Elementwise optimizer every other step (R39)** — halves C-Lion/embedding-group
+  work; low risk if body MUD still steps every update.
+
+**Explicitly not prioritizing for train wall-clock (keep on ice):**
+
+- **MLA (Multi-Head Latent Attention):** mainly KV-cache / long-decode; adopt if global
+  patch context becomes long and memory-bound.
+- **BLT-D / BLT-DV block diffusion:** large gen win, real quality cost + retrain — already
+  deferred under BLT generation.
+- **nGPT hypersphere residual stream:** strong sample-efficiency claims (4–20× fewer
+  steps) but high integration risk with ternary STE / BitLinear; revisit only after DyT
+  and MuonClip land.
+
+Refs (short): Muon/MuonClip arXiv:2502.16982; SOAP arXiv:2409.11321; DyT arXiv:2503.10622;
+Gated DeltaNet / Kimi Linear arXiv:2510.26692; Fast BLT arXiv:2605.08044; nGPT
+arXiv:2410.01131; Raschka "State of LLMs 2025" architecture comparison.
 
 ---
 

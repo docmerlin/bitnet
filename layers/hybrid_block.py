@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from config import TernaryConfig
 from layers.attn_res import AttentionResidual, AttnResStream, SandwichResidual
+from layers.dyt import make_norm
 from layers.engram import Engram
 from layers.h_bitlinear import HBitLinear
 from layers.infini_attention import InfiniAttention
@@ -52,17 +53,35 @@ class HybridTransformerBlock(nn.Module):
         )
 
         # Pre-norms (paper: norm before attn / mlp on mixed residual).
-        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=eps)
-        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=eps)
+        self.attn_norm = make_norm(
+            config.hidden_size,
+            norm_type=config.norm_type,
+            eps=eps,
+            alpha_init=config.dyt_alpha_init,
+        )
+        self.mlp_norm = make_norm(
+            config.hidden_size,
+            norm_type=config.norm_type,
+            eps=eps,
+            alpha_init=config.dyt_alpha_init,
+        )
 
         self.infini_attn = InfiniAttention(config)
 
         if self.attn_res_mode == "sandwich":
             self.attn_res = SandwichResidual(
-                config.hidden_size, init_scale=config.attn_res_init_scale, eps=eps
+                config.hidden_size,
+                init_scale=config.attn_res_init_scale,
+                eps=eps,
+                norm_type=config.norm_type,
+                dyt_alpha_init=config.dyt_alpha_init,
             )
             self.mlp_res = SandwichResidual(
-                config.hidden_size, init_scale=config.attn_res_init_scale, eps=eps
+                config.hidden_size,
+                init_scale=config.attn_res_init_scale,
+                eps=eps,
+                norm_type=config.norm_type,
+                dyt_alpha_init=config.dyt_alpha_init,
             )
             self.attn_res_mix = None
             self.mlp_res_mix = None
@@ -70,8 +89,18 @@ class HybridTransformerBlock(nn.Module):
             # Per-layer pseudo-queries (paper assigns w_l per layer / branch).
             from layers.attn_res import DepthAttnMix
 
-            self.attn_res_mix = DepthAttnMix(config.hidden_size, eps=eps)
-            self.mlp_res_mix = DepthAttnMix(config.hidden_size, eps=eps)
+            self.attn_res_mix = DepthAttnMix(
+                config.hidden_size,
+                eps=eps,
+                norm_type=config.norm_type,
+                dyt_alpha_init=config.dyt_alpha_init,
+            )
+            self.mlp_res_mix = DepthAttnMix(
+                config.hidden_size,
+                eps=eps,
+                norm_type=config.norm_type,
+                dyt_alpha_init=config.dyt_alpha_init,
+            )
             # Keep attributes for old metric code / soft-load probes.
             self.attn_res = None
             self.mlp_res = None

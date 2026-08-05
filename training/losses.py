@@ -16,20 +16,33 @@ from layers.rfmoe import (
 )
 
 
+def softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
+    """Smooth logit bound: ``cap * tanh(logits / cap)`` (Gemma / speedrun style).
+
+    Near zero the map is nearly identity; large values approach ±cap. ``cap <= 0``
+    is a no-op so callers can pass a disabled flag without branching.
+    """
+    if cap is None or float(cap) <= 0.0:
+        return logits
+    c = float(cap)
+    return c * torch.tanh(logits / c)
+
+
 def language_modeling_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     *,
     z_loss_coef: float = 0.0,
+    logit_softcap: float = 0.0,
 ) -> torch.Tensor:
-    """Token cross-entropy plus an optional z-loss regularizer.
+    """Token cross-entropy plus optional softcap and z-loss.
 
-    The z-loss penalizes the squared log-partition ``logsumexp(logits)`` so the
-    softmax normalizer stays near one. It keeps logits from drifting in
-    low-precision ternary training and lets the optimizer run a higher learning
-    rate without diverging. It is a training-time term only; evaluation reports
-    plain cross-entropy so perplexity stays comparable.
+    Softcap bounds logit magnitude before CE (and before z-loss when both are
+    on). Z-loss penalizes squared ``logsumexp`` so the softmax normalizer stays
+    near one. Both are training-time terms; evaluation reports plain CE so
+    perplexity stays comparable across softcap on/off runs.
     """
+    logits = softcap_logits(logits, logit_softcap)
     flat_logits = logits.reshape(-1, logits.size(-1))
     flat_labels = labels.reshape(-1)
     valid = flat_labels.ne(-100)
@@ -50,6 +63,8 @@ def multi_token_loss(
     labels: torch.Tensor,
     segment_ids: Optional[torch.Tensor] = None,
     label_segment_ids: Optional[torch.Tensor] = None,
+    *,
+    logit_softcap: float = 0.0,
 ) -> torch.Tensor:
     """Mean cross-entropy over the extra multi-token-prediction heads.
 
@@ -76,7 +91,7 @@ def multi_token_loss(
             )
         if not torch.any(target.ne(-100)):
             continue
-        depth_loss = language_modeling_loss(pred, target)
+        depth_loss = language_modeling_loss(pred, target, logit_softcap=logit_softcap)
         total = depth_loss if total is None else total + depth_loss
         counted += 1
     if counted == 0:
@@ -95,6 +110,7 @@ def compute_train_loss(
     segment_ids: Optional[torch.Tensor] = None,
     label_segment_ids: Optional[torch.Tensor] = None,
     z_loss_coef: float = 0.0,
+    logit_softcap: float = 0.0,
     mtp_loss_coef: float = 0.0,
     density_lam: float = 0.0,
     locality_coef: float = 0.0,
@@ -102,7 +118,7 @@ def compute_train_loss(
     rfmoe_s: float = 1.0,
     rfmoe_alpha: float = 0.1,
 ) -> torch.Tensor:
-    """Compose CE (+ z-loss), optional MTP, and independent RFMoE aux terms.
+    """Compose CE (+ softcap / z-loss), optional MTP, and independent RFMoE aux terms.
 
     RFMoE density, locality, and diversity are separate knobs: enabling locality
     or diversity no longer depends on the density controller object existing.
@@ -110,10 +126,16 @@ def compute_train_loss(
     """
     if segment_ids is not None and label_segment_ids is not None:
         labels = labels.masked_fill(segment_ids.ne(label_segment_ids), -100)
-    loss = language_modeling_loss(logits, labels, z_loss_coef=z_loss_coef)
+    loss = language_modeling_loss(
+        logits, labels, z_loss_coef=z_loss_coef, logit_softcap=logit_softcap
+    )
     if mtp_logits:
         loss = loss + mtp_loss_coef * multi_token_loss(
-            list(mtp_logits), labels, segment_ids, label_segment_ids
+            list(mtp_logits),
+            labels,
+            segment_ids,
+            label_segment_ids,
+            logit_softcap=logit_softcap,
         )
 
     if not any(iter_rfmoe(model)):

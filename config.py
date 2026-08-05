@@ -71,6 +71,11 @@ class TernaryConfig:
     # vs the classic 2-mat FFN; power-of-two intermediate also enables Hadamard on mid.
     intermediate_size: int = 2048
     rms_norm_eps: float = 1e-5
+    # Residual-stream normalization: "rms" (default) or "dyt" (Dynamic Tanh,
+    # arXiv:2503.10622). QK-norm stays RMSNorm either way — it stabilises attention
+    # logits, not the residual stream.
+    norm_type: str = "rms"
+    dyt_alpha_init: float = 0.5
     initializer_range: float = 0.02
 
     # Hybrid block parameters (every layer: Infini/PaTH + residual path)
@@ -177,6 +182,12 @@ class TernaryConfig:
         if mode not in {"kimi", "sandwich"}:
             raise ValueError("attn_res_mode must be 'kimi' or 'sandwich'")
         self.attn_res_mode = mode
+        norm = str(self.norm_type).lower()
+        if norm not in {"rms", "rmsnorm", "rms_norm", "dyt", "dynamic_tanh", "dynamictanh"}:
+            raise ValueError("norm_type must be 'rms' or 'dyt'")
+        self.norm_type = "dyt" if norm.startswith("dy") or "tanh" in norm else "rms"
+        if float(self.dyt_alpha_init) <= 0:
+            raise ValueError("dyt_alpha_init must be positive")
 
         self._resolve_layer_structure()
         if self.attn_res_group_size is None:

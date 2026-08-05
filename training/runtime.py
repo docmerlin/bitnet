@@ -103,6 +103,8 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
         "head_dim": args.hidden_size // args.num_heads,
         "intermediate_size": args.intermediate_size,
         "rms_norm_eps": defaults.rms_norm_eps,
+        "norm_type": getattr(args, "norm_type", defaults.norm_type),
+        "dyt_alpha_init": getattr(args, "dyt_alpha_init", defaults.dyt_alpha_init),
         "initializer_range": defaults.initializer_range,
         "block_size": args.final_blocks,
         "path_window_size": args.path_window_size,

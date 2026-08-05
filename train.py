@@ -168,6 +168,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Transformer layers per AttnRes depth-block (default: unique_layers//8).",
     )
+    parser.add_argument(
+        "--norm-type",
+        choices=("rms", "dyt"),
+        default=defaults.norm_type,
+        help="Residual-stream norm: rms (default) or dyt (Dynamic Tanh, arXiv:2503.10622).",
+    )
+    parser.add_argument(
+        "--dyt-alpha-init",
+        type=float,
+        default=defaults.dyt_alpha_init,
+        help="Initial α for DyT when --norm-type dyt.",
+    )
     parser.add_argument("--sequence-length", type=_positive_int, default=1024)
     parser.add_argument("--path-window-size", type=int, default=defaults.path_window_size)
     parser.add_argument("--disable-hadamard", action="store_true")
@@ -217,6 +229,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--z-loss-coef", type=float, default=1e-4)
+    parser.add_argument(
+        "--logit-softcap",
+        type=float,
+        default=30.0,
+        help="Train-time soft bound on LM logits: cap*tanh(z/cap). 0 disables. "
+        "Default 30 after small A/B beat softcap=0 on val CE. "
+        "Eval CE stays uncapped for comparable PPL.",
+    )
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3)
@@ -518,6 +538,7 @@ def main() -> None:
                         segment_ids=segment_ids,
                         label_segment_ids=label_segment_ids,
                         z_loss_coef=args.z_loss_coef,
+                        logit_softcap=args.logit_softcap,
                         mtp_loss_coef=args.mtp_loss_coef,
                         density_lam=density_controller.lam if density_controller is not None else 0.0,
                         locality_coef=args.rfmoe_locality_coef,

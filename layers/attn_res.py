@@ -27,11 +27,22 @@ import torch.nn.functional as F
 class DepthAttnMix(nn.Module):
     """Single pseudo-query depth attention over residual block states."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-5):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-5,
+        *,
+        norm_type: str = "rms",
+        dyt_alpha_init: float = 0.5,
+    ):
         super().__init__()
         # Paper: Linear(d, 1) without bias; squeeze weight → w ∈ R^d.
         self.proj = nn.Linear(hidden_size, 1, bias=False)
-        self.norm = nn.RMSNorm(hidden_size, eps=eps)
+        from layers.dyt import make_norm
+
+        self.norm = make_norm(
+            hidden_size, norm_type=norm_type, eps=eps, alpha_init=dyt_alpha_init
+        )
         nn.init.zeros_(self.proj.weight)
 
     def forward(
@@ -59,9 +70,21 @@ class SandwichResidual(nn.Module):
     Kept for ``attn_res_mode="sandwich"`` ablations and old checkpoints.
     """
 
-    def __init__(self, hidden_size: int, init_scale: float = 0.1, eps: float = 1e-5):
+    def __init__(
+        self,
+        hidden_size: int,
+        init_scale: float = 0.1,
+        eps: float = 1e-5,
+        *,
+        norm_type: str = "rms",
+        dyt_alpha_init: float = 0.5,
+    ):
         super().__init__()
-        self.norm = nn.RMSNorm(hidden_size, eps=eps)
+        from layers.dyt import make_norm
+
+        self.norm = make_norm(
+            hidden_size, norm_type=norm_type, eps=eps, alpha_init=dyt_alpha_init
+        )
         self.scale = nn.Parameter(torch.ones(1) * init_scale)
 
     def forward(self, x_in: torch.Tensor, sublayer_out: torch.Tensor) -> torch.Tensor:

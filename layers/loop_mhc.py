@@ -33,14 +33,25 @@ MAX_LOOP_EMBEDS = 64
 class LoopHyperConnection(nn.Module):
     """Loop-boundary hyper-connections (Hyperloop / simplified mHC)."""
 
-    def __init__(self, hidden_size: int, rms_norm_eps: float = 1e-5):
+    def __init__(
+        self,
+        hidden_size: int,
+        rms_norm_eps: float = 1e-5,
+        *,
+        norm_type: str = "rms",
+        dyt_alpha_init: float = 0.5,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_streams = NUM_STREAMS
         n = NUM_STREAMS
         flat = n * hidden_size
 
-        self.norm = nn.RMSNorm(flat, eps=rms_norm_eps)
+        from layers.dyt import make_norm
+
+        self.norm = make_norm(
+            flat, norm_type=norm_type, eps=rms_norm_eps, alpha_init=dyt_alpha_init
+        )
 
         # Input-dependent projections on flattened multi-stream residual.
         self.w_pre = nn.Linear(flat, n, bias=True)

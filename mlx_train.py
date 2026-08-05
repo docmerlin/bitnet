@@ -103,6 +103,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Transformer layers per AttnRes depth-block (default: unique_layers//8).",
     )
+    parser.add_argument(
+        "--norm-type",
+        choices=("rms", "dyt"),
+        default="rms",
+        help="Residual-stream norm: rms (default) or dyt (Dynamic Tanh, arXiv:2503.10622). "
+        "QK-norm stays RMSNorm either way.",
+    )
+    parser.add_argument(
+        "--dyt-alpha-init",
+        type=float,
+        default=0.5,
+        help="Initial α for DyT when --norm-type dyt (paper default 0.5).",
+    )
     parser.add_argument("--num-prelude-layers", type=int, default=2)
     parser.add_argument("--num-recurrent-layers", type=int, default=4)
     parser.add_argument("--num-coda-layers", type=int, default=2)
@@ -196,6 +209,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooldown-steps", type=int, default=0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--z-loss-coef", type=float, default=1e-4)
+    parser.add_argument(
+        "--logit-softcap",
+        type=float,
+        default=30.0,
+        help="Train-time soft bound on LM logits: cap*tanh(z/cap). 0 disables. "
+        "Default 30 (Gemma/speedrun-style) after small A/B beat softcap=0 on val CE. "
+        "Eval CE stays uncapped for comparable PPL.",
+    )
     parser.add_argument("--mtp-depth", type=int, default=4)
     parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
     parser.add_argument("--engram", action=argparse.BooleanOptionalAction, default=True)
@@ -295,6 +316,14 @@ def _gradient_compile_safe(
     return requested and sequence_length % active_blocks == 0 and _compile_supported(config)
 
 
+def softcap_logits(logits, cap: float):
+    """Smooth logit bound: ``cap * tanh(logits / cap)``. ``cap <= 0`` is a no-op."""
+    if cap is None or float(cap) <= 0.0:
+        return logits
+    c = float(cap)
+    return c * mx.tanh(logits / c)
+
+
 def _masked_ce(logits, targets, valid):
     safe_targets = mx.where(valid, targets, 0)
     # Cross entropy at the logits' own dtype rather than a forced fp32 copy --
@@ -325,6 +354,7 @@ def create_gradient_step(
     compile_step: bool,
     num_loops: int,
     z_loss_coef: float = 0.0,
+    logit_softcap: float = 0.0,
     mtp_loss_coef: float = 0.0,
     locality_coef: float = 0.0,
     diversity_coef: float = 0.0,
@@ -363,17 +393,21 @@ def create_gradient_step(
             )
             logits, mtp_logits = output if return_mtp else (output, [])
         valid = segment_ids == label_segment_ids
-        loss = _masked_ce(logits, targets, valid)
+        # Softcap is train-only (eval uses plain CE for comparable PPL).
+        train_logits = softcap_logits(logits, logit_softcap)
+        loss = _masked_ce(train_logits, targets, valid)
         if z_loss_coef > 0:
             # float32 here, unlike _masked_ce above. The cross-entropy term was
             # measured to give bit-identical gradients at the logits' own dtype;
             # this one squares its result, and a bfloat16 logsumexp over 32k
             # logits carries ~0.06 absolute error, which the square turns into
             # ~1.8 on the term the regulariser is trying to control.
-            log_z = mx.logsumexp(logits.astype(mx.float32), axis=-1)
+            log_z = mx.logsumexp(train_logits.astype(mx.float32), axis=-1)
             loss = loss + z_loss_coef * mx.sum(mx.square(log_z) * valid) / mx.maximum(mx.sum(valid), 1)
         if return_mtp and mtp_index is not None:
-            loss = loss + mtp_loss_coef * _masked_ce(selected_mtp_logits, mtp_targets, mtp_valid)
+            loss = loss + mtp_loss_coef * _masked_ce(
+                softcap_logits(selected_mtp_logits, logit_softcap), mtp_targets, mtp_valid
+            )
         else:
             mtp_losses = []
             for index, depth_logits in enumerate(mtp_logits):
@@ -381,7 +415,13 @@ def create_gradient_step(
                 if shift >= targets.shape[1]:
                     continue
                 depth_valid = segment_ids[:, : -shift] == label_segment_ids[:, shift:]
-                mtp_losses.append(_masked_ce(depth_logits[:, :-shift], targets[:, shift:], depth_valid))
+                mtp_losses.append(
+                    _masked_ce(
+                        softcap_logits(depth_logits[:, :-shift], logit_softcap),
+                        targets[:, shift:],
+                        depth_valid,
+                    )
+                )
             if mtp_losses:
                 loss = loss + mtp_loss_coef * mx.mean(mx.stack(mtp_losses))
         if model.config.use_rfmoe:
@@ -753,6 +793,8 @@ def main() -> None:
             attn_res_mode=args.attn_res_mode,
             attn_res_group_size=args.attn_res_group_size,
             tie_word_embeddings=args.tie_word_embeddings,
+            norm_type=args.norm_type,
+            dyt_alpha_init=args.dyt_alpha_init,
         )
     if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
         print(
@@ -932,6 +974,7 @@ def main() -> None:
                 compile_step=compile_gradient,
                 num_loops=active_loops,
                 z_loss_coef=args.z_loss_coef,
+                logit_softcap=args.logit_softcap,
                 mtp_loss_coef=args.mtp_loss_coef,
                 locality_coef=args.rfmoe_locality_coef,
                 diversity_coef=args.rfmoe_diversity_coef,
@@ -981,6 +1024,7 @@ def main() -> None:
                     compile_step=False,
                     num_loops=active_loops,
                     z_loss_coef=args.z_loss_coef,
+                    logit_softcap=args.logit_softcap,
                     mtp_loss_coef=args.mtp_loss_coef,
                     locality_coef=args.rfmoe_locality_coef,
                     diversity_coef=args.rfmoe_diversity_coef,
