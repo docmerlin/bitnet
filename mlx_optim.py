@@ -133,19 +133,14 @@ def mud_decorrelate(
     passes: int = 1,
     eps: float = 1e-8,
     block_size: int | None = None,
-    neuron_norm: bool = False,
 ) -> mx.array:
     """Triangular whitening of a matrix-valued momentum update.
 
-    ``neuron_norm`` re-normalises the rows of the *returned* matrix. Whitening
-    normalises rows of whichever orientation it worked in, and tall matrices are
-    transposed first for efficiency -- so for a ``[out, in]`` weight with
-    ``out > in`` the uniform axis ends up being the input channels, not the
-    neurons. Measured on this model's shapes: the neuron-axis coefficient of
-    variation is 0.0 for ``out``/``ffn down`` but 0.072 for ``qkv``/``ffn up``,
-    where Newton-Schulz Muon sits at 0.030. That imbalance is what NorMuon
-    (arXiv:2510.05491) exists to remove; this is the stateless version of its
-    fix, and it rotates the update by cos 0.9975.
+    Tall matrices are transposed first so the cheaper axis is whitened. That
+    leaves the neuron (output) axis uneven for ``[out, in]`` with ``out > in``;
+    a stateless per-neuron re-normalise was tried (``mud-neuron-norm``) and
+    regressed val CE on a small A/B, so it was removed rather than left as a
+    dead flag.
     """
     if update.ndim != 2:
         raise ValueError("mud_decorrelate expects a 2D matrix")
@@ -161,20 +156,8 @@ def mud_decorrelate(
 
     def finish(whitened: mx.array) -> mx.array:
         result = whitened.T if transposed else whitened
-        if neuron_norm and transposed:
-            # Untransposed output already has unit rows; only the transposed
-            # path leaves the neuron axis uneven.
-            #
-            # Rescale back to the Frobenius norm the whitening produced. Making
-            # `out` rows unit-norm when whitening made `in` rows unit-norm moves
-            # the total from sqrt(in) to sqrt(out) -- on a [1536, 512] fused qkv
-            # that is a measured 1.73x larger step, i.e. a silent learning-rate
-            # change on exactly the tall matrices this is meant to help. The
-            # point is to redistribute magnitude across neurons, not to add any.
-            target = mx.linalg.norm(result)
-            result = result / (mx.linalg.norm(result, axis=1, keepdims=True) + eps)
-            result = result * (target / (mx.linalg.norm(result) + eps))
         return result.astype(original_dtype)
+
     block_size = q.shape[0] if block_size is None else block_size
     if q.shape[0] > block_size and q.shape[0] % block_size == 0:
         blocks = q.reshape(-1, block_size, q.shape[1])
@@ -261,7 +244,6 @@ class MUD(optim.Optimizer):
         eight_bit: bool = False,
         master_dtype: str = "float32",
         cautious_weight_decay: bool = True,
-        neuron_norm: bool = False,
     ):
         super().__init__()
         if master_dtype not in MASTER_DTYPES:
@@ -274,7 +256,6 @@ class MUD(optim.Optimizer):
         self.eight_bit = eight_bit
         self.master_dtype = master_dtype
         self.cautious_weight_decay = cautious_weight_decay
-        self.neuron_norm = neuron_norm
 
     def init_single(self, parameter: mx.array, state: dict):
         if self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE:
@@ -311,9 +292,7 @@ class MUD(optim.Optimizer):
         if fused_state is None:
             momentum_buffer = self.momentum * previous + gradient
             direction = gradient + self.momentum * momentum_buffer
-        update = mud_decorrelate(
-            direction, self.passes, block_size=self.block_size, neuron_norm=self.neuron_norm
-        )
+        update = mud_decorrelate(direction, self.passes, block_size=self.block_size)
         update = update * (0.2 * math.sqrt(max(parameter.shape)))
         update = cautious_mask(update, gradient)
         if fused_state is not None:
@@ -415,7 +394,6 @@ class CMUD(optim.MultiOptimizer):
         mud_master_dtype: str = "float32",
         embedding_learning_rate: float | None = None,
         cautious_weight_decay: bool = True,
-        neuron_norm: bool = False,
     ):
         self.mud_learning_rate = mud_learning_rate
         self.fallback_learning_rate = fallback_learning_rate
@@ -432,7 +410,6 @@ class CMUD(optim.MultiOptimizer):
             mud_eight_bit,
             mud_master_dtype,
             cautious_weight_decay,
-            neuron_norm,
         )
         embedding = CLion(self.embedding_learning_rate, betas, eight_bit)
         clion = CLion(fallback_learning_rate, betas, eight_bit)
@@ -485,5 +462,4 @@ class CMUD(optim.MultiOptimizer):
             "mud_eight_bit": mud.eight_bit,
             "mud_master_dtype": mud.master_dtype,
             "cautious_weight_decay": mud.cautious_weight_decay,
-            "neuron_norm": mud.neuron_norm,
         }

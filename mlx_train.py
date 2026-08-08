@@ -173,14 +173,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3)
     parser.add_argument("--mud-momentum", type=float, default=0.95)
     parser.add_argument("--mud-passes", type=int, default=1)
-    parser.add_argument("--mud-block-size", type=int, default=64)
     parser.add_argument(
-        "--mud-neuron-norm",
-        action="store_true",
-        help="Re-normalise neuron rows after MUD whitening. MUD transposes tall "
-        "matrices, so qkv and the FFN up-projection come out with a 0.072 "
-        "coefficient of variation across neuron norms (Muon: 0.030). This is the "
-        "stateless form of NorMuon's fix. Off by default -- unvalidated, needs an A/B.",
+        "--mud-block-size",
+        type=int,
+        default=32,
+        help="MUD whitening block size along the cheaper axis. Default 32 (= typical "
+        "head_dim) after small A/B beat 64 and misaligned 48 on val CE; 64 is slightly "
+        "cheaper per step at large width.",
     )
     parser.add_argument("--lion-beta1", type=float, default=0.95)
     parser.add_argument("--lion-beta2", type=float, default=0.98)
@@ -805,7 +804,13 @@ def main() -> None:
     dtype = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}[args.precision]
     model.set_dtype(dtype)
     if args.resume_from and saved.get("optimizer_config"):
-        optimizer = CMUD(**saved["optimizer_config"])
+        # Drop retired CMUD fields so older checkpoints still load.
+        optimizer_config = {
+            key: value
+            for key, value in saved["optimizer_config"].items()
+            if key != "neuron_norm"
+        }
+        optimizer = CMUD(**optimizer_config)
         args.mud_block_size = optimizer.optimizers[0].block_size
         args.cmud_master_dtype = optimizer.optimizers[0].master_dtype
     else:
@@ -822,7 +827,6 @@ def main() -> None:
             mud_master_dtype=args.cmud_master_dtype,
             embedding_learning_rate=args.embedding_learning_rate,
             cautious_weight_decay=args.cautious_weight_decay,
-            neuron_norm=args.mud_neuron_norm,
         )
     optimizer.init(model.trainable_parameters())
     trainer_state = {

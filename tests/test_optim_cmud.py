@@ -49,11 +49,11 @@ def test_blockwise_mud_matches_independent_blocks() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
 
-def test_cmud_defaults_to_64_row_whitening_blocks() -> None:
+def test_cmud_defaults_to_32_row_whitening_blocks() -> None:
     model = nn.Linear(128, 128, bias=False)
     optimizer = build_cmud(model, lr=0.05, fallback_lr=0.02, weight_decay=0.0)
     mud_group = next(group for group in optimizer.param_groups if group["kind"] == "mud")
-    assert mud_group["block_size"] == 64
+    assert mud_group["block_size"] == 32
 
 
 def test_legacy_cmud_checkpoint_keeps_full_matrix_whitening() -> None:

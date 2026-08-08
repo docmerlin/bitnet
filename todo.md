@@ -403,38 +403,13 @@ bumps.
 
 **Worth doing, in value order:**
 
-- [~] **NorMuon (R41, R42) — do not swap for CMUD; port its fix into MUD.** NorMuon
-  (arXiv:2510.05491) and MUD (arXiv:2603.17970) change different stages: MUD replaces
-  Muon's Newton-Schulz polar step with triangular whitening, NorMuon keeps Newton-Schulz and
-  adds a per-neuron second-moment EMA rescale *after* it. They compose; they do not compete,
-  and no head-to-head exists (the two papers' numbers are from different setups and are not
-  comparable).
-
-  Measured here at [2048, 512] on M1 Max: Newton-Schulz (5 steps) 2.93 ms, MUD block=64
-  1.15 ms, MUD full-block 46.5 ms. So MUD is 2.5x cheaper than the step NorMuon builds on —
-  moving to Muon to get NorMuon would pay 2.5x on the optimizer's core op — and MUD's entire
-  speed advantage is the `block_size=64` default, not the algorithm.
-
-  NorMuon's *premise* does hold here, and more strongly than for Muon. MUD makes exactly one
-  axis uniform, and transposes tall matrices first, so for `[out, in]` weights with
-  `out > in` the uniform axis is the input channels, not the neurons. Neuron-axis
-  coefficient of variation, this model's shapes:
-
-  | weight | shape | transposed | MUD | Muon |
-  |---|---|---|---|---|
-  | `qkv` | 1536x512 | yes | **0.0723** | 0.0291 |
-  | `ffn up` | 2048x512 | yes | **0.0726** | 0.0311 |
-  | `out` | 512x512 | no | 0.0000 | 0.0183 |
-  | `ffn down` | 512x2048 | no | 0.0000 | 0.0138 |
-
-  `--mud-neuron-norm` (default off) is the stateless form of the fix: re-normalise the
-  neuron rows of the returned matrix. Drives the CV to 0 at no measurable cost and rotates
-  the update by cos 0.9975. Whether it helps perplexity is unmeasured — it needs a training
-  A/B, which is the open part of this item.
-- [ ] **NorMuon proper on top of MUD ("C-NorMUD").** The above is per-step uniformity;
-  NorMuon's actual mechanism is a second-moment EMA per neuron, so neurons with a
-  historically large update get damped over time. Costs one vector per matrix. Only worth
-  building if the stateless version above shows a signal.
+- [x] **NorMuon / mud-neuron-norm — rejected.** NorMuon (arXiv:2510.05491) adds a
+  per-neuron second-moment rescale after Muon's polar step. MUD already replaces that
+  polar step with cheaper triangular whitening; a stateless neuron-row re-normalise was
+  tried as ``--mud-neuron-norm``. Small A/B (1.50M, 100k tok, softcap=30) **regressed**
+  ~0.04 val CE (3.240 → 3.282 at step 150). Code removed; old checkpoints that saved
+  ``neuron_norm`` still resume (field dropped on load). EMA "C-NorMUD" not worth building
+  unless a medium-scale run shows clear tall-matrix undertraining.
 - [x] **Logit softcap (R9, R18, R54).** Implemented as Gemma/speedrun form
   ``cap * tanh(z / cap)`` (not the later sigmoid variant). Train-only; eval CE stays
   uncapped. Wired in `training/losses.py` + `mlx_train.create_gradient_step`; CLI
@@ -456,11 +431,20 @@ bumps.
   (untied from step 0) matches R8-R50. Their later refinement re-ties (R51) and then splits at
   2/3 through the run, copying optimizer state from `lm_head` to `embed` at the split. Needs a
   mid-run parameter and optimizer-state transition, so it is real work, not a flag.
-- [ ] **Per-head-pair orthogonalisation of Q/K (R80).** They stopped whitening the full
-  6-head Q/K matrix and switched to pairs of heads. Here `qkv` is one fused
-  `[3*hidden, hidden]` and MUD whitens it in 64-row blocks that straddle head boundaries
-  arbitrarily. Aligning `--mud-block-size` to `head_dim` (32) or `2*head_dim` (64, which is
-  the current default and happens to align at head_dim 32) is a no-code experiment.
+- [x] **Per-head-pair / MUD block-size vs head_dim (R80).** No-code A/B on
+  `--mud-block-size` for head_dim=32 (h128 / 4 heads). Logs: `runs/mud_block_ab/`.
+
+  | step | b32 (head_dim) | b48 (misaligned) | b64 (old default) |
+  |---|---|---|---|
+  | 50 val | **7.429 (1684)** | 7.460 (1737) | 7.511 (1828) |
+  | 100 val | **3.670 (39.3)** | 3.691 (40.1) | 3.736 (41.9) |
+  | 150 val | **3.209 (24.8)** | 3.216 (24.9) | 3.242 (25.6) |
+  | final train | **3.109** | 3.131 | 3.167 |
+  | wall | **13.5s** | 14.3s | 14.3s |
+
+  Smaller blocks win; ranking b32 > b48 > b64 (not pure "alignment only" — 48 sits
+  between). **Default `--mud-block-size` → 32** (torch+MLX+optim). Large-width recipes
+  may still pass 64 if CMUD step time matters (`run_mlx_1b.sh` keeps explicit 64).
 - [ ] **ReLU^2 MLP (R5).** Two matmuls instead of SwiGLU's three (here four, with the square
   `mid`). A real FLOP cut, but the identity-initialised `mid` is a deliberate design here,
   so this is an architecture A/B rather than a swap.
@@ -651,9 +635,9 @@ regressions can be reverted.**
 
 **Quality-per-token (not step ms):**
 
-- [ ] Embedding LR sweep (10–30× body); `--mud-neuron-norm` / C-NorMUD A/B;
+- [ ] Embedding LR sweep (10–30× body);
   value embeddings in the byte encoder; sampled byte MTP on BLT (in progress).
-  (Logit softcap done — default 30.)
+  (Logit softcap done — default 30. mud-neuron-norm removed after A/B loss.)
 
 #### Training efficiency from 2025–26 literature (2026-08-05)
 
@@ -724,11 +708,9 @@ and RFMoE already in-tree.
   follow-ups only if motivated: LR retune for DyT, α init sweep, or DyT only on locals
   (BLT) while global stays RMS. Derf not worth it until DyT beats RMS.
 - [x] **Logit softcap (speedrun R9/R18/R54)** — landed; default 30. See NanoGPT audit.
-- [ ] **`--mud-neuron-norm` training A/B** — already wired (stateless NorMuon premise on
-  MUD); default off. One flag, no architecture change. See NanoGPT "Worth doing".
-- [ ] **Align MUD block size to head_dim / 2×head_dim (R80-style)** — no-code experiment if
-  defaults already match; else one CLI default tweak. See per-head-pair orthogonalisation
-  note under NanoGPT audit.
+- [x] **`--mud-neuron-norm`** — A/B lost; **code removed** (see NanoGPT "Worth doing").
+- [x] **Align MUD block size to head_dim (R80-style)** — A/B: default **32** beats 64.
+  See NanoGPT "Worth doing".
 - [ ] **Wall-clock curricula** (batch-size, max-seq, attention-window direction) — already
   under Training throughput backlog; reaffirm as lowest-risk systems win: measure
   **bytes/hour to target loss**, not only ms/step.

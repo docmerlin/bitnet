@@ -245,8 +245,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mud-block-size",
         type=_positive_int,
-        default=64,
-        help="Rows per independent batched MUD whitening block.",
+        default=32,
+        help="Rows per independent batched MUD whitening block. Default 32 "
+        "(~head_dim) after small A/B beat 64 on val CE; use 64 if optimizer time binds.",
     )
     parser.add_argument("--no-optimizer-8bit", action="store_true")
     parser.add_argument("--warmup-ratio", type=float, default=0.08)

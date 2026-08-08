@@ -8,7 +8,8 @@ This implements the optimizer plan documented in the README:
   each pass row-normalizes the matrix, forms the row Gram ``G = Q Qᵀ``, takes its
   lower triangle ``T = tril(G)`` as a cheap Cholesky-like factor, applies a forward
   triangular solve ``Q <- T⁻¹ Q``, and re-normalizes. New runs batch independent
-  64-row blocks; ``block_size=None`` keeps full-matrix whitening. The ``C-`` prefix
+  32-row blocks (default; 64 still fine for step time); ``block_size=None`` keeps
+  full-matrix whitening. The ``C-`` prefix
   is the cautious-optimizer mask from *Cautious Optimizers: Improving Training with
   One Line of Code*, which zeroes any per-coordinate update whose sign disagrees
   with the current gradient and rescales the survivors to preserve average step size.
@@ -182,7 +183,7 @@ class CMUD(Optimizer):
         momentum: float = 0.95,
         nesterov: bool = True,
         passes: int = 1,
-        block_size: int | None = 64,
+        block_size: int | None = 32,
         betas: Tuple[float, float] = (0.95, 0.98),
         weight_decay: float = 0.0,
         eight_bit: bool = True,
@@ -329,7 +330,7 @@ def build_cmud(
     weight_decay: float,
     momentum: float = 0.95,
     passes: int = 1,
-    block_size: int | None = 64,
+    block_size: int | None = 32,
     betas: Tuple[float, float] = (0.95, 0.98),
     eight_bit: bool = True,
 ) -> CMUD:

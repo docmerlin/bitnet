@@ -163,7 +163,7 @@ def test_mlx_training_defaults_use_fast_local_batch() -> None:
     assert not args.profile_phases
     assert build_parser().parse_args(["--profile-phases"]).profile_phases
     assert args.validation_batches == 5
-    assert args.mud_block_size == 64
+    assert args.mud_block_size == 32
     assert args.mtp_depth == 4
     assert args.recurrent_quantized_matmul
     assert args.cmud_momentum_8bit

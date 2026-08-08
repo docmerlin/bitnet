@@ -106,7 +106,7 @@ def test_train_sequence_length_must_match_path_window() -> None:
     defaults = parser.parse_args([])
     assert defaults.sequence_length == 1024
     assert defaults.path_window_size == 1024
-    assert defaults.mud_block_size == 64
+    assert defaults.mud_block_size == 32
 
     bad = parser.parse_args(["--sequence-length", "512", "--path-window-size", "1024"])
     try:
