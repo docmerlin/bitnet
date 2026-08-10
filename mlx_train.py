@@ -123,8 +123,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-num-loops", type=int, default=1)
     parser.add_argument("--loop-curriculum-start-ratio", type=float, default=0.0)
     parser.add_argument("--loop-curriculum-ratio", type=float, default=0.2)
-    parser.add_argument("--initial-blocks", type=int, default=8)
-    parser.add_argument("--final-blocks", type=int, default=16)
+    parser.add_argument(
+        "--initial-blocks",
+        type=int,
+        default=16,
+        help="PaTH/Infini chunk count at curriculum start. More blocks → narrower "
+        "local window. Default 16 (grow windows over training; was 8→16 shrink).",
+    )
+    parser.add_argument(
+        "--final-blocks",
+        type=int,
+        default=8,
+        help="PaTH/Infini chunk count at curriculum end. Default 8 with "
+        "--initial-blocks 16 grows the local window (speedrun-style). "
+        "Swap to 8→16 to restore the old shrink schedule.",
+    )
     parser.add_argument("--block-growth-ratio", type=float, default=0.6)
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--path-window-size", type=int, default=1024)

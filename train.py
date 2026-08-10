@@ -261,8 +261,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage1-activation-mix-start", type=float, default=0.0)
     parser.add_argument("--stage1-activation-bits", type=int, default=8)
     parser.add_argument("--final-activation-bits", type=int, default=8)
-    parser.add_argument("--initial-blocks", type=int, default=8)
-    parser.add_argument("--final-blocks", type=int, default=16)
+    parser.add_argument(
+        "--initial-blocks",
+        type=int,
+        default=16,
+        help="Chunk count at curriculum start (more → narrower local window). "
+        "Default 16 with --final-blocks 8 grows windows over training.",
+    )
+    parser.add_argument(
+        "--final-blocks",
+        type=int,
+        default=8,
+        help="Chunk count at curriculum end. Default 8 (grow); use 16 with "
+        "initial 8 to restore the old shrink schedule.",
+    )
     parser.add_argument("--block-growth-ratio", type=float, default=0.6)
 
     parser.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
@@ -304,8 +316,8 @@ def main() -> None:
 
     if args.hidden_size % args.num_heads != 0:
         parser.error("--hidden-size must be divisible by --num-heads")
-    if args.final_blocks < args.initial_blocks:
-        parser.error("--final-blocks must be greater than or equal to --initial-blocks")
+    if min(args.initial_blocks, args.final_blocks) < 1:
+        parser.error("--initial-blocks and --final-blocks must be positive")
     if not 0.0 <= args.mixture_switch_ratio <= 1.0:
         parser.error("--mixture-switch-ratio must be between 0.0 and 1.0")
     if args.min_num_loops < 1:

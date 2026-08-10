@@ -454,8 +454,10 @@ bumps.
   byte-level encoder rather than the patch-level global model.
 - [ ] **Batch-size schedule (R46) and max_seq_len schedule (R72).** Cheap curriculum knobs;
   this repo already has loop-count, block-count and quantisation curricula to hang them on.
-- [ ] **Drop the first MLP layer (R30) and the first attention layer (R35).** Two separate
-  records, each a straight win. Costs nothing to try given the prelude/recurrent/coda split.
+  (Attention-window direction: default now **grows** windows via blocks 16→8.)
+- [x] **Drop the first MLP layer (R30) and the first attention layer (R35).** Flags
+  ``--skip-first-prelude-mlp`` / ``--skip-first-prelude-attn``; A/Bs did not adopt
+  (MLP flat speed + slight loss; attn faster but clear quality regression).
 - [x] **Update the elementwise optimizer only every other step (R39).** Wired as
   ``--clion-interval``; A/B did not beat every-step (see lowest-risk section).
 - [ ] **Smear token embeddings one position forward (R34).** Very cheap, but Engram already
@@ -476,12 +478,10 @@ Superseded detail from the earlier pass:
 - [x] **Sweep `--embedding-learning-rate`.** 2M A/B (`runs/emb_lr_ab/`): 10× best,
   30× overshot. 540M: 10× blew val; 5× stable (`runs/emb_lr_500m_ab/x5`). **Default
   now 4× body** for stability margin. Explicit absolute rate still overrides.
-- [ ] **Decide the attention-window curriculum direction.** `_chunk_bounds` sets
-  `block_width = length // num_blocks`, so the default `--initial-blocks 8 --final-blocks 16`
-  *shrinks* the local window 128 -> 64 over training. The speedrun grows it (cheap early,
-  long-context late). More chunks does mean more Infini memory writes, so this may be
-  deliberate — but if it is not, swapping the two flags is free and both faster early and
-  better late.
+- [x] **Decide the attention-window curriculum direction.** Default was 8→16 blocks
+  (window shrinks). A/B 2M, seq 128 (`runs/attn_window_ab/`): grow 16→4 slightly beat
+  shrink 4→16 on val@150 (2.597 vs 2.606) and wall (16.5s vs 17.8s); fixed wide 4→4
+  was fastest (13.4s) with similar val. **Default now 16→8** (grow windows).
 - [ ] **Momentum warmup in MUD (R9, 0.85 -> 0.95).** Small speedrun win. Needs momentum to
   become a traced `mx.array` like `learning_rate` so `apply_step` stays compiled, plus a
   `float()` in `checkpoint_config`. Skipped as speculative for a whitening optimizer.
@@ -618,11 +618,11 @@ regressions can be reverted.**
   stay mildly faster with packed on — the old 52M “turn it off → 1.10×” result does not
   reproduce. Keep CLI default True with existing guards (`seq ≥ 128`, `weight_mix ≥ 1`).
   No scale gate flip.
-- [ ] **Wall-clock curricula:** batch-size schedule, max-seq schedule, and re-check attention
-  window curriculum direction (`initial-blocks`/`final-blocks` may shrink windows; speedrun
-  grows them). Prefer measured bytes/hour over step ms alone.
-- [ ] **Drop first prelude MLP / first attention (R30/R35).** Free A/B given the
-  prelude/recurrent/coda split.
+- [ ] **Wall-clock curricula:** batch-size schedule, max-seq schedule still open.
+  Attention-window direction decided: default **grows** windows (16→8 blocks).
+- [x] **Drop first prelude MLP / first attention (R30/R35).** Implemented as flags;
+  small A/Bs: MLP no speed win + slight quality loss; attn ~12% faster but clear
+  quality loss. Defaults off.
 - [x] **BitNet activation width → 8-bit default.** BLT already at 8 (4-bit collapses after
   ramp; fake-quant so train speed is flat). `MLXBitNetConfig.activation_bits`,
   `--final-activation-bits` (torch+MLX trainers), and convert/generate fallbacks now 8.
@@ -713,14 +713,13 @@ and RFMoE already in-tree.
 - [x] **`--mud-neuron-norm`** — A/B lost; **code removed** (see NanoGPT "Worth doing").
 - [x] **Align MUD block size to head_dim (R80-style)** — A/B: default **32** beats 64.
   See NanoGPT "Worth doing".
-- [ ] **Wall-clock curricula** (batch-size, max-seq, attention-window direction) — already
-  under Training throughput backlog; reaffirm as lowest-risk systems win: measure
-  **bytes/hour to target loss**, not only ms/step.
+- [ ] **Wall-clock curricula** (batch-size, max-seq) — attention-window direction done
+  (grow default). Prefer measured bytes/hour to target loss, not only ms/step.
 - [ ] **BLT-S self-speculation** — already implemented and deferred pending a trained
   entropy student (see BLT generation performance). Zero train risk; inference-only;
   quality-preserving under greedy. Revisit when student patches ~2–4 bytes.
-- [ ] **Drop first prelude MLP / first attention (R30/R35)** — already listed; free A/B
-  given prelude/recurrent/coda. Architecture flag, not a new subsystem.
+- [x] **Drop first prelude MLP / first attention (R30/R35)** — flags + A/B; defaults off
+  (see Training throughput backlog).
 - [x] **Elementwise optimizer every other step (R39)** — implemented as
   ``--clion-interval`` (MUD every step; C-Lion every N).
   - 2M toy (`runs/clion_interval_ab/`): val@150 2.592 vs 2.603; no wall win.
