@@ -327,7 +327,10 @@ Relevant flags:
 - `--optimizer {cmud,lion}` (default `cmud`)
 - `--learning-rate` — LR for C-Lion fallback group (and legacy Lion path)
 - `--embedding-learning-rate` (MLX only) — LR for embedding / `lm_head` group;
-  defaults to `--learning-rate`. modded-nanogpt runs these well above body rate
+  defaults to **4× `--learning-rate`** (2M liked 10×; 540M blew val at 10×, stable
+  at 5× — default 4× for margin; override if needed)
+- `--clion-interval` (MLX only) — apply C-Lion groups every N steps (MUD always);
+  default `1`. `2` is speedrun R39; small A/B did not win speed or quality
 - `--tie-word-embeddings` / `--no-tie-word-embeddings` (MLX only, default untied)
 - `--mud-learning-rate` — LR for MUD matrix group (MUD paper default `1e-3`)
 - `--mud-momentum` — MUD heavy-ball momentum (Nesterov lookahead)

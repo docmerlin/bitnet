@@ -119,6 +119,11 @@ class MLXBitNetConfig:
     # learning rate was their largest win after Muon. Costs vocab*hidden extra
     # parameters (16.7M at vocab 32768 / hidden 512).
     tie_word_embeddings: bool = False
+    # NanoGPT-speedrun R30: drop the MLP half of the first prelude layer (layer 0).
+    # Saves FFN FLOPs + params on that block; attention still runs.
+    skip_first_prelude_mlp: bool = False
+    # NanoGPT-speedrun R35: drop the attention half of the first prelude layer.
+    skip_first_prelude_attn: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads:
@@ -1797,45 +1802,60 @@ class MLXHybridBlock(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.attn_res_mode = config.attn_res_mode
+        # R30 / R35: first prelude layer only (unique layer_id 0).
+        self.skip_mlp = bool(config.skip_first_prelude_mlp and layer_id == 0)
+        self.skip_attn = bool(config.skip_first_prelude_attn and layer_id == 0)
         self.engram = MLXEngram(config, layer_id) if config.use_engram and layer_id in config.engram_layer_ids else None
-        self.attn_norm = mlx_make_norm(hidden, config)
-        self.attn = MLXPaTHAttention(config)
-        self.attn_gate = mx.array([0.0])
-        self.mlp_norm = mlx_make_norm(hidden, config)
-        self.moe = MLXRFMoE(config) if config.use_rfmoe else None
-        if self.moe is None:
-            self.up = MLXHBitLinear(hidden, intermediate * 2, config)
-            self.mid = MLXHBitLinear(intermediate, intermediate, config)
-            # Cold start: identity mid ~ classic 2-mat path (silu pass-through on
-            # expand), scaled so ternarisation lands on a *true* identity. The
-            # per-output-channel scale is mean(|row|); a plain eye(I) row is one 1
-            # and I-1 zeros, so the scale is 1/I and the quantised weight comes out
-            # as eye(I)/I -- a 1/512 attenuator, not a pass-through. eye(I)*I gives
-            # mean(|row|) = 1, so the quantised weight is exactly eye(I). The
-            # weight mix is pinned with it: the straight-through blend only means
-            # anything when raw and quantised share a scale, and here they differ
-            # by I.
-            self.mid.weight = mx.eye(intermediate, dtype=self.mid.weight.dtype) * intermediate
-            self.mid.pinned_weight_mix = 1.0
-            self.mid.weight_mix = mx.array(1.0)
-            self.mid._pinned_full_weight_quant = True
-            self.down = MLXHBitLinear(intermediate, hidden, config)
-            self.down.weight = self.down.weight * 0.01
+        if self.skip_attn:
+            self.attn_norm = None
+            self.attn = None
+            self.attn_gate = None
+        else:
+            self.attn_norm = mlx_make_norm(hidden, config)
+            self.attn = MLXPaTHAttention(config)
+            self.attn_gate = mx.array([0.0])
+        self.moe = None
+        if self.skip_mlp:
+            # No FFN params or compute on this block (speedrun R30).
+            self.mlp_norm = None
+        else:
+            self.mlp_norm = mlx_make_norm(hidden, config)
+            self.moe = MLXRFMoE(config) if config.use_rfmoe else None
+            if self.moe is None:
+                self.up = MLXHBitLinear(hidden, intermediate * 2, config)
+                self.mid = MLXHBitLinear(intermediate, intermediate, config)
+                # Cold start: identity mid ~ classic 2-mat path (silu pass-through on
+                # expand), scaled so ternarisation lands on a *true* identity. The
+                # per-output-channel scale is mean(|row|); a plain eye(I) row is one 1
+                # and I-1 zeros, so the scale is 1/I and the quantised weight comes out
+                # as eye(I)/I -- a 1/512 attenuator, not a pass-through. eye(I)*I gives
+                # mean(|row|) = 1, so the quantised weight is exactly eye(I). The
+                # weight mix is pinned with it: the straight-through blend only means
+                # anything when raw and quantised share a scale, and here they differ
+                # by I.
+                self.mid.weight = mx.eye(intermediate, dtype=self.mid.weight.dtype) * intermediate
+                self.mid.pinned_weight_mix = 1.0
+                self.mid.weight_mix = mx.array(1.0)
+                self.mid._pinned_full_weight_quant = True
+                self.down = MLXHBitLinear(intermediate, hidden, config)
+                self.down.weight = self.down.weight * 0.01
         if self.attn_res_mode == "kimi":
+            # Allocate both mixers so AttnResStream.start can seed them; skipped
+            # half never calls its mix_* path.
             self.attn_res_mix = MLXDepthAttnMix(hidden, config=config)
             self.mlp_res_mix = MLXDepthAttnMix(hidden, config=config)
             # Keep sandwich attrs for convert soft-load / sandwich mode compatibility.
-            self.attn_post = mlx_make_norm(hidden, config)
-            self.attn_scale = mx.array([0.1])
-            self.mlp_post = mlx_make_norm(hidden, config)
-            self.mlp_scale = mx.array([0.1])
+            self.attn_post = mlx_make_norm(hidden, config) if not self.skip_attn else None
+            self.attn_scale = mx.array([0.1]) if not self.skip_attn else None
+            self.mlp_post = mlx_make_norm(hidden, config) if not self.skip_mlp else None
+            self.mlp_scale = mx.array([0.1]) if not self.skip_mlp else None
         else:
             self.attn_res_mix = None
             self.mlp_res_mix = None
-            self.attn_post = mlx_make_norm(hidden, config)
-            self.attn_scale = mx.array([0.1])
-            self.mlp_post = mlx_make_norm(hidden, config)
-            self.mlp_scale = mx.array([0.1])
+            self.attn_post = mlx_make_norm(hidden, config) if not self.skip_attn else None
+            self.attn_scale = mx.array([0.1]) if not self.skip_attn else None
+            self.mlp_post = mlx_make_norm(hidden, config) if not self.skip_mlp else None
+            self.mlp_scale = mx.array([0.1]) if not self.skip_mlp else None
 
     def _dense_mlp(self, x: mx.array) -> mx.array:
         # Decode M=1: one Metal dispatch for up + mid + down ternary FFN.
@@ -1878,6 +1898,8 @@ class MLXHybridBlock(nn.Module):
         return self.down(hidden_act)
 
     def _mlp(self, x: mx.array, checkpoint_activations: bool = False) -> mx.array:
+        if self.skip_mlp:
+            raise RuntimeError("MLP skipped on this block (skip_first_prelude_mlp)")
         if self.moe is not None:
             if checkpoint_activations and self.moe.backend != "hybrid":
                 output, gate_stack, hard_density = activation_checkpoint(
@@ -1891,8 +1913,17 @@ class MLXHybridBlock(nn.Module):
         return run_mlp(x)
 
     def new_inference_cache(self, batch_size: int) -> "MLXBlockInferenceCache":
+        if self.skip_attn:
+            # Placeholder so decode cache length matches the block stack; never read.
+            attention = MLXPaTHInferenceCache(
+                memory_m=mx.zeros((batch_size, 1, 1, 1), dtype=mx.float32),
+                memory_z=mx.zeros((batch_size, 1, 1), dtype=mx.float32),
+                memory_initialized=mx.zeros((batch_size,), dtype=mx.bool_),
+            )
+        else:
+            attention = self.attn.new_inference_cache(batch_size)
         return MLXBlockInferenceCache(
-            attention=self.attn.new_inference_cache(batch_size),
+            attention=attention,
             engram=MLXEngramInferenceCache() if self.engram is not None else None,
         )
 
@@ -1903,6 +1934,8 @@ class MLXHybridBlock(nn.Module):
         update_memory: bool,
         checkpoint_activations: bool,
     ) -> mx.array:
+        if self.skip_attn:
+            raise RuntimeError("attention skipped on this block (skip_first_prelude_attn)")
         return self.attn(
             x_norm,
             segment_ids,
@@ -1921,13 +1954,16 @@ class MLXHybridBlock(nn.Module):
         if self.engram is not None:
             run_engram = activation_checkpoint(self.engram) if checkpoint_activations else self.engram
             x = x + run_engram(x, input_ids, segment_ids)
-        attention = self._mixer(
-            self.attn_norm(x),
-            segment_ids,
-            update_memory,
-            checkpoint_activations,
-        )
-        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if not self.skip_attn:
+            attention = self._mixer(
+                self.attn_norm(x),
+                segment_ids,
+                update_memory,
+                checkpoint_activations,
+            )
+            x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if self.skip_mlp:
+            return x
         output = self._mlp(self.mlp_norm(x), checkpoint_activations)
         return self.mlp_post(x + self.mlp_scale * output)
 
@@ -1946,27 +1982,38 @@ class MLXHybridBlock(nn.Module):
         stream.attn_mix = self.attn_res_mix
         stream.mlp_mix = self.mlp_res_mix
 
-        h = stream.mix_attn()
-        if self.engram is not None:
+        if not self.skip_attn:
+            h = stream.mix_attn()
+            if self.engram is not None:
+                if engram_runner is not None:
+                    h = h + engram_runner(h)
+                else:
+                    run_engram = activation_checkpoint(self.engram) if checkpoint_activations else self.engram
+                    h = h + run_engram(h, input_ids, segment_ids)
+
+            if attn_runner is not None:
+                attention = attn_runner(self.attn_norm(h))
+            else:
+                attention = self._mixer(
+                    self.attn_norm(h),
+                    segment_ids,
+                    update_memory,
+                    checkpoint_activations,
+                )
+            stream.add_sublayer(mx.sigmoid(self.attn_gate) * attention)
+        elif self.engram is not None:
+            # Engram still injects into the residual stream without attention.
+            h = stream.hidden()
             if engram_runner is not None:
-                h = h + engram_runner(h)
+                delta = engram_runner(h)
             else:
                 run_engram = activation_checkpoint(self.engram) if checkpoint_activations else self.engram
-                h = h + run_engram(h, input_ids, segment_ids)
+                delta = run_engram(h, input_ids, segment_ids)
+            stream.add_sublayer(delta)
 
-        if attn_runner is not None:
-            attention = attn_runner(self.attn_norm(h))
-        else:
-            attention = self._mixer(
-                self.attn_norm(h),
-                segment_ids,
-                update_memory,
-                checkpoint_activations,
-            )
-        stream.add_sublayer(mx.sigmoid(self.attn_gate) * attention)
-
-        h = stream.mix_mlp()
-        stream.add_sublayer(self._mlp(self.mlp_norm(h), checkpoint_activations))
+        if not self.skip_mlp:
+            h = stream.mix_mlp()
+            stream.add_sublayer(self._mlp(self.mlp_norm(h), checkpoint_activations))
         stream.close_layer()
         return stream
 
@@ -2003,7 +2050,7 @@ class MLXHybridBlock(nn.Module):
             None,
             update_memory,
             False,
-            attn_runner=attn_runner,
+            attn_runner=None if self.skip_attn else attn_runner,
             engram_runner=engram_runner if self.engram is not None else None,
         )
 
@@ -2019,8 +2066,11 @@ class MLXHybridBlock(nn.Module):
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.incremental(x, input_ids, token_history, cache.engram)
-        attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
-        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if not self.skip_attn:
+            attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
+            x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if self.skip_mlp:
+            return x
         return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
 
     def extend(
@@ -2035,8 +2085,11 @@ class MLXHybridBlock(nn.Module):
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.extend(x, input_ids, token_history, cache.engram)
-        attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
-        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if not self.skip_attn:
+            attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
+            x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if self.skip_mlp:
+            return x
         return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
 
     def prefill(
@@ -2050,8 +2103,11 @@ class MLXHybridBlock(nn.Module):
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.prefill(x, input_ids, cache.engram)
-        attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
-        x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if not self.skip_attn:
+            attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
+            x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
+        if self.skip_mlp:
+            return x
         return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
 
     def __call__(

@@ -456,7 +456,8 @@ bumps.
   this repo already has loop-count, block-count and quantisation curricula to hang them on.
 - [ ] **Drop the first MLP layer (R30) and the first attention layer (R35).** Two separate
   records, each a straight win. Costs nothing to try given the prelude/recurrent/coda split.
-- [ ] **Update the elementwise optimizer only every other step (R39).** Halves CLion work.
+- [x] **Update the elementwise optimizer only every other step (R39).** Wired as
+  ``--clion-interval``; A/B did not beat every-step (see lowest-risk section).
 - [ ] **Smear token embeddings one position forward (R34).** Very cheap, but Engram already
   supplies a much stronger version of the same signal — low expected value here.
 
@@ -472,9 +473,9 @@ Superseded detail from the earlier pass:
   the two MLX groups. Costs 16.8M params at vocab 32768 / hidden 512 and ~nothing in step
   time: 2,405 vs 2,829 ms fwd+bwd at batch 4, peak 20.31 vs 20.27 GB. Checkpoint
   compatibility deliberately not preserved — see the README note.
-- [ ] **Sweep `--embedding-learning-rate`.** Wired but still defaults to `--learning-rate`,
-  which is the pre-split behaviour and leaves the untied head's main benefit on the table.
-  modded-nanogpt runs embeddings well above the body rate; 10-30x is the range to try.
+- [x] **Sweep `--embedding-learning-rate`.** 2M A/B (`runs/emb_lr_ab/`): 10× best,
+  30× overshot. 540M: 10× blew val; 5× stable (`runs/emb_lr_500m_ab/x5`). **Default
+  now 4× body** for stability margin. Explicit absolute rate still overrides.
 - [ ] **Decide the attention-window curriculum direction.** `_chunk_bounds` sets
   `block_width = length // num_blocks`, so the default `--initial-blocks 8 --final-blocks 16`
   *shrinks* the local window 128 -> 64 over training. The speedrun grows it (cheap early,
@@ -635,8 +636,9 @@ regressions can be reverted.**
 
 **Quality-per-token (not step ms):**
 
-- [ ] Embedding LR sweep (10–30× body);
-  value embeddings in the byte encoder; sampled byte MTP on BLT (in progress).
+- [x] **Embedding LR sweep.** 2M (`runs/emb_lr_ab/`): 1× 3.497 / **10× 2.585** / 30× 4.061.
+  540M: **10× val collapse**; **5× stable** (`runs/emb_lr_500m_ab/x5`). **Default = 4×
+  body** (margin under 5×). Value embeddings / byte MTP still open.
   (Logit softcap done — default 30. mud-neuron-norm removed after A/B loss.)
 
 #### Training efficiency from 2025–26 literature (2026-08-05)
@@ -719,8 +721,14 @@ and RFMoE already in-tree.
   quality-preserving under greedy. Revisit when student patches ~2–4 bytes.
 - [ ] **Drop first prelude MLP / first attention (R30/R35)** — already listed; free A/B
   given prelude/recurrent/coda. Architecture flag, not a new subsystem.
-- [ ] **Elementwise optimizer every other step (R39)** — halves C-Lion/embedding-group
-  work; low risk if body MUD still steps every update.
+- [x] **Elementwise optimizer every other step (R39)** — implemented as
+  ``--clion-interval`` (MUD every step; C-Lion every N).
+  - 2M toy (`runs/clion_interval_ab/`): val@150 2.592 vs 2.603; no wall win.
+  - **540.5M** h1024 `8+16×1+8` untied emb10× 100k tok (`runs/clion_500m_ab/`):
+    wall **640.7s → 629.2s** (~1.8%); mean tok/s **160 → 168** (~5%); final train
+    **2.453 vs 2.469**. val@50 **4.39 vs 4.01** (every2 better early); late val
+    unstable both arms on this short budget. **Keep default 1** — modest speed,
+    not a clear quality free lunch.
 
 **Explicitly not prioritizing for train wall-clock (keep on ice):**
 

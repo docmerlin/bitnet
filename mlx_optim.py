@@ -377,6 +377,11 @@ class CMUD(optim.MultiOptimizer):
     higher rate than the body. Both of those tables are lookup-shaped rather than
     matrix-shaped, so neither belongs in MUD's whitening; giving them their own
     optimizer is what makes a separate rate expressible.
+
+    ``clion_interval`` (NanoGPT-speedrun R39): apply both C-Lion groups only every
+    N optimizer steps; MUD still runs every step. ``1`` = every step (legacy);
+    ``2`` = every other step. Off-step embedding/head/norm grads are dropped (not
+    accumulated) so momentum state for those groups only advances on C-Lion steps.
     """
 
     def __init__(
@@ -394,6 +399,7 @@ class CMUD(optim.MultiOptimizer):
         mud_master_dtype: str = "float32",
         embedding_learning_rate: float | None = None,
         cautious_weight_decay: bool = True,
+        clion_interval: int = 1,
     ):
         self.mud_learning_rate = mud_learning_rate
         self.fallback_learning_rate = fallback_learning_rate
@@ -401,6 +407,9 @@ class CMUD(optim.MultiOptimizer):
         self.embedding_learning_rate = (
             fallback_learning_rate if embedding_learning_rate is None else embedding_learning_rate
         )
+        if int(clion_interval) < 1:
+            raise ValueError("clion_interval must be >= 1")
+        self.clion_interval = int(clion_interval)
         mud = MUD(
             mud_learning_rate,
             momentum,
@@ -442,6 +451,16 @@ class CMUD(optim.MultiOptimizer):
             and not depthwise_conv
         )
 
+    def should_update_clion(self, optimizer_step_index: int) -> bool:
+        """True when C-Lion groups should run on this 0-based optimizer step."""
+        return (int(optimizer_step_index) % self.clion_interval) == 0
+
+    def update_mud_only(self, model, gradients: dict) -> None:
+        """Apply MUD to matrix weights only; leave embedding/fallback C-Lion frozen."""
+        parts = self._split_dictionary(gradients)
+        mud_updates = self.optimizers[0].apply_gradients(parts[0], model)
+        model.update(mud_updates)
+
     def set_lr_multiplier(self, multiplier: float) -> None:
         self.optimizers[0].learning_rate = self.mud_learning_rate * multiplier
         self.optimizers[1].learning_rate = self.embedding_learning_rate * multiplier
@@ -462,4 +481,5 @@ class CMUD(optim.MultiOptimizer):
             "mud_eight_bit": mud.eight_bit,
             "mud_master_dtype": mud.master_dtype,
             "cautious_weight_decay": mud.cautious_weight_decay,
+            "clion_interval": self.clion_interval,
         }

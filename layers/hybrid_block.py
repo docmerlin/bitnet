@@ -52,36 +52,60 @@ class HybridTransformerBlock(nn.Module):
             else None
         )
 
-        # Pre-norms (paper: norm before attn / mlp on mixed residual).
-        self.attn_norm = make_norm(
-            config.hidden_size,
-            norm_type=config.norm_type,
-            eps=eps,
-            alpha_init=config.dyt_alpha_init,
+        # R30 / R35: first prelude layer only (unique layer_id 0).
+        self.skip_mlp = bool(
+            getattr(config, "skip_first_prelude_mlp", False) and layer_id == 0
         )
-        self.mlp_norm = make_norm(
-            config.hidden_size,
-            norm_type=config.norm_type,
-            eps=eps,
-            alpha_init=config.dyt_alpha_init,
+        self.skip_attn = bool(
+            getattr(config, "skip_first_prelude_attn", False) and layer_id == 0
         )
 
-        self.infini_attn = InfiniAttention(config)
+        # Pre-norms (paper: norm before attn / mlp on mixed residual).
+        self.attn_norm = (
+            None
+            if self.skip_attn
+            else make_norm(
+                config.hidden_size,
+                norm_type=config.norm_type,
+                eps=eps,
+                alpha_init=config.dyt_alpha_init,
+            )
+        )
+        self.mlp_norm = (
+            None
+            if self.skip_mlp
+            else make_norm(
+                config.hidden_size,
+                norm_type=config.norm_type,
+                eps=eps,
+                alpha_init=config.dyt_alpha_init,
+            )
+        )
+
+        self.infini_attn = None if self.skip_attn else InfiniAttention(config)
 
         if self.attn_res_mode == "sandwich":
-            self.attn_res = SandwichResidual(
-                config.hidden_size,
-                init_scale=config.attn_res_init_scale,
-                eps=eps,
-                norm_type=config.norm_type,
-                dyt_alpha_init=config.dyt_alpha_init,
+            self.attn_res = (
+                None
+                if self.skip_attn
+                else SandwichResidual(
+                    config.hidden_size,
+                    init_scale=config.attn_res_init_scale,
+                    eps=eps,
+                    norm_type=config.norm_type,
+                    dyt_alpha_init=config.dyt_alpha_init,
+                )
             )
-            self.mlp_res = SandwichResidual(
-                config.hidden_size,
-                init_scale=config.attn_res_init_scale,
-                eps=eps,
-                norm_type=config.norm_type,
-                dyt_alpha_init=config.dyt_alpha_init,
+            self.mlp_res = (
+                None
+                if self.skip_mlp
+                else SandwichResidual(
+                    config.hidden_size,
+                    init_scale=config.attn_res_init_scale,
+                    eps=eps,
+                    norm_type=config.norm_type,
+                    dyt_alpha_init=config.dyt_alpha_init,
+                )
             )
             self.attn_res_mix = None
             self.mlp_res_mix = None
@@ -109,8 +133,10 @@ class HybridTransformerBlock(nn.Module):
                 f"attn_res_mode must be 'kimi' or 'sandwich', got {self.attn_res_mode!r}"
             )
 
-        self.use_rfmoe = config.use_rfmoe
-        if self.use_rfmoe:
+        self.use_rfmoe = config.use_rfmoe and not self.skip_mlp
+        if self.skip_mlp:
+            self.moe = None
+        elif self.use_rfmoe:
             expert_dim = config.rfmoe_expert_dim or config.intermediate_size // 4
             self.moe = RFMoE(
                 config.hidden_size,
@@ -150,8 +176,9 @@ class HybridTransformerBlock(nn.Module):
 
     def _scale_sublayer_outputs(self, scale: float) -> None:
         with torch.no_grad():
-            self.infini_attn.o_proj.weight.mul_(scale)
-            if not self.use_rfmoe:
+            if not self.skip_attn:
+                self.infini_attn.o_proj.weight.mul_(scale)
+            if not self.skip_mlp and not self.use_rfmoe:
                 self.ffn_down.weight.mul_(scale)
 
     def _mixer(
@@ -165,6 +192,8 @@ class HybridTransformerBlock(nn.Module):
         update_memory: Optional[bool] = None,
         memory_safe: Optional[bool] = None,
     ) -> torch.Tensor:
+        if self.skip_attn:
+            raise RuntimeError("attention skipped on this block (skip_first_prelude_attn)")
         self.infini_attn.num_blocks = self.num_blocks
         return self.infini_attn(
             x_norm,
@@ -210,19 +239,22 @@ class HybridTransformerBlock(nn.Module):
                 segment_ids=segment_ids,
             )
 
-        residual = x
-        x_norm = self.attn_norm(x)
-        mixer_out = self._mixer(
-            x_norm,
-            attention_mask,
-            attn_bias=attn_bias,
-            query_valid=query_valid,
-            segment_ids=segment_ids,
-            update_memory=update_memory,
-            memory_safe=memory_safe,
-        )
-        x = self.attn_res(residual, torch.sigmoid(self.gate) * mixer_out)
+        if not self.skip_attn:
+            residual = x
+            x_norm = self.attn_norm(x)
+            mixer_out = self._mixer(
+                x_norm,
+                attention_mask,
+                attn_bias=attn_bias,
+                query_valid=query_valid,
+                segment_ids=segment_ids,
+                update_memory=update_memory,
+                memory_safe=memory_safe,
+            )
+            x = self.attn_res(residual, torch.sigmoid(self.gate) * mixer_out)
 
+        if self.skip_mlp:
+            return x
         residual = x
         x_norm = self.mlp_norm(x)
         mlp_out = self._mlp(x_norm)
@@ -245,31 +277,45 @@ class HybridTransformerBlock(nn.Module):
         stream.attn_mix = self.attn_res_mix
         stream.mlp_mix = self.mlp_res_mix
 
-        h = stream.mix_attn()
-        if self.engram is not None:
+        if not self.skip_attn:
+            h = stream.mix_attn()
+            if self.engram is not None:
+                if input_ids is None:
+                    raise ValueError("input_ids are required by Engram layers")
+                h = h + self.engram(
+                    h,
+                    input_ids,
+                    attention_mask=attention_mask,
+                    segment_ids=segment_ids,
+                )
+
+            attn_out = self._mixer(
+                self.attn_norm(h),
+                attention_mask,
+                attn_bias=attn_bias,
+                query_valid=query_valid,
+                segment_ids=segment_ids,
+                update_memory=update_memory,
+                memory_safe=memory_safe,
+            )
+            stream.add_sublayer(torch.sigmoid(self.gate) * attn_out)
+        elif self.engram is not None:
             if input_ids is None:
                 raise ValueError("input_ids are required by Engram layers")
-            h = h + self.engram(
-                h,
-                input_ids,
-                attention_mask=attention_mask,
-                segment_ids=segment_ids,
+            h = stream.hidden()
+            stream.add_sublayer(
+                self.engram(
+                    h,
+                    input_ids,
+                    attention_mask=attention_mask,
+                    segment_ids=segment_ids,
+                )
             )
 
-        attn_out = self._mixer(
-            self.attn_norm(h),
-            attention_mask,
-            attn_bias=attn_bias,
-            query_valid=query_valid,
-            segment_ids=segment_ids,
-            update_memory=update_memory,
-            memory_safe=memory_safe,
-        )
-        stream.add_sublayer(torch.sigmoid(self.gate) * attn_out)
-
-        h = stream.mix_mlp()
-        mlp_out = self._mlp(self.mlp_norm(h))
-        stream.add_sublayer(mlp_out)
+        if not self.skip_mlp:
+            h = stream.mix_mlp()
+            mlp_out = self._mlp(self.mlp_norm(h))
+            stream.add_sublayer(mlp_out)
         stream.close_layer()
         return stream
 

@@ -158,9 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--embedding-learning-rate",
         type=float,
         default=None,
-        help="Rate for the token embedding and the untied output head (default: "
-        "--learning-rate). modded-nanogpt runs these well above the body rate; "
-        "try 10-30x once --no-tie-word-embeddings is in play.",
+        help="Rate for the token embedding and the untied output head. "
+        "Default: 4× --learning-rate (conservative after 540M: 10× blew val; "
+        "5× stayed stable; 4× margin). Pass an absolute rate to override.",
+    )
+    parser.add_argument(
+        "--clion-interval",
+        type=int,
+        default=1,
+        help="Apply C-Lion groups (embeddings/head/norms) every N optimizer steps; "
+        "MUD still steps every update. Default 1. 2 = R39 every-other: ~2–5%% faster "
+        "at 540M (runs/clion_500m_ab) but not quality-neutral enough to default. "
+        "Off-step grads are dropped, not accumulated.",
     )
     parser.add_argument(
         "--tie-word-embeddings",
@@ -218,6 +227,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mtp-depth", type=int, default=4)
     parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
+    parser.add_argument(
+        "--skip-first-prelude-mlp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Drop the MLP half of prelude layer 0 (NanoGPT-speedrun R30). "
+        "Attention still runs; FFN params are not allocated for that block.",
+    )
+    parser.add_argument(
+        "--skip-first-prelude-attn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Drop the attention half of prelude layer 0 (NanoGPT-speedrun R35). "
+        "MLP still runs; PaTH/Infini params are not allocated for that block.",
+    )
     parser.add_argument("--engram", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--engram-layer-ids", default="1,15")
     parser.add_argument(
@@ -275,6 +298,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("initial-blocks and final-blocks must be positive")
     if args.mud_block_size is not None and args.mud_block_size < 1:
         raise ValueError("mud-block-size must be positive")
+    if args.clion_interval < 1:
+        raise ValueError("clion-interval must be >= 1")
     if min(args.stage1_activation_bits, args.final_activation_bits) < 2:
         raise ValueError("activation bits must be at least 2")
     if not 0 <= args.mixture_switch_ratio <= 1:
@@ -470,17 +495,28 @@ def create_apply_step(
     grad_clip: float,
     compile_step: bool = True,
 ):
+    """Build full and MUD-only apply closures (R39: C-Lion every N steps).
+
+    Two separate callables so ``mx.compile`` can specialize each path; the
+    training loop picks by step index rather than branching inside one graph.
+    """
     state = [model.state, optimizer.state]
 
-    def apply_step(gradients, lr_scale):
-        gradients, grad_norm = optim.clip_grad_norm(gradients, grad_clip)
-        optimizer.set_lr_multiplier(lr_scale)
-        optimizer.update(model, gradients)
-        return grad_norm
+    def _make_apply(*, mud_only: bool):
+        def apply_step(gradients, lr_scale):
+            gradients, grad_norm = optim.clip_grad_norm(gradients, grad_clip)
+            optimizer.set_lr_multiplier(lr_scale)
+            if mud_only:
+                optimizer.update_mud_only(model, gradients)
+            else:
+                optimizer.update(model, gradients)
+            return grad_norm
 
-    if compile_step:
-        apply_step = partial(mx.compile, inputs=state, outputs=state)(apply_step)
-    return apply_step, state
+        if compile_step:
+            apply_step = partial(mx.compile, inputs=state, outputs=state)(apply_step)
+        return apply_step
+
+    return _make_apply(mud_only=False), _make_apply(mud_only=True), state
 
 
 def accumulate_gradients(accumulated, gradients):
@@ -794,6 +830,8 @@ def main() -> None:
             tie_word_embeddings=args.tie_word_embeddings,
             norm_type=args.norm_type,
             dyt_alpha_init=args.dyt_alpha_init,
+            skip_first_prelude_mlp=args.skip_first_prelude_mlp,
+            skip_first_prelude_attn=args.skip_first_prelude_attn,
         )
     if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
         print(
@@ -814,6 +852,13 @@ def main() -> None:
         args.mud_block_size = optimizer.optimizers[0].block_size
         args.cmud_master_dtype = optimizer.optimizers[0].master_dtype
     else:
+        # Default emb/head LR = 4× body (C-Lion). 10× won on 2M but blew val at
+        # 540M; 5× held; 4× keeps a stability margin. Explicit flag wins.
+        emb_lr = (
+            args.learning_rate * 4.0
+            if args.embedding_learning_rate is None
+            else args.embedding_learning_rate
+        )
         optimizer = CMUD(
             mud_learning_rate=args.mud_learning_rate,
             fallback_learning_rate=args.learning_rate,
@@ -825,8 +870,9 @@ def main() -> None:
             eight_bit=not args.no_optimizer_8bit,
             mud_eight_bit=args.cmud_momentum_8bit,
             mud_master_dtype=args.cmud_master_dtype,
-            embedding_learning_rate=args.embedding_learning_rate,
+            embedding_learning_rate=emb_lr,
             cautious_weight_decay=args.cautious_weight_decay,
+            clion_interval=args.clion_interval,
         )
     optimizer.init(model.trainable_parameters())
     trainer_state = {
@@ -926,7 +972,7 @@ def main() -> None:
     checkpoint_scope = args.gradient_checkpoint_scope if args.gradient_checkpointing else False
     profile_totals = {"data": 0.0, "forward_backward": 0.0, "mud": 0.0, "sync_wait": 0.0}
     profile_steps = 0
-    apply_step, state = create_apply_step(
+    apply_full, apply_mud_only, state = create_apply_step(
         model,
         optimizer,
         grad_clip=args.grad_clip,
@@ -1055,7 +1101,11 @@ def main() -> None:
         multiplier = lr_multiplier(
             step - 1, total_steps, warmup_steps, cooldown_steps, args.min_lr_ratio, args.lr_schedule
         )
-        grad_norm = apply_step(accumulated_gradients, mx.array(multiplier))
+        # R39: C-Lion every N steps (interval 1 = always). MUD always applies.
+        if isinstance(optimizer, CMUD) and not optimizer.should_update_clion(step - 1):
+            grad_norm = apply_mud_only(accumulated_gradients, mx.array(multiplier))
+        else:
+            grad_norm = apply_full(accumulated_gradients, mx.array(multiplier))
         if args.profile_phases:
             sync_started = time.perf_counter()
         mx.eval(model.state, optimizer.state, grad_norm)

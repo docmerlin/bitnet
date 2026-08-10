@@ -143,6 +143,10 @@ class TernaryConfig:
     # learning rate was their largest win after Muon. Costs vocab*hidden extra
     # parameters (16.7M at vocab 32768 / hidden 512).
     tie_word_embeddings: bool = False
+    # NanoGPT-speedrun R30: drop the MLP half of the first prelude layer (layer 0).
+    skip_first_prelude_mlp: bool = False
+    # NanoGPT-speedrun R35: drop the attention half of the first prelude layer.
+    skip_first_prelude_attn: bool = False
 
     # Looped / recurrent-depth structure. None = resolve in __post_init__.
     # Effective depth = prelude + recurrent * num_loops + coda.
