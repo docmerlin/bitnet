@@ -7,6 +7,8 @@ import math
 import mlx.core as mx
 import mlx.optimizers as optim
 
+from training.token_progress import momentum_warmup
+
 
 QUANT_BLOCK_SIZE = 2048
 MASTER_DTYPES = {"float32": mx.float32, "bfloat16": mx.bfloat16}
@@ -216,15 +218,22 @@ def dequantize_blockwise(quantized: mx.array, scale: mx.array, shape: tuple[int,
     return (quantized.astype(mx.float32) * scale[:, None]).reshape(-1)[:size].reshape(shape)
 
 
+def _as_float32_array(value: float | mx.array) -> mx.array:
+    """Compile-safe scalar: Python float or mx.array → float32 array."""
+    if isinstance(value, mx.array):
+        return value.astype(mx.float32)
+    return mx.array(float(value), dtype=mx.float32)
+
+
 def _fused_mud_momentum(
     gradient: mx.array,
     previous_q: mx.array,
     previous_scale: mx.array,
-    momentum: float,
+    momentum: float | mx.array,
 ):
     blocks = previous_q.shape[0]
     return _FUSED_MUD_MOMENTUM(
-        inputs=[gradient, previous_q, previous_scale, mx.array(momentum, dtype=mx.float32)],
+        inputs=[gradient, previous_q, previous_scale, _as_float32_array(momentum)],
         template=[("BLOCK_SIZE", QUANT_BLOCK_SIZE)],
         grid=(256, blocks, 1),
         threadgroup=(256, 1, 1),
@@ -249,6 +258,7 @@ class MUD(optim.Optimizer):
         if master_dtype not in MASTER_DTYPES:
             raise ValueError(f"Unsupported master dtype: {master_dtype}")
         self._maybe_schedule("learning_rate", learning_rate)
+        # Live coefficient: Python float or mx.array (warmup under mx.compile).
         self.momentum = momentum
         self.passes = passes
         self.weight_decay = weight_decay
@@ -269,6 +279,7 @@ class MUD(optim.Optimizer):
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
         parameter_dtype = parameter.dtype
         gradient = gradient.astype(mx.float32)
+        mom = _as_float32_array(self.momentum)
         use_eight_bit = self.eight_bit and parameter.size >= QUANT_BLOCK_SIZE
         fused_state = None
         if use_eight_bit and "momentum_buffer_q" in state:
@@ -276,7 +287,7 @@ class MUD(optim.Optimizer):
                 gradient,
                 state["momentum_buffer_q"],
                 state["momentum_buffer_scale"],
-                self.momentum,
+                mom,
             )
             fused_state = next_q, next_scale
         elif "momentum_buffer_q" in state:
@@ -290,8 +301,8 @@ class MUD(optim.Optimizer):
         else:
             previous = mx.zeros(parameter.shape, dtype=mx.float32)
         if fused_state is None:
-            momentum_buffer = self.momentum * previous + gradient
-            direction = gradient + self.momentum * momentum_buffer
+            momentum_buffer = mom * previous + gradient
+            direction = gradient + mom * momentum_buffer
         update = mud_decorrelate(direction, self.passes, block_size=self.block_size)
         update = update * (0.2 * math.sqrt(max(parameter.shape)))
         update = cautious_mask(update, gradient)
@@ -400,6 +411,7 @@ class CMUD(optim.MultiOptimizer):
         embedding_learning_rate: float | None = None,
         cautious_weight_decay: bool = True,
         clion_interval: int = 1,
+        mud_momentum_start: float | None = None,
     ):
         self.mud_learning_rate = mud_learning_rate
         self.fallback_learning_rate = fallback_learning_rate
@@ -410,6 +422,12 @@ class CMUD(optim.MultiOptimizer):
         if int(clion_interval) < 1:
             raise ValueError("clion_interval must be >= 1")
         self.clion_interval = int(clion_interval)
+        # NanoGPT-speedrun R9: warm momentum from start → peak over LR warmup.
+        # None or equal to peak disables the ramp.
+        self.mud_momentum = float(momentum)
+        self.mud_momentum_start = (
+            float(momentum) if mud_momentum_start is None else float(mud_momentum_start)
+        )
         mud = MUD(
             mud_learning_rate,
             momentum,
@@ -461,10 +479,23 @@ class CMUD(optim.MultiOptimizer):
         mud_updates = self.optimizers[0].apply_gradients(parts[0], model)
         model.update(mud_updates)
 
-    def set_lr_multiplier(self, multiplier: float) -> None:
+    def set_lr_multiplier(self, multiplier: float | mx.array) -> None:
         self.optimizers[0].learning_rate = self.mud_learning_rate * multiplier
         self.optimizers[1].learning_rate = self.embedding_learning_rate * multiplier
         self.optimizers[2].learning_rate = self.fallback_learning_rate * multiplier
+
+    def set_mud_momentum(self, momentum: float | mx.array) -> None:
+        """Set live MUD heavy-ball coefficient (warmup-safe under mx.compile)."""
+        self.optimizers[0].momentum = momentum
+
+    def momentum_at(self, step: int, warmup_steps: int) -> float:
+        """Linear ramp start→peak over ``warmup_steps``, then hold peak (R9)."""
+        return momentum_warmup(
+            step,
+            warmup_steps,
+            start=self.mud_momentum_start,
+            peak=self.mud_momentum,
+        )
 
     def checkpoint_config(self) -> dict:
         mud, _embedding, clion = self.optimizers
@@ -473,7 +504,8 @@ class CMUD(optim.MultiOptimizer):
             "fallback_learning_rate": self.fallback_learning_rate,
             "embedding_learning_rate": self.embedding_learning_rate,
             "weight_decay": mud.weight_decay,
-            "momentum": mud.momentum,
+            "momentum": self.mud_momentum,
+            "mud_momentum_start": self.mud_momentum_start,
             "passes": mud.passes,
             "block_size": mud.block_size,
             "betas": [clion.beta1, clion.beta2],

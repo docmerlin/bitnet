@@ -1,4 +1,8 @@
-"""Progress-driven training schedules (quantization, blocks, RFMoE, LR)."""
+"""Progress-driven training schedules (quantization, blocks, RFMoE, LR).
+
+Pure token-progress ramps live in ``training.token_progress`` (torch-free) so
+MLX optim can import them without pulling PyTorch.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,34 @@ import torch.nn as nn
 from data.presets import DatasetSource
 from layers.h_bitlinear import HBitLinear
 from layers.hybrid_block import HybridTransformerBlock
+from training.token_progress import (  # re-export for existing importers
+    WallClockShapes,
+    estimate_total_steps,
+    momentum_warmup,
+    resolve_ramp_bounds,
+    scheduled_int,
+    scheduled_value,
+    snap_sequence_length,
+    wall_clock_shapes,
+)
+
+__all__ = [
+    "WallClockShapes",
+    "choose_stage_mixture",
+    "collect_loop_train_metrics",
+    "estimate_total_steps",
+    "loop_count_for_progress",
+    "lr_schedule_multiplier",
+    "momentum_warmup",
+    "resolve_ramp_bounds",
+    "rfmoe_staircase_schedule",
+    "scheduled_int",
+    "scheduled_value",
+    "snap_sequence_length",
+    "update_block_growth",
+    "update_quantization_schedule",
+    "wall_clock_shapes",
+]
 
 
 def choose_stage_mixture(

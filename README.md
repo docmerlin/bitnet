@@ -333,7 +333,16 @@ Relevant flags:
   default `1`. `2` is speedrun R39; small A/B did not win speed or quality
 - `--tie-word-embeddings` / `--no-tie-word-embeddings` (MLX only, default untied)
 - `--mud-learning-rate` — LR for MUD matrix group (MUD paper default `1e-3`)
-- `--mud-momentum` — MUD heavy-ball momentum (Nesterov lookahead)
+- `--mud-momentum` — peak MUD heavy-ball momentum (default `0.95`)
+- `--mud-momentum-start` — start of momentum ramp over LR warmup (default `0.85`,
+  speedrun R9; set equal to `--mud-momentum` to disable)
+- `--initial-micro-batch-size` / `--micro-batch-size` / `--batch-growth-ratio` —
+  R46 batch ramp. **Default 1→4** over full token progress (1.01B A/B: ~15%
+  wall win vs fixed b1). Set initial=peak to disable. 540M can go higher
+  (1→6–8); 1→6 thrash at ~1B on 32 GB.
+- `--initial-sequence-length` / `--seq-growth-ratio` — R72 max-seq ramp
+  (snapped to nearest multiple of `--path-window-size`; default: no ramp).
+  540M seq 64→128 was slower wall with no quality free lunch
 - `--mud-passes` — triangular-whitening passes `p` (default `1` = MUD1; `2` for
   harder landscapes)
 - `--mud-block-size` — independent whitening rows per block (default `64`)

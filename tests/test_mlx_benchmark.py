@@ -157,6 +157,8 @@ def test_mlx_training_step_is_finite() -> None:
 def test_mlx_training_defaults_use_fast_local_batch() -> None:
     args = build_parser().parse_args([])
     assert args.micro_batch_size == 4
+    assert args.initial_micro_batch_size == 1  # R46 default 1→4 ramp
+    assert args.batch_growth_ratio == 1.0
     assert args.grad_accumulation_steps == 4
     assert not args.gradient_checkpointing
     assert args.gradient_checkpoint_scope == "recurrent"
@@ -462,14 +464,16 @@ def test_mlx_compiled_apply_step_updates_model() -> None:
         eight_bit=False,
     )
     optimizer.init(model.trainable_parameters())
-    apply_step, state = create_apply_step(model, optimizer, grad_clip=1.0, compile_step=True)
+    apply_full, _apply_mud_only, state = create_apply_step(
+        model, optimizer, grad_clip=1.0, compile_step=True
+    )
     before = mx.array(model.embedding.weight)
     gradients = tree_map(mx.ones_like, model.trainable_parameters())
 
-    grad_norm = apply_step(gradients, mx.array(0.5))
+    grad_norm = apply_full(gradients, mx.array(0.5), mx.array(0.95))
     mx.eval(grad_norm, state)
     after_update = mx.array(model.embedding.weight)
-    apply_step(gradients, mx.array(0.0))
+    apply_full(gradients, mx.array(0.0), mx.array(0.95))
     mx.eval(state)
 
     assert mx.isfinite(grad_norm).item()

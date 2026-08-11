@@ -21,6 +21,12 @@ from data.streams import build_batch_stream
 from mlx_model import MLXBitNet, MLXBitNetConfig
 from mlx_optim import CMUD
 from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
+from training.token_progress import (
+    estimate_total_steps,
+    resolve_ramp_bounds,
+    scheduled_value,
+    wall_clock_shapes,
+)
 
 
 _MEMORY_STATE_NAMES = (".memory_m", ".memory_z", ".memory_initialized")
@@ -55,6 +61,9 @@ RETIRED_CONFIG_FIELDS = frozenset(
         "mamba_dt_max",
         "mamba_a_floor",
         "use_mamba_scan_kernel",
+        # MuonClip QK-Clip trial (removed after no-effect A/Bs at 2M / 540M).
+        "qk_clip_threshold",
+        "qk_clip_alpha",
     }
 )
 
@@ -139,7 +148,28 @@ def build_parser() -> argparse.ArgumentParser:
         "Swap to 8→16 to restore the old shrink schedule.",
     )
     parser.add_argument("--block-growth-ratio", type=float, default=0.6)
-    parser.add_argument("--sequence-length", type=int, default=1024)
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=1024,
+        help="Final (peak) packed sequence length. With --initial-sequence-length "
+        "smaller, ramps up over --seq-growth-ratio (NanoGPT-speedrun R72).",
+    )
+    parser.add_argument(
+        "--initial-sequence-length",
+        type=int,
+        default=None,
+        help="Sequence length at token-progress 0 (R72 max-seq schedule). "
+        "Default: same as --sequence-length (no ramp). Must be divisible by "
+        "--path-window-size.",
+    )
+    parser.add_argument(
+        "--seq-growth-ratio",
+        type=float,
+        default=1.0,
+        help="Token-progress fraction over which sequence length ramps from "
+        "--initial-sequence-length to --sequence-length. 1.0 = full run.",
+    )
     parser.add_argument("--path-window-size", type=int, default=1024)
     parser.add_argument(
         "--topk-blocks-branch",
@@ -163,7 +193,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--topk-blocks", type=int, default=4)
     parser.add_argument("--topk-block-size", type=int, default=64)
-    parser.add_argument("--micro-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=4,
+        help="Peak micro-batch size (default 4). Ramps from "
+        "--initial-micro-batch-size over --batch-growth-ratio (R46).",
+    )
+    parser.add_argument(
+        "--initial-micro-batch-size",
+        type=int,
+        default=1,
+        help="Micro-batch at token-progress 0 (R46). Default 1 → peak "
+        "(--micro-batch-size, default 4). Set equal to the peak to disable the ramp.",
+    )
+    parser.add_argument(
+        "--batch-growth-ratio",
+        type=float,
+        default=1.0,
+        help="Token-progress fraction over which micro-batch ramps from "
+        "--initial-micro-batch-size to --micro-batch-size. 1.0 = full run.",
+    )
     parser.add_argument("--grad-accumulation-steps", type=int, default=4)
     parser.add_argument("--total-tokens", type=int, default=10_000_000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -193,7 +243,19 @@ def build_parser() -> argparse.ArgumentParser:
         "win after Muon. Costs vocab*hidden extra parameters.",
     )
     parser.add_argument("--mud-learning-rate", type=float, default=1e-3)
-    parser.add_argument("--mud-momentum", type=float, default=0.95)
+    parser.add_argument(
+        "--mud-momentum",
+        type=float,
+        default=0.95,
+        help="Peak MUD heavy-ball momentum after warmup (speedrun / Muon default 0.95).",
+    )
+    parser.add_argument(
+        "--mud-momentum-start",
+        type=float,
+        default=0.85,
+        help="MUD momentum at step 0; linear ramp to --mud-momentum over LR warmup "
+        "(NanoGPT-speedrun R9). Set equal to --mud-momentum to disable the ramp.",
+    )
     parser.add_argument("--mud-passes", type=int, default=1)
     parser.add_argument(
         "--mud-block-size",
@@ -300,6 +362,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_batch_seq_schedule(args: argparse.Namespace) -> tuple[int, int, int, int]:
+    """Return (initial_batch, final_batch, initial_seq, final_seq).
+
+    Disable a ramp by setting initial equal to the peak (CLI), or pass
+    ``initial_*=None`` programmatically for a fixed shape.
+    """
+    initial_batch, final_batch = resolve_ramp_bounds(
+        args.initial_micro_batch_size, args.micro_batch_size
+    )
+    initial_seq, final_seq = resolve_ramp_bounds(
+        args.initial_sequence_length, args.sequence_length
+    )
+    return initial_batch, final_batch, initial_seq, final_seq
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.hidden_size % args.num_heads:
         raise ValueError("hidden-size must be divisible by num-heads")
@@ -321,6 +398,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("min-num-loops must be positive")
     if not 0 <= args.loop_curriculum_start_ratio <= args.loop_curriculum_ratio <= 1:
         raise ValueError("loop curriculum must satisfy 0 <= start <= end <= 1")
+    if not 0 <= args.batch_growth_ratio <= 1:
+        raise ValueError("batch-growth-ratio must be between zero and one")
+    if not 0 <= args.seq_growth_ratio <= 1:
+        raise ValueError("seq-growth-ratio must be between zero and one")
+    initial_batch, final_batch, initial_seq, final_seq = resolve_batch_seq_schedule(args)
+    if initial_batch < 1 or final_batch < 1:
+        raise ValueError("micro-batch sizes must be positive")
+    if initial_seq < 1 or final_seq < 1:
+        raise ValueError("sequence lengths must be positive")
+    if initial_seq % args.path_window_size:
+        raise ValueError("initial-sequence-length must be divisible by path-window-size")
     if args.lr_schedule == "wsd" and not args.cooldown_steps and args.cooldown_ratio < 0.1:
         # WSD is a plateau plus a long ramp down. Left at the cosine default the
         # ramp is 5% of the run, which is a constant-LR run with a cliff at the
@@ -516,9 +604,10 @@ def create_apply_step(
     state = [model.state, optimizer.state]
 
     def _make_apply(*, mud_only: bool):
-        def apply_step(gradients, lr_scale):
+        def apply_step(gradients, lr_scale, mud_momentum):
             gradients, grad_norm = optim.clip_grad_norm(gradients, grad_clip)
             optimizer.set_lr_multiplier(lr_scale)
+            optimizer.set_mud_momentum(mud_momentum)
             if mud_only:
                 optimizer.update_mud_only(model, gradients)
             else:
@@ -671,13 +760,6 @@ def load_checkpoint(path: Path, model: MLXBitNet, optimizer: optim.Optimizer) ->
     if metadata.get("mlx_random_state") is not None:
         mx.random.state[:] = [mx.array(value, dtype=mx.uint32) for value in metadata["mlx_random_state"]]
     return metadata["trainer_state"]
-
-
-def scheduled_value(start: float, end: float, progress: float, ratio: float) -> float:
-    if ratio <= 0:
-        return end
-    fraction = min(max(progress / ratio, 0.0), 1.0)
-    return start + fraction * (end - start)
 
 
 def lr_multiplier(
@@ -886,6 +968,7 @@ def main() -> None:
             embedding_learning_rate=emb_lr,
             cautious_weight_decay=args.cautious_weight_decay,
             clion_interval=args.clion_interval,
+            mud_momentum_start=args.mud_momentum_start,
         )
     optimizer.init(model.trainable_parameters())
     trainer_state = {
@@ -897,6 +980,7 @@ def main() -> None:
     if args.resume_from:
         trainer_state.update(load_checkpoint(Path(args.resume_from), model, optimizer))
 
+    initial_batch, final_batch, initial_seq, final_seq = resolve_batch_seq_schedule(args)
     early_spec = args.early_train_mixture or args.train_mixture
     early_stream = build_batch_stream(
         parse_mixture(early_spec),
@@ -906,9 +990,9 @@ def main() -> None:
         shuffle_buffer_size=args.shuffle_buffer_size,
         skip_examples=0,
         restart_on_eof=True,
-        sequence_length=args.sequence_length,
+        sequence_length=initial_seq,
         max_document_tokens=args.max_document_tokens,
-        micro_batch_size=args.micro_batch_size,
+        micro_batch_size=initial_batch,
     )
     late_stream = None
     if args.late_train_mixture:
@@ -920,9 +1004,9 @@ def main() -> None:
             shuffle_buffer_size=args.shuffle_buffer_size,
             skip_examples=0,
             restart_on_eof=True,
-            sequence_length=args.sequence_length,
+            sequence_length=initial_seq,
             max_document_tokens=args.max_document_tokens,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=initial_batch,
         )
     if args.resume_from:
         stream_state = saved.get("stream_state")
@@ -939,20 +1023,37 @@ def main() -> None:
             "late": late_stream.state_dict() if late_stream is not None else None,
         }
 
-    tokens_per_microbatch = args.micro_batch_size * args.sequence_length
-    tokens_per_step = tokens_per_microbatch * args.grad_accumulation_steps
-    total_steps = math.ceil(args.total_tokens / tokens_per_step)
+    total_steps = estimate_total_steps(
+        args.total_tokens,
+        initial_batch=initial_batch,
+        final_batch=final_batch,
+        batch_growth_ratio=args.batch_growth_ratio,
+        initial_seq=initial_seq,
+        final_seq=final_seq,
+        seq_growth_ratio=args.seq_growth_ratio,
+        path_window=args.path_window_size,
+        grad_accumulation_steps=args.grad_accumulation_steps,
+    )
+    # Peak tokens/step (final shapes) — used for logging throughput upper bound.
+    tokens_per_step_peak = final_batch * final_seq * args.grad_accumulation_steps
     warmup_steps = args.warmup_steps or math.ceil(total_steps * args.warmup_ratio)
     cooldown_steps = args.cooldown_steps or math.ceil(total_steps * args.cooldown_ratio)
     parameters = sum(value.size for _, value in tree_flatten(model.parameters()))
     print(f"Device: {mx.device_info()['device_name']}")
     print(f"Model parameters: {parameters / 1e6:.2f}M")
     print(f"Effective depth: {config.effective_depth}")
+    if initial_batch != final_batch or initial_seq != final_seq:
+        print(
+            f"Wall-clock curriculum: batch {initial_batch}->{final_batch} "
+            f"(ratio={args.batch_growth_ratio}), seq {initial_seq}->{final_seq} "
+            f"(ratio={args.seq_growth_ratio}); ~{total_steps} steps for "
+            f"{args.total_tokens} tokens (peak {tokens_per_step_peak} tok/step)"
+        )
     window_start, window_end = (
         effective_path_window(
             path_window_size=config.path_window_size,
             block_size=blocks,
-            sequence_length=args.sequence_length,
+            sequence_length=final_seq,
         )
         for blocks in (args.initial_blocks, args.final_blocks)
     )
@@ -1007,6 +1108,18 @@ def main() -> None:
             progress,
             args.block_growth_ratio,
         ))
+        shapes = wall_clock_shapes(
+            progress,
+            initial_batch=initial_batch,
+            final_batch=final_batch,
+            batch_growth_ratio=args.batch_growth_ratio,
+            initial_seq=initial_seq,
+            final_seq=final_seq,
+            seq_growth_ratio=args.seq_growth_ratio,
+            path_window=args.path_window_size,
+        )
+        active_batch, active_seq = shapes.batch, shapes.seq
+        tokens_this_step = shapes.tokens_per_step(args.grad_accumulation_steps)
         model.set_active_blocks(active_blocks)
         quant_fraction = 1.0 if args.stage1_ratio <= 0 else min(progress / args.stage1_ratio, 1.0)
         weight_mix = args.stage1_weight_mix_start + quant_fraction * (1.0 - args.stage1_weight_mix_start)
@@ -1017,19 +1130,20 @@ def main() -> None:
         )
         model.set_quantization_state(weight_mix, activation_mix, activation_bits)
         model.recurrent_quantized_matmul = (
-            args.recurrent_quantized_matmul and args.sequence_length >= 128 and weight_mix >= 1.0
+            args.recurrent_quantized_matmul and active_seq >= 128 and weight_mix >= 1.0
         )
         rf_fraction = min(progress / max(args.rfmoe_curriculum_ratio, 1e-8), 1.0)
         if args.rfmoe_curriculum_ratio <= 0:
             rf_fraction = 1.0
         rf_s = rf_fraction * args.rfmoe_zipf_s
         rf_alpha = 1.0 + rf_fraction * (args.rfmoe_uniform_alpha - 1.0)
-        key = (active_loops, active_blocks, model.recurrent_quantized_matmul)
+        # Batch/seq enter the compile key: MLX traces shapes into the graph.
+        key = (active_loops, active_blocks, active_batch, active_seq, model.recurrent_quantized_matmul)
         if key not in gradient_steps:
             compile_gradient = _gradient_compile_safe(
                 config,
                 args.compile,
-                args.sequence_length,
+                active_seq,
                 active_blocks,
             )
             gradient_step = create_gradient_step(
@@ -1046,6 +1160,7 @@ def main() -> None:
             gradient_steps[key] = (gradient_step, compile_gradient)
         gradient_step, gradient_is_compiled = gradient_steps[key]
         active_stream = late_stream if late_stream is not None and progress >= args.mixture_switch_ratio else early_stream
+        active_stream.set_shapes(micro_batch_size=active_batch, sequence_length=active_seq)
         step_started = time.perf_counter()
         accumulated_gradients = None
         losses = []
@@ -1114,11 +1229,16 @@ def main() -> None:
         multiplier = lr_multiplier(
             step - 1, total_steps, warmup_steps, cooldown_steps, args.min_lr_ratio, args.lr_schedule
         )
-        # R39: C-Lion every N steps (interval 1 = always). MUD always applies.
-        if isinstance(optimizer, CMUD) and not optimizer.should_update_clion(step - 1):
-            grad_norm = apply_mud_only(accumulated_gradients, mx.array(multiplier))
+        if isinstance(optimizer, CMUD):
+            mud_mom = optimizer.momentum_at(step - 1, warmup_steps)
         else:
-            grad_norm = apply_full(accumulated_gradients, mx.array(multiplier))
+            mud_mom = args.mud_momentum
+        # R39: C-Lion every N steps (interval 1 = always). MUD always applies.
+        apply_args = (accumulated_gradients, mx.array(multiplier), mx.array(mud_mom))
+        if isinstance(optimizer, CMUD) and not optimizer.should_update_clion(step - 1):
+            grad_norm = apply_mud_only(*apply_args)
+        else:
+            grad_norm = apply_full(*apply_args)
         if args.profile_phases:
             sync_started = time.perf_counter()
         mx.eval(model.state, optimizer.state, grad_norm)
@@ -1128,7 +1248,7 @@ def main() -> None:
             profile_steps += 1
         elapsed = time.perf_counter() - step_started
         trainer_state["step"] = step
-        trainer_state["tokens_processed"] += tokens_per_step
+        trainer_state["tokens_processed"] += tokens_this_step
         if config.use_rfmoe and hard_densities:
             density = sum(hard_densities) / len(hard_densities)
             factor = 1.0 + args.rfmoe_density_eta
@@ -1141,11 +1261,13 @@ def main() -> None:
                 "step": step,
                 "loss": sum(losses) / len(losses),
                 "tokens_processed": trainer_state["tokens_processed"],
-                "tokens_per_second": tokens_per_step / elapsed,
+                "tokens_per_second": tokens_this_step / elapsed,
                 "learning_rate": optimizer.mud_learning_rate * multiplier,
                 "grad_norm": float(grad_norm.item()),
                 "active_loops": active_loops,
                 "active_blocks": active_blocks,
+                "active_batch": active_batch,
+                "active_seq": active_seq,
                 "quant_weight_mix": weight_mix,
                 "quant_activation_mix": activation_mix,
                 "quant_activation_bits": activation_bits,

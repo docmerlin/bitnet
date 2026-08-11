@@ -452,9 +452,37 @@ bumps.
   one of their largest architectural wins: per-token learned V injected as an alternative
   value stream, adding capacity without FLOPs. Needs token ids, so for BLT it belongs in the
   byte-level encoder rather than the patch-level global model.
-- [ ] **Batch-size schedule (R46) and max_seq_len schedule (R72).** Cheap curriculum knobs;
-  this repo already has loop-count, block-count and quantisation curricula to hang them on.
-  (Attention-window direction: default now **grows** windows via blocks 16→8.)
+- [x] **Batch-size schedule (R46) and max_seq_len schedule (R72).** Wired in ``mlx_train``:
+  ``--initial-micro-batch-size`` / ``--batch-growth-ratio``, ``--initial-sequence-length``
+  / ``--seq-growth-ratio``. Live stream mutation; token-budget step estimate for LR.
+  Seq snaps to nearest multiple of ``--path-window-size``. **Batch default 1→4**
+  (peak ``--micro-batch-size`` 4); seq schedule still opt-in (initial=None).
+  - **2M** (`runs/batch_seq_ab/`, 100k tok): batch 1→4 best val (**2.417** vs fixed
+    2.598) but ~2× wall; seq 64→128 mid; both ≈ batch slower.
+  - **540.5M** (`runs/batch_seq_500m_ab/`, 100k tok, h1024 `8+16×1+8`, seed 1337):
+    | arm | wall | late tok/s | last3 train | last val |
+    |---|---|---|---|---|
+    | fixed b1 a2 s128 | 583s | 176 | 2.28 | 4.01 @90k |
+    | seq 64→128 | 854s | 179 | 2.72 | 3.97 |
+    | batch 1→2 a1 | 629s | 226 | 2.25 | 5.66 |
+    | batch 1→3 a1 | 526s | 304 | 2.24 | 4.25 |
+    | batch 1→4 a1 | 462s | 365 | 2.26 | 3.37 |
+    | batch **1→6** a1 | **386s** | **493** peak | 2.31 | **2.64** |
+    | batch **1→8** a1 | **342s** | 488 peak | **2.10** | **2.39** |
+    | batch 1→12 a1 | 535s | thrash ~93 late | 2.17 | **2.29** |
+    Peaks b3–b12 all fit (ckpt). **Wall sweet spot ≈ 1→8** (~41% faster than
+    fixed); 1→6 close. 1→12 fits but **memory thrash** (tok/s collapses past
+    ~b7–11) → slower wall despite best late val. 1→2 too mild. Val 2-batch
+    noisy but larger peaks look more stable here. Still **opt-in**.
+  - **1.014B** (`runs/batch_seq_1b_ab/`, 100k tok, h1024 `8+48×1+8`, seed 1337):
+    | arm | wall | late tok/s | last3 train | last val |
+    |---|---|---|---|---|
+    | fixed b1 a2 | 1199s | 88 | 2.19 | 3.17 |
+    | batch **1→4** | **1024s** | **122** | 2.26 | 3.23 |
+    | batch 1→6 | 1805s | thrash **~27** | 2.28 | **2.77** |
+    Peak b4/b6 both probe-OK. **1→4 still wins wall** (~15% faster than fixed).
+    **1→6 thrash on 1B** past ~b5 (tok/s 150→20) — probe peak is fine but sustained
+    full-run is not. Prefer **1→4 at ~1B**, 1→6–8 only if memory headroom like 540M.
 - [x] **Drop the first MLP layer (R30) and the first attention layer (R35).** Flags
   ``--skip-first-prelude-mlp`` / ``--skip-first-prelude-attn``; A/Bs did not adopt
   (MLP flat speed + slight loss; attn faster but clear quality regression).
@@ -482,9 +510,11 @@ Superseded detail from the earlier pass:
   (window shrinks). A/B 2M, seq 128 (`runs/attn_window_ab/`): grow 16→4 slightly beat
   shrink 4→16 on val@150 (2.597 vs 2.606) and wall (16.5s vs 17.8s); fixed wide 4→4
   was fastest (13.4s) with similar val. **Default now 16→8** (grow windows).
-- [ ] **Momentum warmup in MUD (R9, 0.85 -> 0.95).** Small speedrun win. Needs momentum to
-  become a traced `mx.array` like `learning_rate` so `apply_step` stays compiled, plus a
-  `float()` in `checkpoint_config`. Skipped as speculative for a whitening optimizer.
+- [x] **Momentum warmup in MUD (R9, 0.85 -> 0.95).** Wired: live momentum is an
+  ``mx.array`` arg to ``apply_step`` (compile-safe). Linear ramp over LR warmup via
+  ``--mud-momentum-start`` (default **0.85**) → ``--mud-momentum`` (0.95). A/B 2M
+  (`runs/mud_mom_warmup_ab/`): val@150 **warmup 2.597** vs fixed 2.602; train final
+  2.505 vs 2.507. Small consistent win → default on.
 
 ### BLT as the main model
 
@@ -618,7 +648,7 @@ regressions can be reverted.**
   stay mildly faster with packed on — the old 52M “turn it off → 1.10×” result does not
   reproduce. Keep CLI default True with existing guards (`seq ≥ 128`, `weight_mix ≥ 1`).
   No scale gate flip.
-- [ ] **Wall-clock curricula:** batch-size schedule, max-seq schedule still open.
+- [x] **Wall-clock curricula:** batch R46 default **1→4**; seq R72 still opt-in.
   Attention-window direction decided: default **grows** windows (16→8 blocks).
 - [x] **Drop first prelude MLP / first attention (R30/R35).** Implemented as flags;
   small A/Bs: MLP no speed win + slight quality loss; attn ~12% faster but clear
@@ -651,15 +681,12 @@ and RFMoE already in-tree.
 
 **Best options (highest expected impact):**
 
-- [ ] **MuonClip-style attention logit control on the MUD path.** Kimi K2 / Moonshot
-  (Muon scaling + MuonClip): per-head negative feedback that rescales Q/K when attention
-  logits explode, unlocking long stable pretrain without loss spikes. Stability *is*
-  training speed here — one spike wastes more wall-clock than most kernel wins. Fits this
-  repo: we already run MUD (triangular whitening, not Newton–Schulz) and QK-norm; add a
-  cheap per-head logit monitor + scale on Q or K after the MUD update (or soft clamp on
-  scores at forward). A/B: steps-to-target-loss and spike count on a 50M-class BitNet or
-  BLT-global run. Refs: Keller Jordan Muon; Moonshot "Muon is Scalable for LLM Training"
-  (arXiv:2502.16982); Kimi K2 / MuonClip writeups.
+- [x] **MuonClip / QK-Clip — tried, no effect; removed.** Implemented post-update
+  per-head Q/K weight rescale (Kimi K2 style) after MUD steps. Equal-token A/Bs at
+  **2M** and **540.5M** (`runs/qk_clip_ab/`, `runs/qk_clip_500m_ab/`): under our
+  QK-norm + short PaTH windows, max attention logits stayed ~5–8, so τ∈{30,100}
+  **never fired**; wall and quality flat vs off. Code deleted; not worth carrying.
+  Revisit only if S_max actually spikes at larger scale / longer context.
 - [ ] **Keep pushing BLT patch coarseness + thinner global depth as first-class knobs.**
   Already the largest measured wall-clock lever on this machine (coarser patches ~+25%,
   thinner recurrent ~+44%, combo ~1.75× vs 48×3 p128). Treat as ongoing schedule: patch
@@ -672,7 +699,7 @@ and RFMoE already in-tree.
   dependencies. Best applied to BLT's **global** transformer (or BitNet recurrent core),
   not the tiny byte locals. Prototype: replace every 4th global block's full/PaTH attn
   with a Gated DeltaNet (or Mamba-2) block; measure train tokens/s, peak memory at long
-  sequences, and loss vs dense baseline. Higher implementation cost than DyT/MuonClip;
+  sequences, and loss vs dense baseline. Higher implementation cost than DyT;
   high ceiling if patch sequences grow. Refs: Gated DeltaNet (Yang et al.); Kimi Linear
   (arXiv:2510.26692); Raschka architecture comparison 2025.
 - [ ] **RFMoE quality + fused grouped expert GEMM (train path).** Sparse capacity is the
@@ -713,8 +740,10 @@ and RFMoE already in-tree.
 - [x] **`--mud-neuron-norm`** — A/B lost; **code removed** (see NanoGPT "Worth doing").
 - [x] **Align MUD block size to head_dim (R80-style)** — A/B: default **32** beats 64.
   See NanoGPT "Worth doing".
-- [ ] **Wall-clock curricula** (batch-size, max-seq) — attention-window direction done
-  (grow default). Prefer measured bytes/hour to target loss, not only ms/step.
+- [x] **Wall-clock curricula** (batch-size R46, max-seq R72) — batch default **1→4**;
+  seq opt-in (see NanoGPT "Worth doing"). Attention-window grow default already on.
+- [x] **MuonClip QK-Clip** — tried at 2M + 540M; no effect (inert under QK-norm);
+  **removed** (see Best options).
 - [ ] **BLT-S self-speculation** — already implemented and deferred pending a trained
   entropy student (see BLT generation performance). Zero train risk; inference-only;
   quality-preserving under greedy. Revisit when student patches ~2–4 bytes.
@@ -737,9 +766,9 @@ and RFMoE already in-tree.
   deferred under BLT generation.
 - **nGPT hypersphere residual stream:** strong sample-efficiency claims (4–20× fewer
   steps) but high integration risk with ternary STE / BitLinear; revisit only after DyT
-  and MuonClip land.
+  is settled (DyT A/B kept RMS default).
 
-Refs (short): Muon/MuonClip arXiv:2502.16982; SOAP arXiv:2409.11321; DyT arXiv:2503.10622;
+Refs (short): SOAP arXiv:2409.11321; DyT arXiv:2503.10622;
 Gated DeltaNet / Kimi Linear arXiv:2510.26692; Fast BLT arXiv:2605.08044; nGPT
 arXiv:2410.01131; Raschka "State of LLMs 2025" architecture comparison.
 

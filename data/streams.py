@@ -400,7 +400,23 @@ class BatchStream:
 
     def __init__(self, sequence_stream: PackedSequenceStream, micro_batch_size: int) -> None:
         self.sequence_stream = sequence_stream
+        if micro_batch_size < 1:
+            raise ValueError("micro_batch_size must be positive")
         self.micro_batch_size = micro_batch_size
+
+    def set_shapes(self, *, micro_batch_size: int, sequence_length: int) -> None:
+        """Live wall-clock curriculum: update batch size and packed window length.
+
+        Sequence length may grow or shrink; the packer buffer is left intact so
+        resume state stays valid. Callers should prefer monotonic growth when
+        possible (R72-style max-seq ramp).
+        """
+        if micro_batch_size < 1:
+            raise ValueError("micro_batch_size must be positive")
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be positive")
+        self.micro_batch_size = int(micro_batch_size)
+        self.sequence_stream.sequence_length = int(sequence_length)
 
     def __iter__(self) -> "BatchStream":
         return self
