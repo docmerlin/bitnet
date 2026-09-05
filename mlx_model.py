@@ -17,13 +17,14 @@ from mlx.nn.utils import checkpoint as activation_checkpoint
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
 from mlx_ternary_kernel import (
-    activation_levels as _activation_level_pair,
     pack_ternary_weight,
-    ste_activation_quantize,
     ternary_fused_ffn_m1,
     ternary_fused_linear_m1,
     ternary_quantized_linear,
 )
+
+from dblocks.condition import MLXAdaRMS, MLXSigmaEmbed, apply_ada
+from dblocks.schedule import NoiseSchedule, layer_ranges
 
 
 _effective_weight_cache: ContextVar[dict[tuple[object, str], object] | None] = ContextVar(
@@ -81,11 +82,6 @@ class MLXBitNetConfig:
     use_topk_blocks: bool = False
     topk_blocks: int = 4
     topk_block_size: int = 64
-    # 8-bit matches BLT: 4-bit activations collapse after the ramp at cold start
-    # and fake-quant train speed is flat across bit width. M=1 fused decode can
-    # still use whatever width the checkpoint pinned.
-    activation_bits: int = 8
-    use_4bit_activations: bool = True
     use_hadamard: bool = True
     use_path_kernel: bool = True
     rms_norm_eps: float = 1e-5
@@ -124,6 +120,21 @@ class MLXBitNetConfig:
     skip_first_prelude_mlp: bool = False
     # NanoGPT-speedrun R35: drop the attention half of the first prelude layer.
     skip_first_prelude_attn: bool = False
+    # DiffusionBlocks (arXiv:2506.14202). "ar" is the existing next-token path.
+    train_mode: str = "ar"
+    dblock_blocks: int = 1
+    dblock_sigma_data: float = 0.5
+    dblock_sigma_min: float = 0.002
+    dblock_sigma_max: float = 80.0
+    dblock_p_mean: float = -1.2
+    dblock_p_std: float = 1.2
+    dblock_overlap: float = 0.1
+    dblock_fourier_dim: int = 64
+    dblock_cond_dim: int = 128
+    dblock_infer: str = "euler"
+    # B=1 Euler evaluations of the unique stack. Independent of num_loops (R).
+    # Paper default is 50; B>1 infer still uses one step per block (T=B).
+    dblock_euler_steps: int = 50
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads:
@@ -136,8 +147,6 @@ class MLXBitNetConfig:
             raise ValueError("num_loops must be positive")
         if self.block_size < 1:
             raise ValueError("block_size must be positive")
-        if self.activation_bits < 2:
-            raise ValueError("activation_bits must be at least 2")
         if self.engram_max_ngram_size < 2:
             raise ValueError("invalid Engram table or N-gram size")
         if self.rfmoe_num_experts < 1:
@@ -160,10 +169,46 @@ class MLXBitNetConfig:
         )
         if float(self.dyt_alpha_init) <= 0:
             raise ValueError("dyt_alpha_init must be positive")
+        train_mode = str(self.train_mode).lower()
+        if train_mode not in {"ar", "dblock"}:
+            raise ValueError("train_mode must be 'ar' or 'dblock'")
+        object.__setattr__(self, "train_mode", train_mode)
+        infer = str(self.dblock_infer).lower()
+        if infer not in {"euler", "loops"}:
+            raise ValueError("dblock_infer must be 'euler' or 'loops'")
+        object.__setattr__(self, "dblock_infer", infer)
+        if int(self.dblock_blocks) < 1:
+            raise ValueError("dblock_blocks must be positive")
+        object.__setattr__(self, "dblock_blocks", int(self.dblock_blocks))
+        if int(self.dblock_euler_steps) < 1:
+            raise ValueError("dblock_euler_steps must be positive")
+        object.__setattr__(self, "dblock_euler_steps", int(self.dblock_euler_steps))
+        if int(self.dblock_fourier_dim) < 2 or int(self.dblock_fourier_dim) % 2:
+            raise ValueError("dblock_fourier_dim must be a positive even integer")
+        if int(self.dblock_cond_dim) < 1:
+            raise ValueError("dblock_cond_dim must be positive")
+        if self.dblock_sigma_min <= 0 or self.dblock_sigma_max <= self.dblock_sigma_min:
+            raise ValueError("need 0 < dblock_sigma_min < dblock_sigma_max")
+        if self.dblock_sigma_data <= 0 or self.dblock_p_std <= 0:
+            raise ValueError("dblock_sigma_data and dblock_p_std must be positive")
+        if self.dblock_overlap < 0:
+            raise ValueError("dblock_overlap must be non-negative")
+        if train_mode == "dblock":
+            # Clean token ids would leak the diffusion target into Engram.
+            object.__setattr__(self, "use_engram", False)
+            object.__setattr__(self, "engram_layer_ids", ())
+            if int(self.mtp_depth) > 0:
+                raise ValueError("MTP is AR-only; set mtp_depth=0 for dblock")
+            if self.dblock_blocks > self.num_hidden_layers:
+                raise ValueError("dblock_blocks cannot exceed unique layer count")
         if self.attn_res_group_size is None:
-            object.__setattr__(
-                self, "attn_res_group_size", max(1, self.num_hidden_layers // 8)
-            )
+            if train_mode == "dblock" and self.dblock_blocks > 1:
+                slice_width = self.num_hidden_layers // self.dblock_blocks
+                object.__setattr__(self, "attn_res_group_size", max(1, slice_width))
+            else:
+                object.__setattr__(
+                    self, "attn_res_group_size", max(1, self.num_hidden_layers // 8)
+                )
         elif int(self.attn_res_group_size) < 1:
             raise ValueError("attn_res_group_size must be >= 1")
         else:
@@ -205,6 +250,33 @@ class MLXBitNetConfig:
     @property
     def effective_depth(self) -> int:
         return self.num_prelude_layers + self.num_recurrent_layers * self.num_loops + self.num_coda_layers
+
+    def noise_schedule(self) -> NoiseSchedule:
+        return NoiseSchedule(
+            sigma_min=self.dblock_sigma_min,
+            sigma_max=self.dblock_sigma_max,
+            sigma_data=self.dblock_sigma_data,
+            p_mean=self.dblock_p_mean,
+            p_std=self.dblock_p_std,
+            overlap=self.dblock_overlap,
+            num_blocks=self.dblock_blocks,
+        )
+
+    def dblock_layer_ranges(self) -> list[tuple[int, int]]:
+        return layer_ranges(self.num_hidden_layers, self.dblock_blocks)
+
+    def dblock_sample_steps(self, euler_steps: int | None = None) -> int:
+        """Euler evaluations at infer. Not recurrent depth.
+
+        B=1: K steps of the unique stack (``dblock_euler_steps``, paper default
+        50). B>1: one step per block. ``num_loops`` is Huginn R, unused here.
+        """
+        if self.dblock_blocks == 1:
+            steps = self.dblock_euler_steps if euler_steps is None else int(euler_steps)
+            if steps < 1:
+                raise ValueError("dblock_euler_steps must be positive")
+            return steps
+        return int(self.dblock_blocks)
 
 
 class MLXDynamicTanh(nn.Module):
@@ -355,52 +427,12 @@ class MLXHBitLinear(nn.Module):
             high=input_dims**-0.5,
             shape=(output_dims, input_dims),
         )
-        self.weight_mix = mx.array(1.0)
-        self.activation_mix = mx.array(1.0)
-        self._activation_mix_f = 1.0
-        # When set, set_quantization_state leaves weight_mix alone. Used by the
-        # identity-initialised FFN mid; see MLXHybridBlock.
-        self.pinned_weight_mix: float | None = None
-        self._pinned_full_weight_quant = False
-        # [positive, negative] for the fused quantiser. Module state, not a
-        # locally built constant, so mx.compile treats it as an input and a
-        # mid-run bit-width change flows through instead of being baked in.
-        self.activation_level_pair = _activation_level_pair(config.activation_bits)
-        self.freeze(
-            keys=["weight_mix", "activation_mix", "activation_level_pair"],
-            recurse=False,
-        )
-        # Pinned inference weights: set by pin_inference_weights(); avoid per-token rematerialization.
         self._pinned_dense: mx.array | None = None
         self._pinned_packed: tuple | None = None
-        self._full_activation_quant = False
-        self._act_levels_f = float((2 ** (config.activation_bits - 1)) - 1)
 
     def prepare_input(self, x: mx.array) -> mx.array:
         if self.config.use_hadamard and self.input_dims & (self.input_dims - 1) == 0:
             x = mx.hadamard_transform(x)
-        if self.config.use_4bit_activations:
-            # One fused kernel rather than the nine elementwise passes the
-            # expression form costs -- absmax, divide, round, clip, rescale, and
-            # the straight-through add. Measured 2-7x on the quantiser alone,
-            # and it is 41-75% of a whole HBitLinear. The levels stay a runtime
-            # array so ramping the bit width does not recompile the graph.
-            #
-            # float32 on purpose. The expression this replaced read the levels
-            # from a float32 array, so bfloat16 activations were promoted and the
-            # whole quantisation -- and the matmul consuming it -- ran at float32.
-            # The kernel works in the input dtype, so passing x through unchanged
-            # would silently drop this stack to bfloat16 quantisation: measured
-            # 1180 of 1200 elements differing on a [4, 300] bf16 input. bfloat16
-            # carries 8 mantissa bits and an 8-bit grid needs 255 levels, so that
-            # is not a safe change to make by accident. See todo.md -- the
-            # implied float32 matmul may itself be worth revisiting deliberately.
-            quantized_x = ste_activation_quantize(
-                x.astype(mx.float32), self.activation_level_pair
-            ).astype(mx.float32)
-            if self._full_activation_quant:
-                return quantized_x
-            x = x + self.activation_mix * mx.stop_gradient(quantized_x - x)
         return x
 
     def effective_weight(
@@ -422,14 +454,9 @@ class MLXHBitLinear(nn.Module):
         normalized = weight / weight_scale
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
         quantized_weight = ternary * weight_scale
-        # stop_gradient(q) + mix*(w - stop_gradient(w)) at mix=1, rather than
-        # w + mix*stop_gradient(q - w): same value and gradient, but the latter
-        # computes q - w, and the identity-initialised FFN mid has w ~ I against
-        # q ~ 1, so that subtraction loses most of its significant digits.
-        if self._pinned_full_weight_quant:
-            effective = (mx.stop_gradient(quantized_weight) + (weight - mx.stop_gradient(weight))).astype(dtype)
-        else:
-            effective = (weight + self.weight_mix * mx.stop_gradient(quantized_weight - weight)).astype(dtype)
+        # BitNet STE, mix=1: sg(q) + (w - sg(w)). Not w + sg(q - w) — that
+        # subtracts q-w and loses digits on the identity FFN mid (w ~ N, q ~ 1).
+        effective = (mx.stop_gradient(quantized_weight) + (weight - mx.stop_gradient(weight))).astype(dtype)
         if cache is not None and key is not None and key[0] is not None:
             cache[key] = effective
         return effective
@@ -476,12 +503,9 @@ class MLXHBitLinear(nn.Module):
         return packed_weight
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Decode fast path: M=1 fused act-quant + ternary add/sub GEMV (one Metal dispatch).
         in_dim = int(self.weight.shape[1])
         out_dim = int(self.weight.shape[0])
         tokens = int(x.size // max(in_dim, 1))
-        # Custom ternary M=1 kernel helps small/medium shapes (launch-bound + fused act quant).
-        # At 1B widths (K/N ~1024+) mx.quantized_matmul is faster — skip the custom GEMV.
         use_fused_m1 = (
             tokens == 1
             and in_dim <= 512
@@ -492,13 +516,7 @@ class MLXHBitLinear(nn.Module):
             packed_weight = self._packed_weight(x)
             if packed_weight is not None:
                 packed, scales, group_size = packed_weight
-                if self.config.use_hadamard and in_dim & (in_dim - 1) == 0:
-                    x = mx.hadamard_transform(x)
-                if self.config.use_4bit_activations and not self._full_activation_quant:
-                    # Partial quant mix (training): keep STE prepare + generic quantized matmul.
-                    x = self.prepare_input(x)
-                    return ternary_quantized_linear(x, self.weight, packed, scales)
-                quantize_acts = bool(self.config.use_4bit_activations and self._full_activation_quant)
+                x = self.prepare_input(x)
                 return ternary_fused_linear_m1(
                     x,
                     packed,
@@ -506,15 +524,13 @@ class MLXHBitLinear(nn.Module):
                     in_dim=in_dim,
                     out_dim=out_dim,
                     group_size=int(group_size),
-                    quantize_acts=quantize_acts,
-                    act_levels=self._act_levels_f,
                     dtype=x.dtype,
                 )
 
         return self.forward_prepared(self.prepare_input(x))
 
     def forward_prepared(self, x: mx.array) -> mx.array:
-        """Project input already transformed and activation-quantized by an equivalent layer."""
+        """Project input already Hadamard-transformed by an equivalent layer."""
         if self._pinned_packed is not None:
             packed, scales, _ = self._pinned_packed
             return ternary_quantized_linear(x, self.weight, packed, scales)
@@ -525,19 +541,6 @@ class MLXHBitLinear(nn.Module):
             packed, scales, _ = packed_weight
             return ternary_quantized_linear(x, self.weight, packed, scales)
         return x @ self.effective_weight(x.dtype).T
-
-    def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
-        if self.pinned_weight_mix is not None:
-            weight_mix = self.pinned_weight_mix
-        self._pinned_full_weight_quant = self.pinned_weight_mix is not None and weight_mix >= 1.0
-        self.weight_mix = mx.array(weight_mix)
-        self.activation_mix = mx.array(activation_mix)
-        self._activation_mix_f = activation_mix
-        levels = float((2 ** (max(bits, 2) - 1)) - 1)
-        self.activation_level_pair = _activation_level_pair(bits)
-        self._act_levels_f = levels
-        self._full_activation_quant = activation_mix >= 1.0
-        self.clear_pinned_inference_weight()
 
 
 class MLXEngram(nn.Module):
@@ -725,9 +728,6 @@ class MLXRFMoEExpert(nn.Module):
         # plain identity row (one 1, D-1 zeros) has scale 1/D and quantises to
         # eye(D)/D -- an attenuator, not a pass-through. See TernaryMLP.mid_proj.
         self.w_mid.weight = mx.eye(expert_dim, dtype=self.w_mid.weight.dtype) * expert_dim
-        self.w_mid.pinned_weight_mix = 1.0
-        self.w_mid.weight_mix = mx.array(1.0)
-        self.w_mid._pinned_full_weight_quant = True
         self.w_down = MLXHBitLinear(expert_dim, hidden, config)
         self.bias = mx.array([1e-6])
 
@@ -1204,11 +1204,7 @@ class MLXPaTHAttention(nn.Module):
     def _project(self, x: mx.array, segment_ids: mx.array | None):
         batch, length, _ = x.shape
         # Keep single-token fused projections; share preprocessing on training/prefill batches.
-        same_preparation = (
-            self.qkv._activation_mix_f == self.path_down._activation_mix_f
-            and self.qkv._act_levels_f == self.path_down._act_levels_f
-        )
-        prepared_x = self.qkv.prepare_input(x) if batch * length > 1 and same_preparation else None
+        prepared_x = self.qkv.prepare_input(x) if batch * length > 1 else None
         projected_qkv = self.qkv(x) if prepared_x is None else self.qkv.forward_prepared(prepared_x)
         qkv = projected_qkv.reshape(
             batch,
@@ -1829,14 +1825,8 @@ class MLXHybridBlock(nn.Module):
                 # per-output-channel scale is mean(|row|); a plain eye(I) row is one 1
                 # and I-1 zeros, so the scale is 1/I and the quantised weight comes out
                 # as eye(I)/I -- a 1/512 attenuator, not a pass-through. eye(I)*I gives
-                # mean(|row|) = 1, so the quantised weight is exactly eye(I). The
-                # weight mix is pinned with it: the straight-through blend only means
-                # anything when raw and quantised share a scale, and here they differ
-                # by I.
+                # mean(|row|) = 1, so the quantised weight is exactly eye(I).
                 self.mid.weight = mx.eye(intermediate, dtype=self.mid.weight.dtype) * intermediate
-                self.mid.pinned_weight_mix = 1.0
-                self.mid.weight_mix = mx.array(1.0)
-                self.mid._pinned_full_weight_quant = True
                 self.down = MLXHBitLinear(intermediate, hidden, config)
                 self.down.weight = self.down.weight * 0.01
         if self.attn_res_mode == "kimi":
@@ -1856,6 +1846,23 @@ class MLXHybridBlock(nn.Module):
             self.attn_scale = mx.array([0.1]) if not self.skip_attn else None
             self.mlp_post = mlx_make_norm(hidden, config) if not self.skip_mlp else None
             self.mlp_scale = mx.array([0.1]) if not self.skip_mlp else None
+        dblock = config.train_mode == "dblock"
+        self.ada_attn = (
+            MLXAdaRMS(hidden, config.dblock_cond_dim)
+            if dblock and not self.skip_attn
+            else None
+        )
+        self.ada_mlp = (
+            MLXAdaRMS(hidden, config.dblock_cond_dim)
+            if dblock and not self.skip_mlp
+            else None
+        )
+
+    def _attn_norm(self, x: mx.array, cond: mx.array | None) -> mx.array:
+        return apply_ada(self.attn_norm(x), self.ada_attn, cond)
+
+    def _mlp_norm(self, x: mx.array, cond: mx.array | None) -> mx.array:
+        return apply_ada(self.mlp_norm(x), self.ada_mlp, cond)
 
     def _dense_mlp(self, x: mx.array) -> mx.array:
         # Decode M=1: one Metal dispatch for up + mid + down ternary FFN.
@@ -1867,9 +1874,6 @@ class MLXHybridBlock(nn.Module):
             tokens == 1
             and hidden <= 512
             and inter <= 1024
-            and self.up._full_activation_quant
-            and self.mid._full_activation_quant
-            and self.down._full_activation_quant
             and not self.up.config.use_hadamard
         ):
             up_p = self.up._packed_weight(x)
@@ -1887,8 +1891,6 @@ class MLXHybridBlock(nn.Module):
                         down_p[1],
                         hidden=hidden,
                         intermediate=inter,
-                        quantize_acts=bool(self.up.config.use_4bit_activations),
-                        act_levels=self.up._act_levels_f,
                         dtype=x.dtype,
                     )
                 except ValueError:
@@ -1950,13 +1952,14 @@ class MLXHybridBlock(nn.Module):
         segment_ids: mx.array | None = None,
         update_memory: bool = True,
         checkpoint_activations: bool = False,
+        cond: mx.array | None = None,
     ) -> mx.array:
         if self.engram is not None:
             run_engram = activation_checkpoint(self.engram) if checkpoint_activations else self.engram
             x = x + run_engram(x, input_ids, segment_ids)
         if not self.skip_attn:
             attention = self._mixer(
-                self.attn_norm(x),
+                self._attn_norm(x, cond),
                 segment_ids,
                 update_memory,
                 checkpoint_activations,
@@ -1964,7 +1967,7 @@ class MLXHybridBlock(nn.Module):
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        output = self._mlp(self.mlp_norm(x), checkpoint_activations)
+        output = self._mlp(self._mlp_norm(x, cond), checkpoint_activations)
         return self.mlp_post(x + self.mlp_scale * output)
 
     def forward_kimi(
@@ -1977,6 +1980,7 @@ class MLXHybridBlock(nn.Module):
         *,
         attn_runner=None,
         engram_runner=None,
+        cond: mx.array | None = None,
     ) -> MLXAttnResStream:
         """Kimi Block AttnRes step. ``attn_runner`` overrides train attn for decode paths."""
         stream.attn_mix = self.attn_res_mix
@@ -1992,10 +1996,10 @@ class MLXHybridBlock(nn.Module):
                     h = h + run_engram(h, input_ids, segment_ids)
 
             if attn_runner is not None:
-                attention = attn_runner(self.attn_norm(h))
+                attention = attn_runner(self._attn_norm(h, cond))
             else:
                 attention = self._mixer(
-                    self.attn_norm(h),
+                    self._attn_norm(h, cond),
                     segment_ids,
                     update_memory,
                     checkpoint_activations,
@@ -2013,7 +2017,7 @@ class MLXHybridBlock(nn.Module):
 
         if not self.skip_mlp:
             h = stream.mix_mlp()
-            stream.add_sublayer(self._mlp(self.mlp_norm(h), checkpoint_activations))
+            stream.add_sublayer(self._mlp(self._mlp_norm(h, cond), checkpoint_activations))
         stream.close_layer()
         return stream
 
@@ -2117,6 +2121,7 @@ class MLXHybridBlock(nn.Module):
         segment_ids: mx.array | None = None,
         update_memory: bool = True,
         checkpoint_activations: bool = False,
+        cond: mx.array | None = None,
     ) -> mx.array | MLXAttnResStream:
         if self.attn_res_mode == "kimi":
             if not isinstance(x, MLXAttnResStream):
@@ -2127,6 +2132,7 @@ class MLXHybridBlock(nn.Module):
                 segment_ids,
                 update_memory,
                 checkpoint_activations,
+                cond=cond,
             )
         if isinstance(x, MLXAttnResStream):
             raise TypeError("sandwich mode expects a hidden array, not MLXAttnResStream")
@@ -2136,6 +2142,7 @@ class MLXHybridBlock(nn.Module):
             segment_ids,
             update_memory,
             checkpoint_activations,
+            cond=cond,
         )
 
 
@@ -2208,6 +2215,11 @@ class MLXBitNet(nn.Module):
         self.blocks = [MLXHybridBlock(config, layer_id) for layer_id in range(config.num_hidden_layers)]
         self.loop_hc = MLXLoopHyperConnection(config)
         self.norm = mlx_make_norm(config.hidden_size, config)
+        self.sigma_embed = (
+            MLXSigmaEmbed(config.dblock_fourier_dim, config.dblock_cond_dim)
+            if config.train_mode == "dblock"
+            else None
+        )
         self.mtp_transforms = [
             nn.Sequential(
                 mlx_make_norm(config.hidden_size, config),
@@ -2225,13 +2237,6 @@ class MLXBitNet(nn.Module):
     def uses_engram(self) -> bool:
         """Whether any block hashes token n-grams, the one thing needing ids."""
         return any(block.engram is not None for block in self.blocks)
-
-    def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
-        def update(_, module):
-            if isinstance(module, MLXHBitLinear):
-                module.set_quantization_state(weight_mix, activation_mix, bits)
-
-        self.apply_to_modules(update)
 
     def set_active_blocks(self, blocks: int) -> None:
         for block in self.blocks:
@@ -2758,6 +2763,7 @@ class MLXBitNet(nn.Module):
         segment_ids: mx.array | None,
         update_memory: bool,
         checkpoint: bool,
+        cond: mx.array | None = None,
     ) -> mx.array:
         """Run a stack of blocks; Kimi mode uses a fresh AttnRes stream from seed."""
         if not blocks:
@@ -2765,11 +2771,11 @@ class MLXBitNet(nn.Module):
         if not self._kimi_mode:
             x = seed
             for block in blocks:
-                x = block(x, tokens, segment_ids, update_memory, checkpoint)
+                x = block(x, tokens, segment_ids, update_memory, checkpoint, cond)
             return x
         stream = self._new_attn_stream(seed)
         for block in blocks:
-            stream = block(stream, tokens, segment_ids, update_memory, checkpoint)
+            stream = block(stream, tokens, segment_ids, update_memory, checkpoint, cond)
         return stream.hidden()
 
     def _run_decode_stack(
@@ -2808,6 +2814,11 @@ class MLXBitNet(nn.Module):
         checkpoint_activations: bool | str = False,
         *,
         inputs_embeds: mx.array | None = None,
+        apply_input_norm: bool = True,
+        cond: mx.array | None = None,
+        flatten_loops: bool = False,
+        layer_start: int | None = None,
+        layer_end: int | None = None,
     ) -> mx.array:
         """Run the block stack, from token ids or from embeddings already computed.
 
@@ -2817,25 +2828,45 @@ class MLXBitNet(nn.Module):
         hashing is defined over a vocabulary -- everything else (PaTH, Infini,
         RFMoE) reads hidden states only. So ``tokens`` stays required
         exactly when Engram is active and is otherwise optional.
+
+        Noisy dblock embeds skip SubLN (``apply_input_norm=False``): it would rescale σ.
         """
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError("pass exactly one of tokens or inputs_embeds")
-        loops = self.config.num_loops if num_loops is None else num_loops
+        if inputs_embeds is not None and self.uses_engram:
+            raise ValueError(
+                "Engram hashes token n-grams and cannot run on embeddings alone; "
+                "disable it (use_engram=False) to drive this stack from inputs_embeds"
+            )
+        loops = 1 if flatten_loops else (self.config.num_loops if num_loops is None else num_loops)
         if loops < 1:
             raise ValueError("num_loops must be positive")
         checkpoint_scope = "all" if checkpoint_activations is True else checkpoint_activations or "none"
         if checkpoint_scope not in ("none", "recurrent", "all"):
             raise ValueError("checkpoint_activations must be none, recurrent, or all")
 
-        if inputs_embeds is not None and self.uses_engram:
-            raise ValueError(
-                "Engram hashes token n-grams and cannot run on embeddings alone; "
-                "disable it (use_engram=False) to drive this stack from inputs_embeds"
-            )
         batch_size = tokens.shape[0] if tokens is not None else inputs_embeds.shape[0]
         if reset_memory:
             self.reset_memory(batch_size)
-        x = self.subln(self.embedding(tokens) if inputs_embeds is None else inputs_embeds)
+        if inputs_embeds is not None:
+            x = self.subln(inputs_embeds) if apply_input_norm else inputs_embeds
+        else:
+            x = self.subln(self.embedding(tokens))
+        if flatten_loops or layer_start is not None or layer_end is not None:
+            start = 0 if layer_start is None else int(layer_start)
+            end = len(self.blocks) if layer_end is None else int(layer_end)
+            if start < 0 or end > len(self.blocks) or start >= end:
+                raise ValueError("layer_start:layer_end must be a non-empty unique-layer slice")
+            x = self._run_block_stack(
+                self.blocks[start:end],
+                x,
+                tokens,
+                segment_ids,
+                True,
+                checkpoint_scope in ("recurrent", "all"),
+                cond,
+            )
+            return self.norm(x)
         prelude_end = self.config.num_prelude_layers
         recurrent_end = prelude_end + self.config.num_recurrent_layers
         # Prelude: one AttnRes segment (or sandwich stack).
@@ -2846,6 +2877,7 @@ class MLXBitNet(nn.Module):
             segment_ids,
             True,
             checkpoint_scope == "all",
+            cond,
         )
         if self.config.num_recurrent_layers:
             streams = self.loop_hc.expand(x)
@@ -2862,6 +2894,7 @@ class MLXBitNet(nn.Module):
                         segment_ids,
                         loop_index == loops - 1,
                         checkpoint_scope in ("recurrent", "all"),
+                        cond,
                     )
                     embedding_index = min(loop_index, 63)
                     output = x + self.loop_hc.loop_embed.weight[embedding_index].astype(x.dtype)
@@ -2879,8 +2912,124 @@ class MLXBitNet(nn.Module):
             segment_ids,
             True,
             checkpoint_scope == "all",
+            cond,
         )
         return self.norm(x)
+
+    def _broadcast_sigma(self, sigma: mx.array, like: mx.array) -> mx.array:
+        value = sigma.astype(like.dtype)
+        while value.ndim < like.ndim:
+            value = value[..., None]
+        return value
+
+    def dblock_c_in(self, sigma: mx.array) -> mx.array:
+        data = mx.array(self.config.dblock_sigma_data, dtype=mx.float32)
+        sigma_f = sigma.astype(mx.float32)
+        return 1.0 / mx.sqrt(sigma_f * sigma_f + data * data)
+
+    def dblock_clean_embeddings(self, tokens: mx.array) -> mx.array:
+        return _safe_normalize(self.embedding(tokens), axis=-1)
+
+    def dblock_forward_from_z(
+        self,
+        z: mx.array,
+        sigma: mx.array,
+        tokens: mx.array | None = None,
+        segment_ids: mx.array | None = None,
+        *,
+        block_id: int | None = None,
+        checkpoint_activations: bool | str = False,
+        reset_memory: bool = True,
+        num_loops: int | None = None,
+    ) -> mx.array:
+        """Denoiser body: EDM-scaled ``z`` through one unique slice (or the Huginn stack)."""
+        if self.config.train_mode != "dblock" or self.sigma_embed is None:
+            raise RuntimeError("dblock_forward_from_z requires train_mode='dblock'")
+        scale = self._broadcast_sigma(self.dblock_c_in(sigma), z)
+        scaled = scale.astype(z.dtype) * z
+        cond = self.sigma_embed(sigma).astype(z.dtype)
+        loops = 1 if num_loops is None else int(num_loops)
+        if loops < 1:
+            raise ValueError("num_loops must be positive")
+        # Engram is off in dblock; drive the stack from noisy embeddings only.
+        if self.config.dblock_blocks == 1 and block_id in (None, 0):
+            return self.hidden_states(
+                None,
+                segment_ids,
+                num_loops=loops,
+                reset_memory=reset_memory,
+                checkpoint_activations=checkpoint_activations,
+                inputs_embeds=scaled,
+                apply_input_norm=False,
+                cond=cond,
+            )
+        if loops != 1:
+            raise ValueError("looped dblock infer requires dblock_blocks=1")
+        ranges = self.config.dblock_layer_ranges()
+        index = 0 if block_id is None else int(block_id)
+        start, end = ranges[index]
+        return self.hidden_states(
+            None,
+            segment_ids,
+            num_loops=1,
+            reset_memory=reset_memory,
+            checkpoint_activations=checkpoint_activations,
+            inputs_embeds=scaled,
+            apply_input_norm=False,
+            cond=cond,
+            flatten_loops=True,
+            layer_start=start,
+            layer_end=end,
+        )
+
+    def dblock_logits(
+        self,
+        tokens: mx.array,
+        segment_ids: mx.array | None,
+        sigma: mx.array,
+        eps: mx.array,
+        *,
+        block_id: int | None = None,
+        checkpoint_activations: bool | str = False,
+    ) -> mx.array:
+        y = self.dblock_clean_embeddings(tokens)
+        z = y + self._broadcast_sigma(sigma, y) * eps.astype(y.dtype)
+        hidden = self.dblock_forward_from_z(
+            z,
+            sigma,
+            tokens,
+            segment_ids,
+            block_id=block_id,
+            checkpoint_activations=checkpoint_activations,
+        )
+        return self.logits_from(hidden)
+
+    def dblock_euler_step(
+        self,
+        z: mx.array,
+        sigma_in: mx.array,
+        sigma_out: mx.array,
+        tokens: mx.array | None = None,
+        segment_ids: mx.array | None = None,
+        *,
+        block_id: int | None = None,
+        num_loops: int | None = None,
+    ) -> mx.array:
+        """One VE Euler step (paper Eq. 5). ``D`` is L2-normalized block hidden."""
+        hidden = self.dblock_forward_from_z(
+            z,
+            sigma_in,
+            tokens,
+            segment_ids,
+            block_id=block_id,
+            reset_memory=True,
+            num_loops=num_loops,
+        )
+        predicted = _safe_normalize(hidden, axis=-1)
+        sigma_in_b = self._broadcast_sigma(sigma_in, z)
+        sigma_out_b = self._broadcast_sigma(sigma_out, z)
+        delta = (sigma_in_b - sigma_out_b) / mx.maximum(sigma_in_b, 1e-8)
+        return z + delta * (z - predicted.astype(z.dtype))
 
     def __call__(
         self,

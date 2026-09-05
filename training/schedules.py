@@ -1,4 +1,4 @@
-"""Progress-driven training schedules (quantization, blocks, RFMoE, LR).
+"""Progress-driven training schedules (blocks, RFMoE, LR).
 
 Pure token-progress ramps live in ``training.token_progress`` (torch-free) so
 MLX optim can import them without pulling PyTorch.
@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Tuple
 import torch.nn as nn
 
 from data.presets import DatasetSource
-from layers.h_bitlinear import HBitLinear
 from layers.hybrid_block import HybridTransformerBlock
 from training.token_progress import (  # re-export for existing importers
     WallClockShapes,
@@ -39,7 +38,6 @@ __all__ = [
     "scheduled_value",
     "snap_sequence_length",
     "update_block_growth",
-    "update_quantization_schedule",
     "wall_clock_shapes",
 ]
 
@@ -92,39 +90,6 @@ def lr_schedule_multiplier(
 
     cooldown_progress = (step - warmup_steps - main_steps) / max(cooldown_steps, 1)
     return max(min_lr_ratio * (1.0 - cooldown_progress), 0.0)
-
-
-def update_quantization_schedule(model: nn.Module, token_progress: float, args) -> Dict[str, float]:
-    token_progress = min(max(token_progress, 0.0), 1.0)
-
-    if token_progress < args.stage1_ratio:
-        stage_progress = token_progress / max(args.stage1_ratio, 1e-8)
-        weight_mix = args.stage1_weight_mix_start + stage_progress * (1.0 - args.stage1_weight_mix_start)
-        activation_mix = args.stage1_activation_mix_start + stage_progress * (1.0 - args.stage1_activation_mix_start)
-        activation_bits = int(round(
-            args.stage1_activation_bits
-            - stage_progress * (args.stage1_activation_bits - args.final_activation_bits)
-        ))
-    else:
-        weight_mix = 1.0
-        activation_mix = 1.0
-        activation_bits = args.final_activation_bits
-
-    for module in model.modules():
-        if isinstance(module, HBitLinear):
-            module.set_quantization_state(
-                weight_mix=weight_mix,
-                activation_mix=activation_mix,
-                activation_bits=activation_bits,
-                enable_weight_quantization=True,
-                enable_activation_quantization=True,
-            )
-
-    return {
-        "quant_weight_mix": weight_mix,
-        "quant_activation_mix": activation_mix,
-        "quant_activation_bits": float(activation_bits),
-    }
 
 
 def update_block_growth(model: nn.Module, token_progress: float, args) -> int:

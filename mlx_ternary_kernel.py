@@ -113,54 +113,24 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
     input_names=["x", "packed", "scales", "params"],
     output_names=["y"],
     source=r"""
-        // params: [in_dim, out_dim, group_size, words_per_row, groups_per_row,
-        //          quantize_acts (0/1), act_levels, neg_levels]
-        // Threadgroup cooperatively loads/quantizes x once; each thread owns output rows.
+        // params: [in_dim, out_dim, group_size, words_per_row, groups_per_row]
         uint out_dim = uint(params[1]);
         uint in_dim = uint(params[0]);
         uint words_per_row = uint(params[3]);
         uint groups_per_row = uint(params[4]);
-        uint quantize_acts = uint(params[5]);
-        float act_levels = params[6];
-        float neg_levels = params[7];
 
         uint lane = thread_position_in_threadgroup.x;
         uint tg = threads_per_threadgroup.x;
-        uint o0 = thread_position_in_grid.x; // one thread per output when tg maps 1:1
+        uint o0 = thread_position_in_grid.x;
 
         threadgroup float xq[2048];
-        threadgroup float partial[256];
         if (in_dim > 2048u) {
             if (o0 < out_dim) y[o0] = T(0);
             return;
         }
 
-        // --- shared absmax + quantize (or plain load) of x ---
-        float local_max = 0.0f;
         for (uint i = lane; i < in_dim; i += tg) {
-            local_max = max(local_max, abs(float(x[i])));
-        }
-        partial[lane] = local_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (lane < stride && lane + stride < tg) {
-                partial[lane] = max(partial[lane], partial[lane + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float amax = max(partial[0], 1e-5f);
-        float ascale = amax / max(act_levels, 1.0f);
-        if (quantize_acts != 0u) {
-            for (uint i = lane; i < in_dim; i += tg) {
-                float v = float(x[i]) / ascale;
-                v = round(v);
-                v = clamp(v, -neg_levels, act_levels);
-                xq[i] = v * ascale;
-            }
-        } else {
-            for (uint i = lane; i < in_dim; i += tg) {
-                xq[i] = float(x[i]);
-            }
+            xq[i] = float(x[i]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -197,11 +167,9 @@ def ternary_fused_linear_m1(
     in_dim: int,
     out_dim: int,
     group_size: int,
-    quantize_acts: bool = False,
-    act_levels: float = 7.0,
     dtype=None,
 ) -> mx.array:
-    """Fused decode linear for a single token (M=1): optional act quant + ternary GEMV.
+    """Fused decode linear for a single token (M=1): ternary GEMV.
 
     Matches dense ``x @ effective_ternary.T`` for the pack layout of ``pack_ternary_weight``.
     ``x`` may be rank-1 ``(in_dim,)`` or rank-2/3 with leading size 1.
@@ -218,7 +186,6 @@ def ternary_fused_linear_m1(
         raise ValueError("in_dim must be divisible by 32")
     words_per_row = in_dim // 16
     groups_per_row = in_dim // group_size
-    neg_levels = act_levels + 1.0
     params = mx.array(
         [
             float(in_dim),
@@ -226,9 +193,6 @@ def ternary_fused_linear_m1(
             float(group_size),
             float(words_per_row),
             float(groups_per_row),
-            1.0 if quantize_acts else 0.0,
-            float(act_levels),
-            float(neg_levels),
         ],
         dtype=mx.float32,
     )
@@ -270,11 +234,10 @@ _TERNARY_FFN_M1 = mx.fast.metal_kernel(
     output_names=["y"],
     source=r"""
         // BitNet dense FFN for M=1:
-        //   u = tern(up, quant(x)); (g,v)=split(u); h = silu(g)*v;
-        //   h = tern(mid, quant(h)); h = silu(h);
-        //   y = tern(down, quant(h));
-        // params: [hidden, inter, up_words, mid_words, down_words, up_groups, mid_groups, down_groups,
-        //          quantize_acts, act_levels, neg_levels]
+        //   u = tern(up, x); (g,v)=split(u); h = silu(g)*v;
+        //   h = silu(tern(mid, h));
+        //   y = tern(down, h);
+        // params: [hidden, inter, up_words, mid_words, down_words, up_groups, mid_groups, down_groups]
         uint hidden = uint(params[0]);
         uint inter = uint(params[1]);
         uint up_words = uint(params[2]);
@@ -283,37 +246,15 @@ _TERNARY_FFN_M1 = mx.fast.metal_kernel(
         uint up_groups = uint(params[5]);
         uint mid_groups = uint(params[6]);
         uint down_groups = uint(params[7]);
-        uint quantize_acts = uint(params[8]);
-        float act_levels = params[9];
-        float neg_levels = params[10];
 
         uint lane = thread_position_in_threadgroup.x;
         uint tg = threads_per_threadgroup.x;
 
         threadgroup float buf_a[2048];
         threadgroup float buf_b[4096]; // holds up to 2*inter for up output
-        threadgroup float partial[256];
 
-        // --- load / quant x into buf_a[0:hidden] ---
-        float local_max = 0.0f;
         for (uint i = lane; i < hidden; i += tg) {
-            local_max = max(local_max, abs(float(x[i])));
-        }
-        partial[lane] = local_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (lane < stride) partial[lane] = max(partial[lane], partial[lane + stride]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float amax = max(partial[0], 1e-5f);
-        float ascale = amax / max(act_levels, 1.0f);
-        for (uint i = lane; i < hidden; i += tg) {
-            float v = float(x[i]);
-            if (quantize_acts != 0u) {
-                v = round(v / ascale);
-                v = clamp(v, -neg_levels, act_levels) * ascale;
-            }
-            buf_a[i] = v;
+            buf_a[i] = float(x[i]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -348,26 +289,6 @@ _TERNARY_FFN_M1 = mx.fast.metal_kernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // quant mid input
-        if (quantize_acts != 0u) {
-            local_max = 0.0f;
-            for (uint i = lane; i < inter; i += tg) local_max = max(local_max, abs(buf_a[i]));
-            partial[lane] = local_max;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-                if (lane < stride) partial[lane] = max(partial[lane], partial[lane + stride]);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            amax = max(partial[0], 1e-5f);
-            ascale = amax / max(act_levels, 1.0f);
-            for (uint i = lane; i < inter; i += tg) {
-                float v = buf_a[i] / ascale;
-                v = round(v);
-                buf_a[i] = clamp(v, -neg_levels, act_levels) * ascale;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
         // --- mid GEMV: inter -> inter into buf_b ---
         for (uint o = lane; o < inter; o += tg) {
             float wscale = float(mid_scales[o * mid_groups]);
@@ -390,26 +311,6 @@ _TERNARY_FFN_M1 = mx.fast.metal_kernel(
             buf_b[o] = sum * sig;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // quant down input
-        if (quantize_acts != 0u) {
-            local_max = 0.0f;
-            for (uint i = lane; i < inter; i += tg) local_max = max(local_max, abs(buf_b[i]));
-            partial[lane] = local_max;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-                if (lane < stride) partial[lane] = max(partial[lane], partial[lane + stride]);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            amax = max(partial[0], 1e-5f);
-            ascale = amax / max(act_levels, 1.0f);
-            for (uint i = lane; i < inter; i += tg) {
-                float v = buf_b[i] / ascale;
-                v = round(v);
-                buf_b[i] = clamp(v, -neg_levels, act_levels) * ascale;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
 
         // --- down GEMV: inter -> hidden (each lane owns a strided set of outputs) ---
         for (uint o = lane; o < hidden; o += tg) {
@@ -445,8 +346,6 @@ def ternary_fused_ffn_m1(
     *,
     hidden: int,
     intermediate: int,
-    quantize_acts: bool = True,
-    act_levels: float = 7.0,
     dtype=None,
 ) -> mx.array:
     """Fused ternary SwiGLU-mid FFN for a single token (M=1)."""
@@ -471,9 +370,6 @@ def ternary_fused_ffn_m1(
             float(hidden // up_gs),
             float(intermediate // mid_gs),
             float(intermediate // down_gs),
-            1.0 if quantize_acts else 0.0,
-            float(act_levels),
-            float(act_levels + 1.0),
         ],
         dtype=mx.float32,
     )
@@ -497,105 +393,3 @@ def ternary_fused_ffn_m1(
         output_dtypes=[mx.float32],
     )[0]
     return y.reshape(*orig[:-1], hidden).astype(dtype)
-
-
-# ---------------------------------------------------------------------------
-# Fused straight-through activation quantisation.
-#
-# The expression form -- absmax reduce, divide, round, clip, rescale, then
-# ``x + stop_gradient(q - x)`` for the STE -- is about nine elementwise passes
-# over the activation tensor. That is not a rounding error: measured on one
-# HBitLinear at batch 16 x 1024 tokens it is 41% of a 256->1024 projection,
-# 49% of 1024->1024, and 75% of 1024->256, where the layer costs 4.1x a plain
-# matmul. Down-projections are worst because the pass count scales with the
-# *input* width while the matmul scales with input x output.
-#
-# One threadgroup per row: reduce |x| across the row in threadgroup memory,
-# then write the quantised row. Two reads and one write instead of nine passes.
-# The STE is the custom_function's vjp (identity), so the backward stops here
-# rather than differentiating through round/clip.
-# ---------------------------------------------------------------------------
-
-_FUSED_ACT_QUANT = mx.fast.metal_kernel(
-    name="fused_activation_quantize",
-    input_names=["x", "levels"],
-    output_names=["out"],
-    source=r"""
-        uint lane = thread_position_in_threadgroup.x;
-        uint row = thread_position_in_grid.y;
-        uint width = x_shape[x_ndim - 1];
-        ulong base = ulong(row) * width;
-
-        float positive = levels[0];
-        float negative = levels[1];
-
-        threadgroup float shared[TG];
-        float local_max = 0.0f;
-        for (uint i = lane; i < width; i += TG) {
-            local_max = max(local_max, abs(float(x[base + i])));
-        }
-        shared[lane] = local_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = TG / 2; stride > 0; stride >>= 1) {
-            if (lane < stride) {
-                shared[lane] = max(shared[lane], shared[lane + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // Stay in T and divide rather than multiplying by a reciprocal, so this
-        // matches the expression form bit for bit. Both shortcuts disagree only
-        // on values sitting exactly on a rounding boundary -- which at 8 bits
-        // over a 16M-element tensor is not rare.
-        T scale = T(max(shared[0], 1e-5f) / positive);
-        for (uint i = lane; i < width; i += TG) {
-            float value = rint(float(T(x[base + i]) / scale));
-            value = min(max(value, -negative), positive);
-            out[base + i] = T(T(value) * scale);
-        }
-    """,
-)
-
-
-def _fused_activation_quantize(x: mx.array, levels: mx.array) -> mx.array:
-    width = x.shape[-1]
-    rows = x.size // max(width, 1)
-    # Power-of-two threadgroup so the tree reduction above is exact.
-    threads = 256 if width >= 256 else max(32, 1 << (max(width, 1) - 1).bit_length())
-    return _FUSED_ACT_QUANT(
-        inputs=[x, levels],
-        template=[("T", x.dtype), ("TG", threads)],
-        grid=(threads, rows, 1),
-        threadgroup=(threads, 1, 1),
-        output_shapes=[x.shape],
-        output_dtypes=[x.dtype],
-    )[0]
-
-
-def activation_levels(bits: int) -> mx.array:
-    """``[positive, negative]`` level counts for :func:`ste_activation_quantize`.
-
-    A runtime input rather than a template constant so that ramping
-    ``activation_bits`` mid-training does not recompile the graph.
-    """
-    bits = max(int(bits), 2)
-    return mx.array([float((2 ** (bits - 1)) - 1), float(2 ** (bits - 1))], dtype=mx.float32)
-
-
-@mx.custom_function
-def ste_activation_quantize(x: mx.array, levels: mx.array) -> mx.array:
-    """Per-row absmax quantisation of ``x`` with a straight-through gradient.
-
-    Bit-identical to the expression form for float32 and bfloat16 at every
-    width. float16 at 16 bits can differ by one quantisation step, because a
-    10-bit mantissa cannot hold the 32767-level grid the divide passes through;
-    that combination is degenerate anyway.
-    """
-    return _fused_activation_quantize(x, levels)
-
-
-@ste_activation_quantize.vjp
-def _ste_activation_quantize_vjp(primals, cotangent, _output):
-    # Straight through: the quantiser is the identity on the backward pass.
-    _, levels = primals
-    return cotangent, mx.zeros_like(levels)

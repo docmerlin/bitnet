@@ -70,16 +70,7 @@ def test_pytorch_checkpoint_converts_weights_hashes_optimizer_and_outputs(tmp_pa
         saved_group["param_names"] = [parameter_names[id(parameter)] for parameter in live_group["params"]]
     model_state = dict(reversed(list(source_model.state_dict().items())))
     training_args = vars(build_arg_parser().parse_args([]))
-    training_args.update(
-        {
-            "total_tokens": 4,
-            "stage1_ratio": 0.0,
-            "stage1_weight_mix_start": 0.25,
-            "stage1_activation_mix_start": 0.0,
-            "stage1_activation_bits": 8,
-            "final_activation_bits": 4,
-        }
-    )
+    training_args.update({"total_tokens": 4})
     torch.save(
         {
             "model": model_state,

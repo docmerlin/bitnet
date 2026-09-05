@@ -13,7 +13,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 import numpy as np
 import torch
 
-from config import TernaryConfig
+from config import TernaryConfig, migrate_quant_config
 from mlx_model import MLXBitNet, MLXBitNetConfig
 from mlx_optim import CMUD
 from mlx_train import save_checkpoint
@@ -22,6 +22,7 @@ from utils import load_checkpoint_payload
 
 
 def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
+    values = migrate_quant_config(values)
     valid = {field.name for field in fields(TernaryConfig)}
     source = TernaryConfig(**{key: value for key, value in values.items() if key in valid})
     if source.head_dim != source.hidden_size // source.num_attention_heads:
@@ -47,7 +48,6 @@ def mlx_config_from_pytorch(values: dict) -> MLXBitNetConfig:
         # Without this every converted config takes the new untied default and
         # load_pytorch_weights rejects the checkpoint for disagreeing with it.
         tie_word_embeddings=getattr(source, "tie_word_embeddings", True),
-        use_4bit_activations=source.use_4bit_activations,
         use_hadamard=source.use_hadamard,
         rms_norm_eps=source.rms_norm_eps,
         use_engram=source.use_engram,
@@ -295,24 +295,6 @@ def _optimizer_from_pytorch(
     return optimizer
 
 
-def _set_quantization_state(model: MLXBitNet, payload: dict) -> None:
-    args = payload.get("args", {})
-    trainer_state = payload.get("trainer_state", {})
-    progress = trainer_state.get("tokens_processed", 0) / max(args.get("total_tokens", 1), 1)
-    ratio = args.get("stage1_ratio", 0.12)
-    fraction = 1.0 if ratio <= 0 else min(progress / ratio, 1.0)
-    weight_start = args.get("stage1_weight_mix_start", 0.25)
-    activation_start = args.get("stage1_activation_mix_start", 0.0)
-    stage_bits = args.get("stage1_activation_bits", 8)
-    final_bits = args.get("final_activation_bits", 8)
-    weight_mix = weight_start + fraction * (1.0 - weight_start)
-    activation_mix = activation_start + fraction * (1.0 - activation_start)
-    if not payload["model_config"].get("use_4bit_activations", True):
-        activation_mix = 0.0
-    bits = round(stage_bits - fraction * (stage_bits - final_bits))
-    model.set_quantization_state(weight_mix, activation_mix, bits)
-
-
 def convert_pytorch_checkpoint(
     source_path: Path,
     output_dir: Path,
@@ -351,7 +333,6 @@ def convert_pytorch_checkpoint(
     config = mlx_config_from_pytorch(payload["model_config"])
     model = MLXBitNet(config)
     name_map = load_pytorch_weights(model, payload["model"])
-    _set_quantization_state(model, payload)
     optimizer = _optimizer_from_pytorch(
         payload,
         model,

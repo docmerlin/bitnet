@@ -116,7 +116,6 @@ def build_model_config(args: argparse.Namespace, tokenizer: HierarchicalTokenize
         "engram_vocab_size": getattr(args, "engram_vocab_size", None),
         "engram_param_fraction": getattr(args, "engram_param_fraction", 0.05),
         "use_hadamard": not args.disable_hadamard,
-        "use_4bit_activations": True,
         "use_rfmoe": args.use_rfmoe,
         "rfmoe_num_experts": args.rfmoe_num_experts,
         "rfmoe_expert_dim": args.rfmoe_expert_dim,

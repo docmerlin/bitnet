@@ -46,16 +46,12 @@ class RFMoEExpert(nn.Module):
         # eye(D)*D, not eye(D): the per-output-channel scale is mean(|row|), so a
         # plain identity row (one 1, D-1 zeros) has scale 1/D and quantises to
         # eye(D)/D -- an attenuator, not a pass-through. Scaling by D makes
-        # mean(|row|) = 1 so the quantised weight is exactly eye(D). The weight
-        # mix is pinned with it, since blending raw and quantised only means
-        # anything when they share a scale. See TernaryMLP.mid_proj.
+        # mean(|row|) = 1 so the quantised weight is exactly eye(D).
         with torch.no_grad():
             self.w_mid.weight.copy_(
                 torch.eye(expert_dim, device=self.w_mid.weight.device, dtype=self.w_mid.weight.dtype)
                 * expert_dim
             )
-        self.w_mid.pinned_weight_mix = 1.0
-        self.w_mid.weight_quantization_mix = 1.0
         self.w_down = HBitLinear(expert_dim, hidden_size, bias=False, config=config)  # D_act -> D
         # Per-expert fire bias. Warm-started ~0 so every expert fires early
         # (explore/specialize); a density loss ramps it up later to enforce
@@ -93,7 +89,7 @@ class RFMoE(nn.Module):
         self.hidden_size = hidden_size
         self.expert_dim = expert_dim
         rank = rank or max(1, hidden_size // 16)  # paper sizing: r ≈ D/16
-        config = config or SimpleNamespace(use_hadamard=True, use_4bit_activations=True)
+        config = config or SimpleNamespace(use_hadamard=True)
         self.rank = rank
         self.config = config
         self.experts = nn.ModuleList(
@@ -134,13 +130,7 @@ class RFMoE(nn.Module):
             expert.bias.fill_(bias)
         for source, target in zip(reference.modules(), expert.modules()):
             if isinstance(source, HBitLinear) and isinstance(target, HBitLinear):
-                target.set_quantization_state(
-                    weight_mix=source.weight_quantization_mix,
-                    activation_mix=source.activation_quantization_mix,
-                    activation_bits=source.activation_bits,
-                    enable_weight_quantization=source.enable_weight_quantization,
-                    enable_activation_quantization=source.enable_activation_quantization,
-                )
+                target.enable_weight_quantization = source.enable_weight_quantization
         self.experts.append(expert)
         device = parameter.device
         self._last_usage = torch.cat((self._last_usage.to(device), torch.zeros(1, device=device)))

@@ -64,21 +64,6 @@ def test_a_signal_passes_through_the_mid_unattenuated() -> None:
     assert float(mx.std(out)) / float(mx.std(x)) > 0.5
 
 
-def test_the_ramp_does_not_move_the_mid() -> None:
-    # (1-mix)*raw + mix*quantised is only meaningful when raw and quantised share
-    # a scale; for the mid they differ by N, so mixing would put it at 768x
-    # identity a quarter of the way through the ramp.
-    mlp = MLXTernaryMLP(64, 4.0, config=_blt_config())
-    mx.eval(mlp.parameters())
-    size = mlp.mid_proj.weight.shape[0]
-    for weight_mix in (0.0, 0.25, 0.5, 1.0):
-        mlp.mid_proj.set_quantization_state(weight_mix, 0.0, 8)
-        assert bool(mx.allclose(mlp.mid_proj.effective_weight(), mx.eye(size), atol=1e-6)), weight_mix
-    # Sibling projections still ramp normally.
-    mlp.up_proj.set_quantization_state(0.25, 0.0, 8)
-    assert float(mlp.up_proj.weight_mix) == 0.25
-
-
 def test_rfmoe_expert_mids_quantise_to_the_identity() -> None:
     # Same square mid, same trap: the experts had the identical bug.
     import torch as _torch

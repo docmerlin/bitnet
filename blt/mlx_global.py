@@ -126,9 +126,7 @@ class MLXBitNetGlobalTransformer(nn.Module):
                 # 2.2e-1 at 1 / 2 / 8 layers, the last being a relative error of
                 # 1.0, i.e. a completely different output. It does not grow with
                 # the *amount* of padding, so this is a small perturbation being
-                # amplified through depth by the 4-bit activation quantisation,
-                # which is a step function: a tiny shift flips a bucket, which
-                # shifts more, and so on.
+                # amplified through depth.
                 #
                 # BLT's own global transformer tolerates padding exactly, so
                 # bucketing is safe there and only there. For a fixed patch

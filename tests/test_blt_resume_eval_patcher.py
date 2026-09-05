@@ -59,7 +59,6 @@ def build_teacher_config() -> TernaryBLTConfig:
         patch_size=3,
         max_patch_length=8,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
 
 
@@ -117,7 +116,6 @@ def test_blt_resume_eval_and_student_patcher() -> bool:
                 "--max-patch-length",
                 "8",
                 "--disable-hadamard",
-                "--disable-4bit-activations",
                 "--eval-every",
                 "1",
                 "--eval-steps",
@@ -201,7 +199,6 @@ def test_blt_resume_eval_and_student_patcher() -> bool:
                 "--max-patch-length",
                 "8",
                 "--disable-hadamard",
-                "--disable-4bit-activations",
                 "--eval-every",
                 "1",
                 "--eval-steps",

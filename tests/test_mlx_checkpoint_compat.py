@@ -35,18 +35,13 @@ def _optimizer() -> CMUD:
 
 
 def test_runtime_quantisation_state_is_not_written_to_checkpoints(tmp_path) -> None:
-    # These are rebuilt by set_quantization_state every step. Storing them bloats
-    # the file and makes the strict key comparison reject any build with a
-    # different set of them.
+    # Old builds stored mix/level arrays as module state. New models do not, and
+    # the save path still skips those names so leftover keys are not rewritten.
     config = _config()
     model = MLXBitNet(config)
     optimizer = _optimizer()
     optimizer.init(model.trainable_parameters())
     mx.eval(model.parameters())
-
-    assert any(
-        name.endswith(_RUNTIME_QUANT_NAMES) for name, _ in tree_flatten(model.parameters())
-    ), "expected runtime quantisation state on the model"
 
     path = save_checkpoint(tmp_path, model, optimizer, config, {"step": 1}, "ckpt")
     stored = mx.load(str(path))
@@ -97,6 +92,22 @@ def test_config_from_saved_drops_retired_fields() -> None:
     assert config.hidden_size == 64
     assert not hasattr(config, "use_ffn_mid")
     assert not hasattr(config, "use_mamba3_layers")
+
+
+def test_config_from_saved_drops_retired_activation_fields() -> None:
+    config = config_from_saved(
+        {
+            "vocab_size": 256,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "use_4bit_activations": False,
+            "quantize_activations": True,
+            "activation_bits": 4,
+        }
+    )
+    assert not hasattr(config, "use_4bit_activations")
+    assert not hasattr(config, "quantize_activations")
+    assert not hasattr(config, "activation_bits")
 
 
 def test_config_from_saved_still_rejects_an_unknown_field() -> None:

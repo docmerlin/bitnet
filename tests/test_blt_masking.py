@@ -25,7 +25,6 @@ def build_config(*, pad_id: int = -1) -> TernaryBLTConfig:
         patch_size=3,
         max_patch_length=8,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
 
 

@@ -2,9 +2,7 @@
 
 This layer keeps a floating-point master weight for training stability and
 quantizes it to ternary values ``{-1, 0, 1}`` with a straight-through estimator
-during the forward pass. Optional Hadamard preprocessing and 4-bit activation
-quantization reduce compute while preserving a simple, fully-PyTorch
-implementation that still runs on CPU-class hardware.
+during the forward pass. Optional Hadamard preprocessing is applied to inputs.
 """
 
 from __future__ import annotations
@@ -89,23 +87,6 @@ def ternary_quantize_ste(weight: torch.Tensor) -> torch.Tensor:
     return quantized.detach() + (weight - weight.detach())
 
 
-def quantize_activations(x: torch.Tensor, bits: int = 4) -> torch.Tensor:
-    """Apply symmetric activation quantization with STE.
-
-    Scaling is computed per token vector over the last dimension. ``bits`` can
-    be increased during warmup to keep training slightly softer before the model
-    transitions into full 4-bit activation quantization.
-    """
-    if bits < 2:
-        return x
-
-    positive_levels = (2 ** (bits - 1)) - 1
-    negative_levels = 2 ** (bits - 1)
-    scale = x.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / max(positive_levels, 1)
-    quantized = (x / scale).round().clamp(-negative_levels, positive_levels) * scale
-    return x + (quantized - x).detach()
-
-
 class HBitLinear(nn.Module):
     """Hadamard-preconditioned ternary linear projection.
 
@@ -126,12 +107,7 @@ class HBitLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.config = config
-        self.weight_quantization_mix = 1.0
-        self.activation_quantization_mix = 1.0
-        # TernaryBLTConfig carries this; TernaryConfig does not and keeps 4.
-        self.activation_bits = int(getattr(config, "activation_bits", 8))
         self.enable_weight_quantization = True
-        self.enable_activation_quantization = True
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
@@ -156,7 +132,7 @@ class HBitLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def prepare_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply this layer's Hadamard and activation quantization settings."""
+        """Apply this layer's Hadamard, if enabled."""
         if self.hadamard_size is not None:
             # Dense cached matmul, not a fast Walsh-Hadamard transform. At the
             # sizes this model uses (n = in_features = 1024, and 2048 for
@@ -174,17 +150,10 @@ class HBitLinear(nn.Module):
             # the threshold. A FWHT implementation was removed from this module;
             # recover it from git history if the size regime changes.
             x = x @ get_hadamard_tensor(self.hadamard_size, x.device, x.dtype)
-
-        if bool(self.config.use_4bit_activations) and self.enable_activation_quantization:
-            quantized_x = quantize_activations(x, bits=self.activation_bits)
-            if self.activation_quantization_mix >= 1.0:
-                x = quantized_x
-            elif self.activation_quantization_mix > 0.0:
-                x = torch.lerp(x, quantized_x, self.activation_quantization_mix)
         return x
 
     def effective_weight(self, dtype: torch.dtype, weight: torch.Tensor | None = None) -> torch.Tensor:
-        """Return mixed ternary weight, including grouped leading dimensions."""
+        """Return ternary STE weight, including grouped leading dimensions."""
         cache = _EFFECTIVE_WEIGHT_CACHE.get()
         key = (id(self), dtype)
         if weight is None and cache is not None and key in cache:
@@ -192,13 +161,7 @@ class HBitLinear(nn.Module):
 
         weight = self.weight if weight is None else weight
         if self.enable_weight_quantization:
-            quantized_weight = ternary_quantize_ste(weight).to(dtype=dtype)
-            if self.weight_quantization_mix >= 1.0:
-                result = quantized_weight
-            elif self.weight_quantization_mix > 0.0:
-                result = torch.lerp(weight.to(dtype=dtype), quantized_weight, self.weight_quantization_mix)
-            else:
-                result = weight.to(dtype=dtype)
+            result = ternary_quantize_ste(weight).to(dtype=dtype)
         else:
             result = weight.to(dtype=dtype)
         if weight is self.weight and cache is not None:
@@ -206,11 +169,7 @@ class HBitLinear(nn.Module):
         return result
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply Hadamard (on input), activation quantization, and ternary weight matmul.
-
-        Following BitNet b1.58 best practices, Hadamard is applied to the input
-        before the ternary weight multiplication for improved quantization stability.
-        """
+        """Apply Hadamard (on input) and ternary weight matmul."""
         return self.forward_prepared(self.prepare_input(x))
 
     def forward_prepared(self, x: torch.Tensor) -> torch.Tensor:
@@ -220,26 +179,10 @@ class HBitLinear(nn.Module):
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.linear(x, weight, bias)
 
-    def set_quantization_state(
-        self,
-        *,
-        weight_mix: float | None = None,
-        activation_mix: float | None = None,
-        activation_bits: int | None = None,
-        enable_weight_quantization: bool | None = None,
-        enable_activation_quantization: bool | None = None,
-    ) -> None:
-        """Update runtime quantization settings for staged training."""
-        if weight_mix is not None and getattr(self, "pinned_weight_mix", None) is None:
-            self.weight_quantization_mix = float(min(max(weight_mix, 0.0), 1.0))
-        if activation_mix is not None:
-            self.activation_quantization_mix = float(min(max(activation_mix, 0.0), 1.0))
-        if activation_bits is not None:
-            self.activation_bits = max(int(activation_bits), 2)
+    def set_quantization_state(self, *, enable_weight_quantization: bool | None = None) -> None:
+        """Update runtime weight-quantization settings."""
         if enable_weight_quantization is not None:
             self.enable_weight_quantization = bool(enable_weight_quantization)
-        if enable_activation_quantization is not None:
-            self.enable_activation_quantization = bool(enable_activation_quantization)
 
     def extra_repr(self) -> str:
         return (

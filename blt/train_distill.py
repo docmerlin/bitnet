@@ -345,7 +345,9 @@ def build_config_from_args(
     checkpoint_config: dict[str, Any] | None = None,
 ) -> TernaryBLTConfig:
     if checkpoint_config is not None:
-        return TernaryBLTConfig(**checkpoint_config)
+        from config import migrate_quant_config
+
+        return TernaryBLTConfig(**migrate_quant_config(dict(checkpoint_config)))
     return TernaryBLTConfig(
         local_dim=args.local_dim,
         global_dim=args.global_dim,
@@ -366,7 +368,6 @@ def build_config_from_args(
         patch_size=args.patch_size,
         max_patch_length=args.max_patch_length,
         use_hadamard=not args.disable_hadamard,
-        use_4bit_activations=not args.disable_4bit_activations,
         distill_temperature=args.distill_temperature,
     )
 
@@ -877,7 +878,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--max-patch-length", type=int, default=32)
     parser.add_argument("--disable-hadamard", action="store_true")
-    parser.add_argument("--disable-4bit-activations", action="store_true")
     parser.add_argument("--distill-temperature", type=float, default=1.0)
 
     parser.add_argument("--hard-ce-weight", type=float, default=1.0)

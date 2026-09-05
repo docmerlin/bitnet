@@ -385,23 +385,6 @@ class MLXTernaryBLTModel(nn.Module):
         )
         return self.output_head(transformed @ projection_weight.T)
 
-    def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
-        """Ramp quantisation across every ternary projection, backbone included.
-
-        Starting at full 4-bit activations diverges -- see MLXHBitLinear -- so
-        training ramps rather than fixing them at 1.0.
-        """
-        from blt.mlx_layers import MLXHBitLinear as _BLTHBitLinear
-
-        def update(_, module):
-            if isinstance(module, _BLTHBitLinear):
-                module.set_quantization_state(weight_mix, activation_mix, bits)
-
-        self.apply_to_modules(update)
-        backbone = getattr(self.global_transformer, "backbone", None)
-        if backbone is not None and hasattr(backbone, "set_quantization_state"):
-            backbone.set_quantization_state(weight_mix, activation_mix, bits)
-
     def pin_inference_weights(self) -> None:
         """Pin effective ternary weights for generation; skip per-token rematerialize.
 

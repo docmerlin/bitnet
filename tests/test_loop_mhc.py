@@ -17,7 +17,6 @@ def _tiny(**kwargs) -> TernaryConfig:
         head_dim=8,
         intermediate_size=64,
         use_hadamard=False,
-        use_4bit_activations=False,
         num_prelude_layers=0,
         num_recurrent_layers=2,
         num_coda_layers=0,

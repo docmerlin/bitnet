@@ -89,11 +89,6 @@ class TernaryMLP(nn.Module):
         # scale is 1/N and the quantised weight comes out as eye(N)/N -- a 1/1024
         # attenuator, not a pass-through. eye(N)*N gives mean(|row|) = 1, so the
         # quantised weight is exactly eye(N).
-        #
-        # The weight mix is pinned with it: the straight-through blend
-        # (1-mix)*raw + mix*quantised only means anything when raw and quantised
-        # share a scale, and here they differ by N. Ramping this particular matrix
-        # would put it at 768x identity a quarter of the way through the ramp.
         with torch.no_grad():
             self.mid_proj.weight.copy_(
                 torch.eye(
@@ -103,8 +98,6 @@ class TernaryMLP(nn.Module):
                 )
                 * hidden_dim
             )
-        self.mid_proj.pinned_weight_mix = 1.0
-        self.mid_proj.weight_quantization_mix = 1.0
         self.down_proj = HBitLinear(hidden_dim, dim, config=config)
         self.dropout = config.dropout
 

@@ -227,15 +227,12 @@ def test_logged_step_reuses_gradient_forward(tmp_path, monkeypatch, compile_step
 
 
 @pytest.mark.parametrize("global_backbone", [False, True])
-def test_training_survives_the_quantisation_ramp(tmp_path, global_backbone):
-    # 4-bit activations from a cold start collapse the model to uniform output
-    # after one update and NaN on the next. The ramp is what keeps it finite;
-    # without it this diverges at every width and learning rate tried.
+def test_training_stays_finite(tmp_path, global_backbone):
     from blt.mlx_global import MLXBitNetGlobalTransformer, global_config_for
 
     config = _config(local_dim=64, global_dim=128, decoder_dim=64, n_layers_global=4)
     corpus = _corpus(tmp_path, size=1 << 15)
-    # 8 patches over SEQ bytes is the ratio that diverged at 4-bit activations.
+    # 8 patches over SEQ bytes is a typical entropy-patcher density.
     mx.random.seed(0)
     backbone = (
         MLXBitNetGlobalTransformer(config, global_config_for(config, block_size=2, path_window_size=32))
@@ -254,53 +251,3 @@ def test_training_survives_the_quantisation_ramp(tmp_path, global_backbone):
     )
     losses = [h["loss"] for h in trainer.train(log=lambda *_: None)]
     assert np.all(np.isfinite(losses)), losses
-
-
-def test_quantisation_ramps_from_soft_to_full():
-    config = TrainingConfig(steps=100, quant_ramp_ratio=0.25)
-    mx.random.seed(0)
-    model = MLXTernaryBLTModel(_config())
-    mx.eval(model.parameters())
-    trainer = MLXBLTTrainer.__new__(MLXBLTTrainer)
-    trainer.config = config
-
-    start_w, start_a, start_bits = trainer.quantization_at(0)
-    end_w, end_a, end_bits = trainer.quantization_at(99)
-    # Activations must start unquantised -- that is the whole point.
-    assert start_a == 0.0
-    assert start_w == pytest.approx(0.25)
-    assert start_bits == 16
-    assert (end_w, end_a, end_bits) == (1.0, 1.0, 8)
-
-
-def test_activation_mix_zero_skips_quantisation():
-    from blt.mlx_layers import MLXHBitLinear
-
-    layer = MLXHBitLinear(64, 64, config=_config())
-    mx.eval(layer.parameters())
-    x = mx.array(np.random.default_rng(0).standard_normal((1, 4, 64)).astype(np.float32))
-    layer.set_quantization_state(1.0, 0.0, 8)
-    unquantised = layer.prepare_input(x)
-    layer.set_quantization_state(1.0, 1.0, 4)
-    quantised = layer.prepare_input(x)
-    assert float(mx.max(mx.abs(unquantised - quantised))) > 1e-4
-
-
-def test_eight_bit_activations_are_the_default():
-    # 4-bit buys no speed -- quantisation here is fake, so the matmul is float x
-    # ternary either way -- and diverges where 8-bit does not. Measured on the
-    # BitNet backbone at 8 patches over 64 bytes: 4-bit reaches NaN, 8-bit
-    # trains. Set 4 only to match a deployment that truly runs 4-bit kernels.
-    from blt.config import TernaryBLTConfig
-    from blt.mlx_layers import MLXHBitLinear
-
-    config = TernaryBLTConfig()
-    assert config.activation_bits == 8
-    assert MLXHBitLinear(64, 64, config=config).activation_bits == 8
-
-
-def test_activation_bits_must_be_representable():
-    from blt.config import TernaryBLTConfig
-
-    with pytest.raises(ValueError, match="activation_bits must be at least 2"):
-        TernaryBLTConfig(activation_bits=1)

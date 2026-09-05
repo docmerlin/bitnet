@@ -19,7 +19,6 @@ def _config(**overrides) -> TernaryConfig:
         path_window_size=8,
         infini_memory_dim=8,
         use_hadamard=False,
-        use_4bit_activations=False,
         engram_layer_ids=(0,),
         engram_vocab_size=31,
         engram_num_heads=2,

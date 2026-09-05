@@ -21,7 +21,6 @@ def _tiny_config(**kwargs) -> TernaryConfig:
         head_dim=8,
         intermediate_size=64,
         use_hadamard=False,
-        use_4bit_activations=False,
         mtp_depth=0,
         use_rfmoe=False,
     )

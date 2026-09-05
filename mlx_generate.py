@@ -72,6 +72,79 @@ def greedy_generate(
     return tokens
 
 
+def dblock_greedy_generate(
+    model: MLXBitNet,
+    prompt: list[int],
+    max_new_tokens: int,
+    eos_token_id: int | None = None,
+    *,
+    euler_steps: int | None = None,
+) -> list[int]:
+    """Denoise the full window (same as train), then take suffix argmax.
+
+    Not token-by-token AR decode. Prompt positions are noised like every other
+    token; the returned prefix is still the caller's prompt.
+
+    B=1 Euler uses ``euler_steps`` or ``config.dblock_euler_steps`` (paper 50),
+    not ``num_loops``. ``dblock_infer='loops'`` still unrolls Huginn R.
+    """
+    if model.config.train_mode != "dblock":
+        raise ValueError("dblock_greedy_generate requires train_mode='dblock'")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
+    infer_loops = int(getattr(model, "inference_num_loops", None) or model.config.num_loops)
+    if infer_loops < 1:
+        raise ValueError("inference_num_loops must be positive")
+    schedule = model.config.noise_schedule()
+    prompt_len = len(prompt)
+    tokens = mx.array([list(prompt) + [0] * max_new_tokens], dtype=mx.int32)
+    clean = model.dblock_clean_embeddings(tokens)
+    noise = mx.random.normal(clean.shape).astype(clean.dtype)
+    sigma_max = mx.array(schedule.sigma_max, dtype=clean.dtype)
+    z = clean + sigma_max * noise
+    if model.config.dblock_infer == "loops":
+        if model.config.dblock_blocks != 1:
+            raise ValueError("dblock_infer='loops' requires dblock_blocks=1")
+        hidden = model.dblock_forward_from_z(
+            z,
+            mx.array(schedule.sigma_min),
+            tokens,
+            None,
+            block_id=0,
+            num_loops=infer_loops,
+        )
+    else:
+        steps = model.config.dblock_sample_steps(euler_steps)
+        sigmas = schedule.euler_sigmas(steps)
+        for index in range(steps):
+            block_id = 0 if model.config.dblock_blocks == 1 else index
+            z = model.dblock_euler_step(
+                z,
+                mx.array(sigmas[index]),
+                mx.array(sigmas[index + 1]),
+                tokens,
+                None,
+                block_id=block_id,
+            )
+            mx.eval(z)
+        hidden = model.dblock_forward_from_z(
+            z,
+            mx.array(sigmas[-1]),
+            tokens,
+            None,
+            block_id=0 if model.config.dblock_blocks == 1 else steps - 1,
+        )
+    predicted = mx.argmax(model.logits_from(hidden), axis=-1)
+    mx.eval(predicted)
+    suffix = predicted[0, prompt_len:].tolist()
+    out = list(prompt)
+    for token in suffix:
+        out.append(int(token))
+        if eos_token_id is not None and int(token) == eos_token_id:
+            break
+    return out
+
+
 def speculative_greedy_generate(
     prompt: list[int],
     max_new_tokens: int,
@@ -141,7 +214,20 @@ def load_model(
     expected = {
         key
         for key in parameters
-        if not key.endswith((".memory_m", ".memory_z", ".memory_initialized", ".memory_k", ".memory_v"))
+        if not key.endswith(
+            (
+                ".memory_m",
+                ".memory_z",
+                ".memory_initialized",
+                ".memory_k",
+                ".memory_v",
+                # Retired activation-quant module state from older checkpoints.
+                ".activation_levels",
+                ".activation_level_pair",
+                ".weight_mix_value",
+                ".activation_mix_value",
+            )
+        )
     }
     if expected != loaded.keys():
         raise ValueError(
@@ -180,18 +266,7 @@ def load_model(
     else:
         model.inference_num_loops = scheduled_loops
     model.scheduled_inference_num_loops = scheduled_loops
-    stage_ratio = training_args.get("stage1_ratio", 0.0)
-    fraction = 1.0 if stage_ratio <= 0 else min(progress / stage_ratio, 1.0)
-    weight_mix = training_args.get("stage1_weight_mix_start", 0.25) + fraction * (
-        1.0 - training_args.get("stage1_weight_mix_start", 0.25)
-    )
-    activation_mix = training_args.get("stage1_activation_mix_start", 0.0) + fraction * (
-        1.0 - training_args.get("stage1_activation_mix_start", 0.0)
-    )
-    stage_bits = training_args.get("stage1_activation_bits", 8)
-    final_bits = training_args.get("final_activation_bits", 8)
-    model.set_quantization_state(weight_mix, activation_mix, round(stage_bits - fraction * (stage_bits - final_bits)))
-    model.recurrent_quantized_matmul = weight_mix >= 1.0
+    model.recurrent_quantized_matmul = True
     model.set_path_decode_mode(path_decode_mode)
     model.eval()
     mx.eval(model.parameters())
@@ -305,7 +380,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--num-loops",
         type=int,
         default=None,
-        help="Eval-time recurrent loop override (default: checkpoint schedule).",
+        help="Eval-time recurrent loop override (default: checkpoint schedule). "
+        "dblock Euler ignores this; use --dblock-euler-steps.",
+    )
+    parser.add_argument(
+        "--dblock-euler-steps",
+        type=int,
+        default=None,
+        help="B=1 dblock Euler evaluations (default: checkpoint dblock_euler_steps, paper 50). "
+        "Independent of --num-loops.",
     )
     parser.add_argument(
         "--path-decode",
@@ -352,27 +435,38 @@ def main() -> None:
     if not prompt:
         prompt = [tokenizer.bos_id]
     profile = PhaseTimings() if args.profile else None
-    propose, verify = model_callbacks(model, profile=profile)
     started = time.perf_counter()
     stats = GenerationStats()
-    if args.speculative and model.config.mtp_depth:
-        tokens = speculative_greedy_generate(
+    if model.config.train_mode == "dblock":
+        tokens = dblock_greedy_generate(
+            model,
             prompt,
             args.max_new_tokens,
-            propose,
-            verify,
             tokenizer.eos_id,
-            stats,
+            euler_steps=args.dblock_euler_steps,
         )
     else:
-        tokens = greedy_generate(prompt, args.max_new_tokens, propose, tokenizer.eos_id)
+        propose, verify = model_callbacks(model, profile=profile)
+        if args.speculative and model.config.mtp_depth:
+            tokens = speculative_greedy_generate(
+                prompt,
+                args.max_new_tokens,
+                propose,
+                verify,
+                tokenizer.eos_id,
+                stats,
+            )
+        else:
+            tokens = greedy_generate(prompt, args.max_new_tokens, propose, tokenizer.eos_id)
     elapsed = time.perf_counter() - started
     generated = len(tokens) - len(prompt)
     print(tokenizer.decode(tokens))
     print(
         f"generated_tokens={generated} | elapsed_sec={elapsed:.3f} | "
         f"tokens_per_second={generated / elapsed:.3f} | "
-        f"num_loops={model.inference_num_loops} | path_decode={getattr(model, 'path_decode_mode', 'last')} | "
+        f"num_loops={model.inference_num_loops} | "
+        f"dblock_euler_steps={model.config.dblock_sample_steps(args.dblock_euler_steps) if model.config.train_mode == 'dblock' else '-'} | "
+        f"path_decode={getattr(model, 'path_decode_mode', 'last')} | "
         f"compiled={getattr(model, '_compiled_inference_step', None) is not None}"
     )
     if stats.verification_calls:

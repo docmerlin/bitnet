@@ -28,7 +28,6 @@ from training.schedules import (
     lr_schedule_multiplier,
     rfmoe_staircase_schedule,
     update_block_growth,
-    update_quantization_schedule,
 )
 
 __all__ = [
@@ -57,5 +56,4 @@ __all__ = [
     "rfmoe_staircase_schedule",
     "save_checkpoint",
     "update_block_growth",
-    "update_quantization_schedule",
 ]

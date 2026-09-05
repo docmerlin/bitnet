@@ -35,9 +35,7 @@ from blt.mlx_layers import (
 # attenuated the block's own output by 1/256. With the mid a true identity the
 # FFN passes signal at unit gain, and the attention path's pre-existing
 # torch-vs-MLX disagreement is no longer damped: measured 2.3e-4 on the block
-# against 5.2e-8 for the MLP alone. Quantisation is a step function, so a 1e-7
-# difference in a pre-activation flips a level and lands as a ~1/127 relative
-# jump -- the same effect that set the tolerance in test_blt_mlx_model.py.
+# against 5.2e-8 for the MLP alone.
 TOLERANCE = 2e-3
 
 
@@ -132,11 +130,6 @@ def test_shared_projections_prepare_inputs_once(monkeypatch):
         "cross_k": 1,
         "cross_v": 0,
     }
-
-    attention.k_proj.set_quantization_state(1.0, 0.5, 8)
-    calls.update((name, 0) for name in calls)
-    mx.eval(attention(x))
-    assert calls["attention_q"] == calls["attention_k"] == calls["attention_v"] == 1
 
 
 def test_mlp_matches_torch():

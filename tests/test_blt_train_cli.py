@@ -79,7 +79,6 @@ def test_blt_cli_runtime_smoke() -> bool:
                 "--max-patch-length",
                 "8",
                 "--disable-hadamard",
-                "--disable-4bit-activations",
                 "--save-path",
                 str(checkpoint_path),
             ]
@@ -98,7 +97,6 @@ def test_blt_cli_runtime_smoke() -> bool:
             patch_size=3,
             max_patch_length=8,
             use_hadamard=False,
-            use_4bit_activations=False,
         )
         result = run_distillation(args, teacher_override=ToyTeacher(TernaryBLTModel(teacher_config)))
         assert result["start_step"] == 0
@@ -157,7 +155,6 @@ def test_disable_teacher_patcher_uses_static_patch_lengths() -> bool:
             "--max-patch-length",
             "8",
             "--disable-hadamard",
-            "--disable-4bit-activations",
         ]
     )
     teacher = AssertingTeacher(TernaryBLTModel(TernaryBLTConfig(
@@ -174,7 +171,6 @@ def test_disable_teacher_patcher_uses_static_patch_lengths() -> bool:
         patch_size=3,
         max_patch_length=8,
         use_hadamard=False,
-        use_4bit_activations=False,
     )))
     result = run_distillation(args, teacher_override=teacher)
     assert result["teacher_enabled"] is True
@@ -230,7 +226,6 @@ def test_run_distillation_is_seeded_directly() -> bool:
         "--max-patch-length",
         "8",
         "--disable-hadamard",
-        "--disable-4bit-activations",
     ]
     first = run_distillation(parse_args(base_args))
     second = run_distillation(parse_args(base_args))

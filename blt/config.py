@@ -98,18 +98,6 @@ class TernaryBLTConfig:
     max_patch_length: int = 32
 
     use_hadamard: bool = True
-    # Whether activations are fake-quantised at all. The name is historical --
-    # the width is ``activation_bits``, not fixed at 4.
-    use_4bit_activations: bool = True
-    # Activation quantisation width. 8 rather than 4 because 4 buys nothing and
-    # costs stability: quantisation here is fake (``x + stop_gradient(q - x)``),
-    # the tensor stays float and the matmul is float x ternary either way, so
-    # fewer bits is measurably *slower* (skipping it entirely is 1.29x on the
-    # forward) and only changes the rounding grid. 4-bit also diverges from a
-    # cold start -- 7 levels is not enough for the per-token max scale -- while
-    # 8 bits gives 127. Set 4 only to match a deployment that really does
-    # quantise activations to 4 bits in its kernels.
-    activation_bits: int = 8
 
     # Auxiliary byte-level future heads. These operate after the causal local
     # decoder; patch-level MTP is undefined because patches have variable widths.
@@ -130,8 +118,6 @@ class TernaryBLTConfig:
             raise ValueError("distill_temperature must be positive")
         if self.cross_attn_k <= 0:
             raise ValueError("cross_attn_k must be positive")
-        if self.activation_bits < 2:
-            raise ValueError("activation_bits must be at least 2")
         if self.mtp_depth < 0:
             raise ValueError("mtp_depth must be non-negative")
         if self.use_ngram_embeddings:

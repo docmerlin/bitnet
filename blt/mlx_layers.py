@@ -2,11 +2,11 @@
 
 A numerical mirror of :mod:`blt.layers.transformer_block` and
 :mod:`blt.layers.cross_attention`, not of the BitNet stack's ``MLXHBitLinear``.
-The two stacks agree on ternary weight quantization and on the activation
-quantization scheme (width from ``config.activation_bits``), and ``mx.hadamard_transform`` matches the torch dense Hadamard
-matmul to float32 precision, but BLT's blocks differ in shape (SwiGLU with an
-identity-initialised ``mid_proj``, cross-attention with a projected residual), so
-these are written against the BLT torch modules and parity-tested against them.
+The two stacks agree on ternary weight quantization, and
+``mx.hadamard_transform`` matches the torch dense Hadamard matmul to float32
+precision, but BLT's blocks differ in shape (SwiGLU with an identity-initialised
+``mid_proj``, cross-attention with a projected residual), so these are written
+against the BLT torch modules and parity-tested against them.
 
 Conventions worth stating because they are easy to get silently wrong:
 
@@ -28,7 +28,6 @@ import mlx.nn as nn
 
 from blt.config import TernaryBLTConfig
 from blt.ngram_hash import HASH_MODULUS, HASH_PAD, hash_bases
-from mlx_ternary_kernel import activation_levels, ste_activation_quantize
 
 # torch.nn.RMSNorm(dim) leaves eps=None and uses finfo(x.dtype).eps at runtime.
 _TORCH_FLOAT32_EPS = 1.1920928955078125e-07
@@ -115,11 +114,11 @@ def combine_attention_bias(
 
 
 class MLXHBitLinear(nn.Module):
-    """Ternary linear with Hadamard-preconditioned, fake-quantized activations.
+    """Ternary linear with optional Hadamard-preconditioned inputs.
 
     Matches ``layers.h_bitlinear.HBitLinear``: per-output-channel abs-mean weight
-    scale, symmetric per-token activation scale, straight-through estimators on
-    both. Weight is stored ``[out, in]`` so checkpoints transfer directly.
+    scale and a straight-through estimator. Weight is stored ``[out, in]`` so
+    checkpoints transfer directly. Activations stay full precision.
     """
 
     def __init__(self, in_features: int, out_features: int, *, config: TernaryBLTConfig) -> None:
@@ -127,34 +126,6 @@ class MLXHBitLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.use_hadamard = bool(config.use_hadamard) and in_features & (in_features - 1) == 0
-        self.quantize_activations = bool(config.use_4bit_activations)
-        self.activation_bits = int(config.activation_bits)
-        # Quantisation strength, ramped during training rather than fixed.
-        # Fully quantised activations from step 0 diverge: at activation_mix=1.0
-        # the model collapses to uniform output after one update and NaNs on the
-        # next, while activation_mix=0.0 trains normally at any weight_mix.
-        # Ternary weights are not the problem. These mirror
-        # layers.h_bitlinear.HBitLinear, which has had them all along.
-        self.weight_mix = 1.0
-        self.activation_mix = 1.0
-        # When set, set_quantization_state leaves weight_mix alone. Used by the
-        # identity-initialised FFN mid; see MLXTernaryMLP.
-        self.pinned_weight_mix: float | None = None
-        # The ramped values also live as module state, because the trainer wraps
-        # the step in mx.compile and a Python float read inside a traced function
-        # is baked in as a graph constant. Reassigning the float then changes
-        # nothing: measured, a 16-bit and a 4-bit forward returned identical
-        # output under compile, i.e. the whole quantisation ramp was inert.
-        # Arrays in module state are graph *inputs*, so they track. The plain
-        # floats above stay for the branch decisions, which genuinely do need a
-        # retrace when they flip.
-        self.weight_mix_value = mx.array(1.0)
-        self.activation_mix_value = mx.array(1.0)
-        self.activation_level_pair = activation_levels(self.activation_bits)
-        self.freeze(
-            keys=["weight_mix_value", "activation_mix_value", "activation_level_pair"],
-            recurse=False,
-        )
 
         # kaiming_uniform_(a=sqrt(5)) reduces to U(-1/sqrt(fan_in), 1/sqrt(fan_in)).
         bound = 1.0 / math.sqrt(in_features)
@@ -163,54 +134,21 @@ class MLXHBitLinear(nn.Module):
         # instead of redoing abs-mean scale + threshold every matmul. None while training.
         self._pinned_weight: mx.array | None = None
 
-    def set_quantization_state(self, weight_mix: float, activation_mix: float, bits: int) -> None:
-        """Ramp quantisation strength. 0.0 is full precision, 1.0 fully quantised."""
-        if self.pinned_weight_mix is None:
-            self.weight_mix = float(min(max(weight_mix, 0.0), 1.0))
-        else:
-            self.weight_mix = self.pinned_weight_mix
-        self.activation_mix = float(min(max(activation_mix, 0.0), 1.0))
-        self.activation_bits = max(int(bits), 2)
-        self.weight_mix_value = mx.array(self.weight_mix)
-        self.activation_mix_value = mx.array(self.activation_mix)
-        self.activation_level_pair = activation_levels(self.activation_bits)
-
     def prepare_input(self, x: mx.array) -> mx.array:
         if self.use_hadamard:
             x = mx.hadamard_transform(x)
-        if not self.quantize_activations:
-            return x
-        # One fused kernel rather than the nine elementwise passes the
-        # expression form costs -- absmax, divide, round, clip, rescale, and the
-        # straight-through add. Measured 2-7x on the quantiser and 41-75% of a
-        # whole HBitLinear. Bit-identical output; the STE is the kernel's vjp.
-        quantized = ste_activation_quantize(x, self.activation_level_pair)
-        # One branch-free expression rather than early-returning on the mix. A
-        # Python `if` on a ramped value is evaluated once, at trace time, and
-        # baked into the compiled graph: the trainer starts the ramp at
-        # activation_mix=0.0, so the compiled step took the "return x" branch and
-        # never quantised activations again for the whole run. Measured -- a
-        # compiled forward at mix=0 and at mix=1 returned identical output.
-        # At mix=1 this is x + (q - x) = q with an identity gradient, and at
-        # mix=0 it is x, so nothing is lost but the early return.
-        return x + self.activation_mix_value * mx.stop_gradient(quantized - x)
+        return x
 
     def effective_weight(self) -> mx.array:
         if self._pinned_weight is not None:
             return self._pinned_weight
         weight = self.weight
-        if self.weight_mix <= 0.0:
-            return weight
         scale = mx.maximum(mx.mean(mx.abs(mx.stop_gradient(weight)), axis=-1, keepdims=True), 1e-5)
         normalized = weight / scale
         ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
-        if self.weight_mix >= 1.0:
-            # stop_gradient(q) + (w - stop_gradient(w)), not w + stop_gradient(q - w).
-            # Same value and same identity gradient, but the second form computes
-            # q - w, and the identity-initialised FFN mid has w ~ N against q ~ 1,
-            # so that subtraction loses most of its significant digits.
-            return mx.stop_gradient(ternary * scale) + (weight - mx.stop_gradient(weight))
-        return weight + self.weight_mix_value * mx.stop_gradient(ternary * scale - weight)
+        # BitNet STE: sg(q) + (w - sg(w)). Not w + sg(q - w) — that subtracts
+        # q-w and loses digits on the identity FFN mid (w ~ N, q ~ 1).
+        return mx.stop_gradient(ternary * scale) + (weight - mx.stop_gradient(weight))
 
     def pin_inference_weight(self) -> None:
         """Materialize one effective weight for the generation lifetime."""
@@ -224,7 +162,7 @@ class MLXHBitLinear(nn.Module):
         return self.forward_prepared(self.prepare_input(x))
 
     def forward_prepared(self, x: mx.array) -> mx.array:
-        """Project input prepared by a layer with matching activation settings."""
+        """Project input already prepared by an equivalent layer."""
         return x @ self.effective_weight().T
 
 
@@ -337,16 +275,8 @@ class MLXTernarySelfAttention(nn.Module):
         def heads(t):
             return t.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        same_preparation = all(
-            layer.activation_mix == self.q_proj.activation_mix
-            and layer.activation_bits == self.q_proj.activation_bits
-            for layer in (self.k_proj, self.v_proj)
-        )
-        prepared = self.q_proj.prepare_input(x) if same_preparation else None
-        q, k, v = (
-            heads(layer(x) if prepared is None else layer.forward_prepared(prepared))
-            for layer in (self.q_proj, self.k_proj, self.v_proj)
-        )
+        prepared = self.q_proj.prepare_input(x)
+        q, k, v = (heads(layer.forward_prepared(prepared)) for layer in (self.q_proj, self.k_proj, self.v_proj))
         return q, k, v
 
     def __call__(self, x: mx.array, attention_mask: mx.array | None = None) -> mx.array:
@@ -441,24 +371,13 @@ class MLXTernaryMLP(nn.Module):
         # scale is 1/N and the quantised weight comes out as eye(N)/N -- a 1/1024
         # attenuator, not a pass-through. eye(N)*N gives mean(|row|) = 1, so the
         # quantised weight is exactly eye(N).
-        #
-        # The weight mix is pinned with it: the straight-through blend
-        # (1-mix)*raw + mix*quantised only means anything when raw and quantised
-        # share a scale, and here they differ by N. Ramping this particular matrix
-        # would put it at 768x identity a quarter of the way through the ramp.
         self.mid_proj.weight = mx.eye(hidden_dim) * hidden_dim
-        self.mid_proj.pinned_weight_mix = 1.0
-        self.mid_proj.weight_mix = 1.0
         self.down_proj = MLXHBitLinear(hidden_dim, dim, config=config)
 
     def __call__(self, x: mx.array) -> mx.array:
-        same_preparation = (
-            self.gate_proj.activation_mix == self.up_proj.activation_mix
-            and self.gate_proj.activation_bits == self.up_proj.activation_bits
-        )
-        prepared = self.gate_proj.prepare_input(x) if same_preparation else None
-        gate = self.gate_proj(x) if prepared is None else self.gate_proj.forward_prepared(prepared)
-        up = self.up_proj(x) if prepared is None else self.up_proj.forward_prepared(prepared)
+        prepared = self.gate_proj.prepare_input(x)
+        gate = self.gate_proj.forward_prepared(prepared)
+        up = self.up_proj.forward_prepared(prepared)
         hidden = nn.silu(gate) * up
         return self.down_proj(nn.silu(self.mid_proj(hidden)))
 
@@ -542,19 +461,9 @@ class MLXTernaryCrossAttention(nn.Module):
             return t.reshape(batch_size, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = heads(self.q_proj(self.query_norm(query)), query_len)
-        same_preparation = (
-            self.k_proj.activation_mix == self.v_proj.activation_mix
-            and self.k_proj.activation_bits == self.v_proj.activation_bits
-        )
-        prepared = self.k_proj.prepare_input(normed_kv) if same_preparation else None
-        k = heads(
-            self.k_proj(normed_kv) if prepared is None else self.k_proj.forward_prepared(prepared),
-            kv_len,
-        )
-        v = heads(
-            self.v_proj(normed_kv) if prepared is None else self.v_proj.forward_prepared(prepared),
-            kv_len,
-        )
+        prepared = self.k_proj.prepare_input(normed_kv)
+        k = heads(self.k_proj.forward_prepared(prepared), kv_len)
+        v = heads(self.v_proj.forward_prepared(prepared), kv_len)
 
         bias, valid = combine_attention_bias(
             mask, base_bias=None, batch_size=batch_size, q_len=query_len, k_len=kv_len, dtype=q.dtype

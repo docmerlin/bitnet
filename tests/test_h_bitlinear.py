@@ -17,7 +17,6 @@ def test_hadamard_tensor_is_shared() -> bool:
         head_dim=4,
         intermediate_size=16,
         use_hadamard=True,
-        use_4bit_activations=False,
     )
     layer_a = HBitLinear(8, 8, config=cfg)
     layer_b = HBitLinear(8, 8, config=cfg)
@@ -48,7 +47,6 @@ def test_effective_weight_reuse_preserves_gradients() -> None:
         head_dim=4,
         intermediate_size=16,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
     reference = HBitLinear(8, 8, config=cfg)
     cached = HBitLinear(8, 8, config=cfg)

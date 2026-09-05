@@ -485,12 +485,7 @@ class InfiniAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        same_preparation = (
-            self.qkv.hadamard_size == self.path_w_down.hadamard_size
-            and self.qkv.enable_activation_quantization == self.path_w_down.enable_activation_quantization
-            and self.qkv.activation_bits == self.path_w_down.activation_bits
-            and self.qkv.activation_quantization_mix == self.path_w_down.activation_quantization_mix
-        )
+        same_preparation = self.qkv.hadamard_size == self.path_w_down.hadamard_size
         w = self._path_vectors(x, segment_ids, prepared_x if same_preparation else None)
         beta = 2.0 * torch.sigmoid(self.path_beta(x).float())
         log_forget = F.logsigmoid(self.path_forget(x).float())

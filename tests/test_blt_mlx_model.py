@@ -16,13 +16,8 @@ from blt.config import TernaryBLTConfig
 from blt.mlx_model import MLXTernaryBLTModel
 from blt.model import TernaryBLTModel
 
-# Loose because activation fake-quantisation makes this a comparison of two
-# rounding implementations, not two matmuls. At activation_bits=8 the scale is
-# 127x smaller, so x/scale is 127x larger and float differences between torch
-# and MLX cross an integer boundary far more often; a flip costs one full
-# quantisation step. The drift is concentrated in a handful of positions (the
-# rest sit at ~1e-8), which is the signature of boundary flips rather than a
-# systematic divergence.
+# Loose enough for float32 reassociation across torch vs MLX kernels; tight
+# enough to catch a convention error (half-split RoPE, RMSNorm eps drift).
 TOLERANCE = 2e-2
 
 
@@ -149,17 +144,7 @@ def test_torch_state_dict_loads_without_renaming():
     torch_names = set(torch_model.state_dict())
     from mlx.utils import tree_flatten
 
-    # Runtime quantisation state is excluded: weight_mix_value,
-    # activation_mix_value and activation_level_pair exist as MLX module state
-    # only so mx.compile treats them as graph inputs rather than baking them in
-    # as constants. The torch side holds the same values as plain Python
-    # attributes. They are scaffolding, not weights, and never transfer.
-    runtime_state = ("weight_mix_value", "activation_mix_value", "activation_level_pair")
-    mlx_names = {
-        name
-        for name, _ in tree_flatten(mlx_model.parameters())
-        if not name.endswith(runtime_state)
-    }
+    mlx_names = {name for name, _ in tree_flatten(mlx_model.parameters())}
     assert torch_names == mlx_names
 
 

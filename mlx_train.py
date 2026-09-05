@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import time
 from dataclasses import asdict
 from functools import partial
@@ -15,9 +16,10 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
-from config import effective_path_window
+from config import effective_path_window, migrate_quant_config
 from data.presets import parse_mixture
 from data.streams import build_batch_stream
+from dblocks.schedule import blocks_for_layer_width
 from mlx_model import MLXBitNet, MLXBitNetConfig
 from mlx_optim import CMUD
 from tokenizer.hierarchical_tokenizer import HierarchicalTokenizer
@@ -30,11 +32,9 @@ from training.token_progress import (
 
 
 _MEMORY_STATE_NAMES = (".memory_m", ".memory_z", ".memory_initialized")
-# Quantisation knobs that live as module state only so mx.compile treats them as
-# graph inputs rather than baking them in as constants. They are derived from the
-# training schedule, not learned, and set_quantization_state rebuilds them every
-# step -- so saving them bloats every checkpoint and makes the strict key
-# comparison below reject any file written by a build with a different set.
+# Retired mix/level arrays from the old activation-quant ramp. New models do
+# not store them; skip the names so old checkpoints still load and new files
+# do not keep leftover keys.
 _RUNTIME_QUANT_NAMES = (
     ".activation_levels",
     ".activation_level_pair",
@@ -64,6 +64,9 @@ RETIRED_CONFIG_FIELDS = frozenset(
         # MuonClip QK-Clip trial (removed after no-effect A/Bs at 2M / 540M).
         "qk_clip_threshold",
         "qk_clip_alpha",
+        "use_4bit_activations",
+        "quantize_activations",
+        "activation_bits",
     }
 )
 
@@ -77,6 +80,7 @@ def config_from_saved(saved_config: dict) -> MLXBitNetConfig:
             flush=True,
         )
     settings = {k: v for k, v in saved_config.items() if k not in RETIRED_CONFIG_FIELDS}
+    settings = migrate_quant_config(settings)
     if "engram_layer_ids" in settings:
         settings["engram_layer_ids"] = tuple(settings["engram_layer_ids"])
     return MLXBitNetConfig(**settings)
@@ -132,6 +136,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-num-loops", type=int, default=1)
     parser.add_argument("--loop-curriculum-start-ratio", type=float, default=0.0)
     parser.add_argument("--loop-curriculum-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--train-mode",
+        choices=("ar", "dblock"),
+        default="ar",
+        help="ar: next-token CE (default). dblock: DiffusionBlocks embedding-space denoiser.",
+    )
+    parser.add_argument(
+        "--dblock-blocks",
+        type=int,
+        default=1,
+        help="DiffusionBlocks B. 1 = Huginn unique stack. 4 = equal unique-layer slices.",
+    )
+    parser.add_argument(
+        "--dblock-layers-per-block",
+        type=int,
+        default=None,
+        help="Optional thin-block ablation: B = ceil(unique_layers / N). Overrides --dblock-blocks.",
+    )
+    parser.add_argument("--dblock-sigma-data", type=float, default=0.5)
+    parser.add_argument("--dblock-sigma-min", type=float, default=0.002)
+    parser.add_argument("--dblock-sigma-max", type=float, default=80.0)
+    parser.add_argument("--dblock-p-mean", type=float, default=-1.2)
+    parser.add_argument("--dblock-p-std", type=float, default=1.2)
+    parser.add_argument("--dblock-overlap", type=float, default=0.1)
+    parser.add_argument("--dblock-fourier-dim", type=int, default=64)
+    parser.add_argument("--dblock-cond-dim", type=int, default=128)
+    parser.add_argument(
+        "--dblock-infer",
+        choices=("euler", "loops"),
+        default="euler",
+        help="dblock generate: VE Euler (default) or debug loop-unroll.",
+    )
+    parser.add_argument(
+        "--dblock-euler-steps",
+        type=int,
+        default=50,
+        help="B=1 Euler evaluations of the unique stack (paper default 50). "
+        "Independent of --num-loops. B>1 infer still uses one step per block.",
+    )
     parser.add_argument(
         "--initial-blocks",
         type=int,
@@ -343,11 +386,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rfmoe-zipf-s", type=float, default=1.0)
     parser.add_argument("--rfmoe-uniform-alpha", type=float, default=0.1)
     parser.add_argument("--rfmoe-curriculum-ratio", type=float, default=0.0)
-    parser.add_argument("--stage1-ratio", type=float, default=0.12)
-    parser.add_argument("--stage1-weight-mix-start", type=float, default=0.25)
-    parser.add_argument("--stage1-activation-mix-start", type=float, default=0.0)
-    parser.add_argument("--stage1-activation-bits", type=int, default=8)
-    parser.add_argument("--final-activation-bits", type=int, default=8)
     parser.add_argument("--precision", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
@@ -378,6 +416,17 @@ def resolve_batch_seq_schedule(args: argparse.Namespace) -> tuple[int, int, int,
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    unique_layers = args.num_prelude_layers + args.num_recurrent_layers + args.num_coda_layers
+    if args.dblock_layers_per_block is not None:
+        if args.dblock_layers_per_block < 1:
+            raise ValueError("dblock-layers-per-block must be positive")
+        args.dblock_blocks = blocks_for_layer_width(unique_layers, args.dblock_layers_per_block)
+    if args.train_mode == "dblock":
+        args.mtp_depth = 0
+        if args.dblock_blocks < 1:
+            raise ValueError("dblock-blocks must be positive")
+        if args.dblock_blocks > max(unique_layers, 1):
+            raise ValueError("dblock-blocks cannot exceed unique layer count")
     if args.hidden_size % args.num_heads:
         raise ValueError("hidden-size must be divisible by num-heads")
     if args.sequence_length % args.path_window_size:
@@ -390,8 +439,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("mud-block-size must be positive")
     if args.clion_interval < 1:
         raise ValueError("clion-interval must be >= 1")
-    if min(args.stage1_activation_bits, args.final_activation_bits) < 2:
-        raise ValueError("activation bits must be at least 2")
     if not 0 <= args.mixture_switch_ratio <= 1:
         raise ValueError("mixture-switch-ratio must be between zero and one")
     if args.min_num_loops < 1:
@@ -549,6 +596,58 @@ def create_gradient_step(
                 )
             if mtp_losses:
                 loss = loss + mtp_loss_coef * mx.mean(mx.stack(mtp_losses))
+        if model.config.use_rfmoe:
+            density, locality, diversity, _ = model.rfmoe_aux_losses(rfmoe_s, rfmoe_alpha)
+            loss = loss + density_lam * density
+            loss = loss + locality_coef * locality + diversity_coef * diversity
+        return loss
+
+    gradient_step = nn.value_and_grad(model, loss_fn)
+    if compile_step and _compile_supported(model.config):
+        gradient_step = partial(mx.compile, inputs=model.state, outputs=model.state)(gradient_step)
+    return gradient_step
+
+
+def create_dblock_gradient_step(
+    model: MLXBitNet,
+    *,
+    compile_step: bool,
+    block_id: int,
+    z_loss_coef: float = 0.0,
+    logit_softcap: float = 0.0,
+    locality_coef: float = 0.0,
+    diversity_coef: float = 0.0,
+    gradient_checkpointing: bool | str = False,
+):
+    """Compiled denoiser step for one DiffusionBlock (Huginn if block_id is unused)."""
+
+    def loss_fn(
+        inputs,
+        targets,
+        segment_ids,
+        label_segment_ids,
+        density_lam,
+        rfmoe_s,
+        rfmoe_alpha,
+        sigma,
+        eps,
+        loss_weight,
+    ):
+        logits = model.dblock_logits(
+            inputs,
+            segment_ids,
+            sigma,
+            eps,
+            block_id=block_id,
+            checkpoint_activations=gradient_checkpointing,
+        )
+        # Reconstruct the noised tokens (inputs), not AR-shifted targets.
+        valid = mx.ones(inputs.shape, dtype=mx.bool_)
+        train_logits = softcap_logits(logits, logit_softcap)
+        loss = loss_weight * _masked_ce(train_logits, inputs, valid)
+        if z_loss_coef > 0:
+            log_z = mx.logsumexp(train_logits.astype(mx.float32), axis=-1)
+            loss = loss + z_loss_coef * mx.sum(mx.square(log_z) * valid) / mx.maximum(mx.sum(valid), 1)
         if model.config.use_rfmoe:
             density, locality, diversity, _ = model.rfmoe_aux_losses(rfmoe_s, rfmoe_alpha)
             loss = loss + density_lam * density
@@ -862,6 +961,45 @@ def evaluate(model: MLXBitNet, batches) -> dict[str, float]:
     return metrics
 
 
+def evaluate_dblock(
+    model: MLXBitNet,
+    batches,
+    sigmas: tuple[float, ...] = (0.1, 1.0, 10.0),
+) -> dict[str, float]:
+    """Denoise-CE at a fixed σ grid. Not AR perplexity."""
+    if not batches:
+        return {}
+    model.eval()
+    losses = []
+    per_sigma = {sigma: [] for sigma in sigmas}
+    hidden = model.config.hidden_size
+    block_ids = range(model.config.dblock_blocks)
+    for inputs, _targets, segments, _label_segments in batches:
+        valid = mx.ones(inputs.shape, dtype=mx.bool_)
+        for block_id in block_ids:
+            for sigma in sigmas:
+                eps = mx.random.normal((*inputs.shape, hidden))
+                logits = model.dblock_logits(
+                    inputs,
+                    segments,
+                    mx.array(sigma),
+                    eps,
+                    block_id=block_id,
+                )
+                # Average the grid equally; report unweighted CE (not EDM w(σ)).
+                loss = _masked_ce(logits, inputs, valid)
+                mx.eval(loss)
+                value = float(loss.item())
+                losses.append(value)
+                per_sigma[sigma].append(value)
+    model.train()
+    mean_loss = sum(losses) / len(losses)
+    metrics = {"val_loss": mean_loss, "val_denoise_ce": mean_loss}
+    for sigma, values in per_sigma.items():
+        metrics[f"val_denoise_ce_sigma_{sigma:g}"] = sum(values) / len(values)
+    return metrics
+
+
 def main() -> None:
     args = build_parser().parse_args()
     saved = None
@@ -927,6 +1065,18 @@ def main() -> None:
             dyt_alpha_init=args.dyt_alpha_init,
             skip_first_prelude_mlp=args.skip_first_prelude_mlp,
             skip_first_prelude_attn=args.skip_first_prelude_attn,
+            train_mode=args.train_mode,
+            dblock_blocks=args.dblock_blocks,
+            dblock_sigma_data=args.dblock_sigma_data,
+            dblock_sigma_min=args.dblock_sigma_min,
+            dblock_sigma_max=args.dblock_sigma_max,
+            dblock_p_mean=args.dblock_p_mean,
+            dblock_p_std=args.dblock_p_std,
+            dblock_overlap=args.dblock_overlap,
+            dblock_fourier_dim=args.dblock_fourier_dim,
+            dblock_cond_dim=args.dblock_cond_dim,
+            dblock_infer=args.dblock_infer,
+            dblock_euler_steps=args.dblock_euler_steps,
         )
     if args.compile and config.use_rfmoe and config.rfmoe_backend != "metal":
         print(
@@ -1042,6 +1192,14 @@ def main() -> None:
     print(f"Device: {mx.device_info()['device_name']}")
     print(f"Model parameters: {parameters / 1e6:.2f}M")
     print(f"Effective depth: {config.effective_depth}")
+    dblock_rng = random.Random(args.seed)
+    dblock_schedule = config.noise_schedule() if config.train_mode == "dblock" else None
+    if config.train_mode == "dblock":
+        print(
+            f"DiffusionBlocks: B={config.dblock_blocks} infer={config.dblock_infer} "
+            f"euler_steps={config.dblock_euler_steps} slices={config.dblock_layer_ranges()}",
+            flush=True,
+        )
     if initial_batch != final_batch or initial_seq != final_seq:
         print(
             f"Wall-clock curriculum: batch {initial_batch}->{final_batch} "
@@ -1102,6 +1260,8 @@ def main() -> None:
         active_loops = config.num_loops if args.loop_curriculum_ratio <= 0 else round(
             args.min_num_loops + loop_fraction * (config.num_loops - args.min_num_loops)
         )
+        if config.train_mode == "dblock":
+            active_loops = 1
         active_blocks = round(scheduled_value(
             args.initial_blocks,
             args.final_blocks,
@@ -1121,16 +1281,8 @@ def main() -> None:
         active_batch, active_seq = shapes.batch, shapes.seq
         tokens_this_step = shapes.tokens_per_step(args.grad_accumulation_steps)
         model.set_active_blocks(active_blocks)
-        quant_fraction = 1.0 if args.stage1_ratio <= 0 else min(progress / args.stage1_ratio, 1.0)
-        weight_mix = args.stage1_weight_mix_start + quant_fraction * (1.0 - args.stage1_weight_mix_start)
-        activation_mix = args.stage1_activation_mix_start + quant_fraction * (1.0 - args.stage1_activation_mix_start)
-        activation_bits = round(
-            args.stage1_activation_bits
-            - quant_fraction * (args.stage1_activation_bits - args.final_activation_bits)
-        )
-        model.set_quantization_state(weight_mix, activation_mix, activation_bits)
         model.recurrent_quantized_matmul = (
-            args.recurrent_quantized_matmul and active_seq >= 128 and weight_mix >= 1.0
+            args.recurrent_quantized_matmul and active_seq >= 128
         )
         rf_fraction = min(progress / max(args.rfmoe_curriculum_ratio, 1e-8), 1.0)
         if args.rfmoe_curriculum_ratio <= 0:
@@ -1138,33 +1290,77 @@ def main() -> None:
         rf_s = rf_fraction * args.rfmoe_zipf_s
         rf_alpha = 1.0 + rf_fraction * (args.rfmoe_uniform_alpha - 1.0)
         # Batch/seq enter the compile key: MLX traces shapes into the graph.
-        key = (active_loops, active_blocks, active_batch, active_seq, model.recurrent_quantized_matmul)
-        if key not in gradient_steps:
-            compile_gradient = _gradient_compile_safe(
-                config,
-                args.compile,
-                active_seq,
-                active_blocks,
-            )
-            gradient_step = create_gradient_step(
-                model,
-                compile_step=compile_gradient,
-                num_loops=active_loops,
-                z_loss_coef=args.z_loss_coef,
-                logit_softcap=args.logit_softcap,
-                mtp_loss_coef=args.mtp_loss_coef,
-                locality_coef=args.rfmoe_locality_coef,
-                diversity_coef=args.rfmoe_diversity_coef,
-                gradient_checkpointing=checkpoint_scope,
-            )
-            gradient_steps[key] = (gradient_step, compile_gradient)
-        gradient_step, gradient_is_compiled = gradient_steps[key]
+        compile_gradient = _gradient_compile_safe(
+            config,
+            args.compile,
+            active_seq,
+            active_blocks,
+        )
+        if config.train_mode == "dblock":
+            for block_id in range(config.dblock_blocks):
+                key = (
+                    active_loops,
+                    active_blocks,
+                    active_batch,
+                    active_seq,
+                    model.recurrent_quantized_matmul,
+                    "dblock",
+                    block_id,
+                )
+                if key not in gradient_steps:
+                    gradient_steps[key] = (
+                        create_dblock_gradient_step(
+                            model,
+                            compile_step=compile_gradient,
+                            block_id=block_id,
+                            z_loss_coef=args.z_loss_coef,
+                            logit_softcap=args.logit_softcap,
+                            locality_coef=args.rfmoe_locality_coef,
+                            diversity_coef=args.rfmoe_diversity_coef,
+                            gradient_checkpointing=checkpoint_scope,
+                        ),
+                        compile_gradient,
+                    )
+            gradient_step, gradient_is_compiled = None, compile_gradient
+        else:
+            key = (active_loops, active_blocks, active_batch, active_seq, model.recurrent_quantized_matmul)
+            if key not in gradient_steps:
+                gradient_step = create_gradient_step(
+                    model,
+                    compile_step=compile_gradient,
+                    num_loops=active_loops,
+                    z_loss_coef=args.z_loss_coef,
+                    logit_softcap=args.logit_softcap,
+                    mtp_loss_coef=args.mtp_loss_coef,
+                    locality_coef=args.rfmoe_locality_coef,
+                    diversity_coef=args.rfmoe_diversity_coef,
+                    gradient_checkpointing=checkpoint_scope,
+                )
+                gradient_steps[key] = (gradient_step, compile_gradient)
+            gradient_step, gradient_is_compiled = gradient_steps[key]
         active_stream = late_stream if late_stream is not None and progress >= args.mixture_switch_ratio else early_stream
         active_stream.set_shapes(micro_batch_size=active_batch, sequence_length=active_seq)
         step_started = time.perf_counter()
         accumulated_gradients = None
         losses = []
         hard_densities = []
+        dblock_block_id = None
+        dblock_sigma = None
+        dblock_weight = None
+        if config.train_mode == "dblock":
+            dblock_block_id = dblock_rng.randrange(config.dblock_blocks)
+            dblock_sigma = dblock_schedule.sample(dblock_block_id, dblock_rng)
+            dblock_weight = dblock_schedule.weight(dblock_sigma)
+            key = (
+                active_loops,
+                active_blocks,
+                active_batch,
+                active_seq,
+                model.recurrent_quantized_matmul,
+                "dblock",
+                dblock_block_id,
+            )
+            gradient_step, gradient_is_compiled = gradient_steps[key]
         for microbatch_index in range(args.grad_accumulation_steps):
             if args.profile_phases:
                 phase_started = time.perf_counter()
@@ -1177,7 +1373,16 @@ def main() -> None:
                 mx.array(rf_s),
                 mx.array(rf_alpha),
             ]
-            if config.mtp_depth > 0 and args.mtp_loss_coef > 0:
+            if config.train_mode == "dblock":
+                eps = mx.random.normal((*batch[0].shape, config.hidden_size))
+                gradient_args.extend(
+                    [
+                        mx.array(dblock_sigma),
+                        eps,
+                        mx.array(dblock_weight),
+                    ]
+                )
+            elif config.mtp_depth > 0 and args.mtp_loss_coef > 0:
                 index = mtp_head_index(step, microbatch_index, args.grad_accumulation_steps, config.mtp_depth)
                 gradient_args.extend(prepare_mtp_batch(batch[1], batch[2], batch[3], index, config.mtp_depth))
             if args.profile_phases:
@@ -1197,17 +1402,29 @@ def main() -> None:
                     "retrying gradients eagerly.",
                     flush=True,
                 )
-                gradient_step = create_gradient_step(
-                    model,
-                    compile_step=False,
-                    num_loops=active_loops,
-                    z_loss_coef=args.z_loss_coef,
-                    logit_softcap=args.logit_softcap,
-                    mtp_loss_coef=args.mtp_loss_coef,
-                    locality_coef=args.rfmoe_locality_coef,
-                    diversity_coef=args.rfmoe_diversity_coef,
-                    gradient_checkpointing=checkpoint_scope,
-                )
+                if config.train_mode == "dblock":
+                    gradient_step = create_dblock_gradient_step(
+                        model,
+                        compile_step=False,
+                        block_id=key[-1],
+                        z_loss_coef=args.z_loss_coef,
+                        logit_softcap=args.logit_softcap,
+                        locality_coef=args.rfmoe_locality_coef,
+                        diversity_coef=args.rfmoe_diversity_coef,
+                        gradient_checkpointing=checkpoint_scope,
+                    )
+                else:
+                    gradient_step = create_gradient_step(
+                        model,
+                        compile_step=False,
+                        num_loops=active_loops,
+                        z_loss_coef=args.z_loss_coef,
+                        logit_softcap=args.logit_softcap,
+                        mtp_loss_coef=args.mtp_loss_coef,
+                        locality_coef=args.rfmoe_locality_coef,
+                        diversity_coef=args.rfmoe_diversity_coef,
+                        gradient_checkpointing=checkpoint_scope,
+                    )
                 gradient_steps[key] = (gradient_step, False)
                 gradient_is_compiled = False
                 loss, gradients = gradient_step(*gradient_args)
@@ -1268,9 +1485,6 @@ def main() -> None:
                 "active_blocks": active_blocks,
                 "active_batch": active_batch,
                 "active_seq": active_seq,
-                "quant_weight_mix": weight_mix,
-                "quant_activation_mix": activation_mix,
-                "quant_activation_bits": activation_bits,
                 "time": time.time(),
             }
             if args.profile_phases:
@@ -1282,6 +1496,12 @@ def main() -> None:
                 )
                 profile_totals = dict.fromkeys(profile_totals, 0.0)
                 profile_steps = 0
+            if config.train_mode == "dblock":
+                metrics["dblock_block_id"] = dblock_block_id
+                metrics["dblock_sigma"] = dblock_sigma
+                metrics["dblock_weight"] = dblock_weight
+                if dblock_weight:
+                    metrics["denoise_ce"] = metrics["loss"] / dblock_weight
             if config.use_rfmoe:
                 metrics["rfmoe_density"] = sum(hard_densities) / len(hard_densities)
                 metrics["rfmoe_lambda"] = trainer_state["density_lambda"]
@@ -1291,7 +1511,11 @@ def main() -> None:
         if args.eval_interval > 0 and step % args.eval_interval == 0:
             if args.profile_phases:
                 validation_started = time.perf_counter()
-            validation = evaluate(model, validation_batches)
+            validation = (
+                evaluate_dblock(model, validation_batches)
+                if config.train_mode == "dblock"
+                else evaluate(model, validation_batches)
+            )
             if args.profile_phases and validation:
                 validation["profile_validation_seconds"] = time.perf_counter() - validation_started
             if validation:

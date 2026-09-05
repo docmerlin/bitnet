@@ -32,7 +32,6 @@ def build_config() -> TernaryBLTConfig:
         patch_size=3,
         max_patch_length=8,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
 
 
@@ -51,7 +50,6 @@ def build_teacher_config_with_wider_decoder() -> TernaryBLTConfig:
         patch_size=3,
         max_patch_length=8,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
 
 

@@ -28,7 +28,6 @@ def build_block() -> HybridTransformerBlock:
         attn_res_mode="sandwich",
         use_engram=False,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
     return HybridTransformerBlock(config)
 
@@ -161,7 +160,6 @@ def test_paper_memory_retrieve_matches_linear_formula() -> None:
             path_window_size=4,
             use_engram=False,
             use_hadamard=False,
-            use_4bit_activations=False,
         )
     )
     q = torch.randn(2, 2, 3, 8)

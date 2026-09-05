@@ -27,7 +27,6 @@ def _tiny_config() -> TernaryConfig:
         head_dim=8,
         intermediate_size=128,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
 
 

@@ -73,7 +73,6 @@ def test_bitnet_kimi_forward_and_loop_reset() -> bool:
         infini_memory_dim=8,
         use_engram=False,
         use_hadamard=False,
-        use_4bit_activations=False,
         attn_res_mode="kimi",
         attn_res_group_size=1,
     )
@@ -108,7 +107,6 @@ def test_sandwich_mode_still_works() -> bool:
         num_hidden_layers=2,
         use_engram=False,
         use_hadamard=False,
-        use_4bit_activations=False,
         attn_res_mode="sandwich",
         attn_res_init_scale=1.0,
     )

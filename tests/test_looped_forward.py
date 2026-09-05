@@ -23,7 +23,6 @@ def _tiny_looped(
         block_size=4,
         infini_memory_dim=8,
         use_hadamard=False,
-        use_4bit_activations=False,
         num_prelude_layers=prelude,
         num_recurrent_layers=recurrent,
         num_coda_layers=coda,

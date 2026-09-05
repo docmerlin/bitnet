@@ -16,6 +16,18 @@ def effective_path_window(
     return min(int(path_window_size), block_width)
 
 
+def migrate_quant_config(settings: dict) -> dict:
+    """Drop retired activation-quant keys so old checkpoints still load."""
+    settings = dict(settings)
+    for key in (
+        "use_4bit_activations",
+        "quantize_activations",
+        "activation_bits",
+    ):
+        settings.pop(key, None)
+    return settings
+
+
 def _nearest_odd_table_size(target: int) -> int:
     """Pick an odd table size near ``target`` (hash-friendly; avoid tiny tables)."""
     n = max(17, int(target) | 1)  # odd, at least 17
@@ -126,7 +138,6 @@ class TernaryConfig:
 
     # Ternary training / inference
     use_hadamard: bool = True
-    use_4bit_activations: bool = True
 
     # Routing-free MoE FFN (off by default -> dense GLU FFN)
     use_rfmoe: bool = False

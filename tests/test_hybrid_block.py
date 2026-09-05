@@ -30,7 +30,6 @@ def test_hybrid_block():
         attn_res_group_size=2,
         use_engram=False,
         use_hadamard=False,
-        use_4bit_activations=False,
     )
 
     block = HybridTransformerBlock(config, layer_id=0)

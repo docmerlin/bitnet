@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterator, Optional
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from config import TernaryConfig
+from config import TernaryConfig, migrate_quant_config
 from data.presets import parse_mixture
 from data.streams import PrefetchStream, build_batch_stream
 from layers.rfmoe import DensityController, iter_rfmoe, rfmoe_density, rfmoe_diversity_loss
@@ -45,7 +45,6 @@ from training.schedules import (
     lr_schedule_multiplier,
     rfmoe_staircase_schedule,
     update_block_growth,
-    update_quantization_schedule,
 )
 from utils import load_checkpoint_payload, seed_everything
 
@@ -256,11 +255,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooldown-steps", type=int, default=0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
 
-    parser.add_argument("--stage1-ratio", type=float, default=0.12)
-    parser.add_argument("--stage1-weight-mix-start", type=float, default=0.25)
-    parser.add_argument("--stage1-activation-mix-start", type=float, default=0.0)
-    parser.add_argument("--stage1-activation-bits", type=int, default=8)
-    parser.add_argument("--final-activation-bits", type=int, default=8)
     parser.add_argument(
         "--initial-blocks",
         type=int,
@@ -362,7 +356,9 @@ def main() -> None:
         saved_config = load_checkpoint_payload(Path(args.resume_from), map_location="cpu").get("model_config")
         if saved_config:
             valid_fields = {f.name for f in fields(TernaryConfig)}
-            checkpoint_config = {k: v for k, v in saved_config.items() if k in valid_fields}
+            checkpoint_config = {
+                k: v for k, v in migrate_quant_config(saved_config).items() if k in valid_fields
+            }
             checkpoint_config.setdefault("use_engram", False)
             model_config = TernaryConfig(**checkpoint_config)
     base_model = BitNetDeep(model_config)
@@ -490,7 +486,6 @@ def main() -> None:
     try:
         while state.step < total_steps and state.tokens_processed < args.total_tokens:
             train_progress = state.tokens_processed / max(args.total_tokens, 1)
-            quant_metrics = update_quantization_schedule(base_model, train_progress, args)
             active_blocks = update_block_growth(base_model, train_progress, args)
             active_loops = loop_count_for_progress(
                 train_progress,
@@ -626,7 +621,6 @@ def main() -> None:
                         "mixture_switch_ratio": args.mixture_switch_ratio,
                         **loop_metrics,
                         **rfmoe_metrics,
-                        **quant_metrics,
                     },
                 )
 

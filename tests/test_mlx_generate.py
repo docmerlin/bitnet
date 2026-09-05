@@ -72,7 +72,6 @@ def test_mlx_speculative_generation_matches_model_greedy() -> None:
         )
     )
     model.set_dtype(mx.bfloat16)
-    model.set_quantization_state(1.0, 1.0, 4)
     model.set_inference_block_width(2)
     mx.eval(model.parameters())
     propose, verify = model_callbacks(model)
@@ -202,7 +201,6 @@ def test_batched_cache_extension_matches_sequential_steps() -> None:
     )
     model = MLXBitNet(config)
     model.set_dtype(mx.bfloat16)
-    model.set_quantization_state(1.0, 1.0, 4)
     model.set_inference_block_width(2)
     cache = model.new_inference_cache(num_loops=2)
     model.prefill(mx.array([[1, 2, 3]]), cache)
@@ -246,7 +244,6 @@ def test_packed_inference_cache_matches_dense_and_reuses_weights() -> None:
     packed.load_weights(list(tree_flatten(dense.parameters())))
     for model in (dense, packed):
         model.set_dtype(mx.bfloat16)
-        model.set_quantization_state(1.0, 1.0, 4)
 
     dense_cache = dense.new_inference_cache()
     packed_cache = packed.new_inference_cache()
@@ -394,7 +391,6 @@ def test_pin_inference_weights_reuses_dense_or_packed() -> None:
     )
     model = MLXBitNet(config, recurrent_quantized_matmul=True)
     model.set_dtype(mx.bfloat16)
-    model.set_quantization_state(1.0, 1.0, 4)
     model.pin_inference_weights(mx.bfloat16, prefer_packed=False)
     linear = model.blocks[0].up
     assert linear._pinned_dense is not None
@@ -453,7 +449,6 @@ def test_compiled_inference_step_matches_eager(monkeypatch) -> None:
     compiled.load_weights(list(tree_flatten(eager.parameters())))
     for model in (eager, compiled):
         model.set_dtype(mx.bfloat16)
-        model.set_quantization_state(1.0, 1.0, 4)
         model.set_inference_block_width(2)
         model.inference_num_loops = 2
         model.path_decode_mode = "last"
@@ -506,7 +501,6 @@ def test_lazy_compiled_inference_failure_falls_back_to_eager(monkeypatch) -> Non
     fallback = MLXBitNet(config)
     fallback.load_weights(list(tree_flatten(eager.parameters())))
     for model in (eager, fallback):
-        model.set_quantization_state(1.0, 1.0, 4)
         model.set_inference_block_width(2)
 
     compile_calls = 0

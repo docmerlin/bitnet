@@ -19,7 +19,6 @@ def _attention() -> InfiniAttention:
         infini_memory_dim=4,
         use_engram=False,
         use_hadamard=False,
-        use_4bit_activations=False,
     ))
 
 
