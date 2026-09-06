@@ -9,6 +9,103 @@ from mlx_generate import greedy_generate, model_callbacks, speculative_greedy_ge
 from mlx_model import MLXBitNet, MLXBitNetConfig
 
 
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("valid_vocab_size", [None, 7])
+def test_callbacks_mask_all_heads_and_skip_unused_drafts(monkeypatch, speculative, valid_vocab_size):
+    model = MLXBitNet(MLXBitNetConfig(
+        vocab_size=16, hidden_size=8, num_attention_heads=2, intermediate_size=16,
+        num_prelude_layers=0, num_recurrent_layers=0, num_coda_layers=0,
+        use_engram=False, mtp_depth=2,
+    ))
+    draft_calls = []
+
+    def draft_logits(hidden):
+        assert speculative, "non-speculative generation must not evaluate draft heads"
+        draft_calls.append(True)
+        return mx.broadcast_to(mx.arange(16), (1, 2, 16))
+
+    monkeypatch.setattr(model, "draft_logits", draft_logits)
+    monkeypatch.setattr(
+        model, "logits_from",
+        lambda hidden: mx.broadcast_to(mx.arange(16), (*hidden.shape[:-1], 16)),
+    )
+    propose, verify = model_callbacks(
+        model, speculative=speculative, valid_vocab_size=valid_vocab_size,
+    )
+    expected = (valid_vocab_size or 16) - 1
+    proposals = propose([1, 2])
+    assert proposals == [expected] * (3 if speculative else 1)
+    verified, drafts = verify([1, 2], proposals)
+    assert verified == [expected] * len(proposals)
+    assert drafts == ([expected, expected] if speculative else [])
+    if speculative:
+        assert len(draft_calls) == 2
+        tokens = speculative_greedy_generate([1, 2], 6, propose, verify)
+    else:
+        tokens = greedy_generate([1, 2], 6, propose)
+    assert tokens == [1, 2] + [expected] * 6
+    assert model.embedding.weight.shape[0] == 16
+
+
+@pytest.mark.parametrize("valid_vocab_size", [0, -1, 17])
+def test_generation_rejects_invalid_vocabulary_bound(valid_vocab_size):
+    from mlx_generate import _generation_argmax
+
+    with pytest.raises(ValueError, match="valid_vocab_size"):
+        _generation_argmax(mx.zeros((1, 16)), valid_vocab_size)
+
+
+@pytest.mark.parametrize("mode,speculative", [("ar", False), ("ar", True), ("dblock", False)])
+def test_cli_uses_defined_vocab_and_effective_speculation(monkeypatch, mode, speculative):
+    import sys
+    import mlx_generate
+
+    model = MLXBitNet(MLXBitNetConfig(
+        vocab_size=16, hidden_size=8, num_attention_heads=2, intermediate_size=16,
+        num_prelude_layers=1, num_recurrent_layers=0, num_coda_layers=0,
+        num_loops=1, use_engram=False, mtp_depth=2 if mode == "ar" else 0,
+        train_mode=mode,
+    ))
+    model.inference_num_loops = 1
+    draft_calls = []
+
+    class Tokenizer:
+        bos_id, eos_id = 1, 5
+
+        def __init__(self, *, max_patch_size, vocab_size_target):
+            assert vocab_size_target == 16  # Rebuild IDs using the checkpoint's target.
+
+        def __len__(self):
+            return 7
+
+        def encode(self, prompt):
+            return [1, 2]
+
+        def decode(self, tokens):
+            assert tokens == [1, 2, 6, 6, 6]
+            return "decoded"
+
+    def draft_logits(hidden):
+        assert speculative
+        draft_calls.append(True)
+        return mx.broadcast_to(mx.arange(16), (1, 2, 16))
+
+    monkeypatch.setattr(model, "draft_logits", draft_logits)
+    monkeypatch.setattr(
+        model, "logits_from",
+        lambda hidden: mx.broadcast_to(mx.arange(16), (*hidden.shape[:-1], 16)),
+    )
+    monkeypatch.setattr(mlx_generate, "load_model", lambda *args, **kwargs: (model, {}))
+    monkeypatch.setattr(mlx_generate, "HierarchicalTokenizer", Tokenizer)
+    monkeypatch.setattr(sys, "argv", [
+        "mlx_generate.py", "unused.safetensors", "--prompt", "x", "--max-new-tokens", "3",
+        "--dblock-euler-steps", "1", "--speculative" if speculative else "--no-speculative",
+    ])
+    mlx_generate.main()
+    assert bool(draft_calls) == speculative
+    assert model.config.vocab_size == model.embedding.weight.shape[0] == 16
+
+
 def test_speculative_greedy_matches_vanilla_on_acceptance_and_rejection() -> None:
     sequence = [1, 2, 3, 4, 5, 6, 7]
 
@@ -259,8 +356,7 @@ def test_packed_inference_cache_matches_dense_and_reuses_weights() -> None:
     assert mx.allclose(actual, expected, rtol=1e-2, atol=1e-2).item()
     assert mx.allclose(actual_next, expected_next, rtol=1e-2, atol=1e-2).item()
     assert any(key[1].startswith("packed-") for key in packed_cache.weight_cache)
-    # Prefill-populated packed entries must be reused (same object ids), even if decode
-    # touches additional packed keys via the M=1 fused path.
+    # Prefill-populated packed entries must be reused (same object ids) during decode.
     after = {key: id(value) for key, value in packed_cache.weight_cache.items()}
     for key, value_id in cached_weights.items():
         assert after.get(key) == value_id

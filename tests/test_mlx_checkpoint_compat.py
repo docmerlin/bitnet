@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import mlx.core as mx
@@ -69,6 +70,37 @@ def test_a_checkpoint_round_trips(tmp_path) -> None:
         if key.endswith(_RUNTIME_QUANT_NAMES) or value.size == 0:
             continue
         assert float(mx.max(mx.abs(value - after[key]))) == 0.0, key
+
+
+def test_cli_resume_keeps_legacy_vocab_dimensions(monkeypatch, tmp_path):
+    import mlx_train
+
+    checkpoint = tmp_path / "legacy.safetensors"
+    checkpoint.with_suffix(".json").write_text(json.dumps({
+        "model_config": asdict(_config(vocab_size=32768)),
+        "training_args": {"tokenizer_max_patch_size": 8},
+    }))
+
+    class Tokenizer:
+        def __init__(self, **kwargs):
+            assert kwargs == {"max_patch_size": 8, "vocab_size_target": 32768}
+
+        def __len__(self):
+            return 1067
+
+    class ConfigVerified(Exception):
+        pass
+
+    def build_model(config):
+        assert config.vocab_size == 32768
+        raise ConfigVerified
+
+    monkeypatch.setattr(mlx_train, "HierarchicalTokenizer", Tokenizer)
+    monkeypatch.setattr(mlx_train, "MLXBitNet", build_model)
+    monkeypatch.setattr("sys.argv", ["mlx_train", "--resume-from", str(checkpoint),
+                                    "--output-dir", str(tmp_path)])
+    with pytest.raises(ConfigVerified):
+        mlx_train.main()
 
 
 def test_config_from_saved_drops_retired_fields() -> None:

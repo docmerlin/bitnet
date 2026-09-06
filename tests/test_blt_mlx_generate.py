@@ -125,15 +125,22 @@ def test_generation_stops_at_eos(speculation_window):
     assert np.array_equal(np.asarray(tokens), np.asarray(baseline))
 
 
-def test_entropy_patcher_drives_generation():
-    config = _config()
+@pytest.mark.parametrize("cap_only", [False, True])
+def test_entropy_patcher_drives_generation(cap_only):
+    config = _config(max_patch_length=3 if cap_only else 32)
     _, mlx_model = _pair(config)
     mx.random.seed(0)
     patcher = MLXByteEntropyModel(config, dim=32, num_layers=1, num_heads=4, max_seq_len=128)
     mx.eval(patcher.parameters())
     calibrate_threshold(patcher, mx.array(_prompt(64, seed=5)), target_patch_size=4.0)
+    if cap_only:
+        patcher.set_threshold(100.0)
 
-    reference = None
+    reference = mx.array(_prompt())
+    for _ in range(20):
+        output = mlx_model(reference, patch_lengths=patcher.predict_patch_lengths(reference))
+        reference = mx.concatenate([reference, mx.argmax(output.logits[:, -1:], axis=-1)], axis=1)
+        mx.eval(reference)
     for window in (0, 4, 8):
         tokens, stats = generate(
             mlx_model,
@@ -141,9 +148,8 @@ def test_entropy_patcher_drives_generation():
             max_new_bytes=20,
             patcher=patcher,
             speculation_window=window,
+            eos_id=-1,
         )
-        if reference is None:
-            reference = tokens
         # An entropy patcher predicts, so even the baseline drifts past bytes
         # rather than re-patching each one.
         assert stats.bytes_per_global_pass > 1.0

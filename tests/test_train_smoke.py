@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -110,6 +111,81 @@ def test_checkpoint_save_load_roundtrip() -> bool:
 
     print("BitNet checkpoint round-trip smoke tests passed")
     return True
+
+
+@pytest.mark.parametrize("checkpoint_step", [2, 7, 9])
+def test_cli_resume_preserves_nondefault_lr_schedule_and_vocab(monkeypatch, tmp_path, checkpoint_step):
+    import train
+    from torch.optim.lr_scheduler import LambdaLR
+    from training.schedules import lr_schedule_multiplier
+
+    args = train.build_arg_parser().parse_args([
+        "--total-tokens", "160", "--micro-batch-size", "1", "--sequence-length", "8",
+        "--grad-accumulation-steps", "2", "--path-window-size", "4",
+        "--warmup-steps", "3", "--cooldown-steps", "2", "--min-lr-ratio", "0.37",
+        "--learning-rate", "0.007", "--mud-learning-rate", "0.013",
+        "--vocab-size", "32768", "--tokenizer-max-patch-size", "6",
+    ])
+    config = _tiny_config()
+    config.path_window_size = 4
+    model = BitNetDeep(config)
+
+    def optimizer_for(model, args):
+        parameters = list(model.parameters())
+        return torch.optim.SGD([
+            {"params": parameters[:1], "lr": args.learning_rate},
+            {"params": parameters[1:], "lr": args.mud_learning_rate},
+        ])
+
+    optimizer = optimizer_for(model, args)
+    scheduler = LambdaLR(optimizer, lambda step: lr_schedule_multiplier(step, 10, 3, 2, 0.37))
+    for _ in range(checkpoint_step):
+        optimizer.step()
+        scheduler.step()
+    checkpoint = save_checkpoint(tmp_path, model, optimizer, scheduler, None,
+                                 TrainerState(step=checkpoint_step), config, args, "resume.pt")
+    expected = [scheduler.get_last_lr()]
+    for _ in range(checkpoint_step, 11):
+        optimizer.step()
+        scheduler.step()
+        expected.append(scheduler.get_last_lr())
+
+    class Tokenizer:
+        def __init__(self, **kwargs):
+            assert kwargs == {"max_patch_size": 6, "vocab_size_target": 32768}
+
+        def __len__(self):
+            return 260
+
+    class ResumeVerified(Exception):
+        pass
+
+    def check_resume(path, restored_model, restored_optimizer, restored_scheduler, scaler):
+        load_checkpoint(path, restored_model, restored_optimizer, restored_scheduler, scaler)
+        assert restored_model.config.vocab_size == 512  # Not the new tokenizer length.
+        actual = [restored_scheduler.get_last_lr()]
+        for _ in range(checkpoint_step, 11):
+            restored_optimizer.step()
+            restored_scheduler.step()
+            actual.append(restored_scheduler.get_last_lr())
+        assert actual == expected
+        raise ResumeVerified
+
+    monkeypatch.setattr(train, "HierarchicalTokenizer", Tokenizer)
+    monkeypatch.setattr(train, "create_optimizer", optimizer_for)
+    monkeypatch.setattr(train, "build_batch_stream", lambda *args, **kwargs: iter(()))
+    monkeypatch.setattr(train, "load_checkpoint", check_resume)
+    monkeypatch.setattr("sys.argv", ["train", "--resume-from", str(checkpoint),
+                                    "--output-dir", str(tmp_path), "--device", "cpu"])
+    with pytest.raises(ResumeVerified):
+        train.main()
+
+
+def test_resume_rejects_missing_schedule_configuration():
+    from training.checkpoint import restore_resume_args
+
+    with pytest.raises(ValueError, match="Cannot resume LR schedule"):
+        restore_resume_args(argparse.Namespace(), {})
 
 
 def test_soft_resume_pre_mid_checkpoint_identity_inits_mid() -> bool:

@@ -18,7 +18,7 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from config import effective_path_window, migrate_quant_config
 from data.presets import parse_mixture
-from data.streams import build_batch_stream
+from data.streams import EmptyPartitionError, build_batch_stream
 from dblocks.schedule import blocks_for_layer_width
 from mlx_model import MLXBitNet, MLXBitNetConfig
 from mlx_optim import CMUD
@@ -95,13 +95,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--late-train-mixture", default="")
     parser.add_argument("--mixture-switch-ratio", type=float, default=0.7)
     parser.add_argument("--val-mixture", default="fineweb_edu=0.5,dclm=0.5")
-    parser.add_argument("--validation-offset-examples", type=int, default=25000)
+    parser.add_argument("--validation-offset-examples", type=int, default=25000,
+                        help="Raw records to skip before selecting the stable 1%% validation holdout.")
     parser.add_argument("--validation-batches", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--shuffle-buffer-size", type=int, default=1000)
     parser.add_argument("--max-document-tokens", type=int, default=32768)
     parser.add_argument("--tokenizer-max-patch-size", type=int, default=8)
-    parser.add_argument("--vocab-size", type=int, default=32768)
+    parser.add_argument("--vocab-size", type=int, default=32768,
+                        help="Tokenizer merge-vocabulary ceiling; new models use the actual defined ID count.")
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--num-heads", type=int, default=16)
     parser.add_argument("--intermediate-size", type=int, default=1024)
@@ -901,19 +903,24 @@ def lr_multiplier(
 def build_validation_batches(tokenizer, args) -> list[tuple[mx.array, mx.array, mx.array, mx.array]]:
     if args.validation_batches <= 0:
         return []
-    stream = build_batch_stream(
-        parse_mixture(args.val_mixture),
-        tokenizer,
-        seed=args.seed + 999,
-        shuffle=False,
-        shuffle_buffer_size=args.shuffle_buffer_size,
-        skip_examples=args.validation_offset_examples,
-        restart_on_eof=True,
-        sequence_length=args.sequence_length,
-        max_document_tokens=args.max_document_tokens,
-        micro_batch_size=args.micro_batch_size,
-    )
-    return [convert_batch(next(stream)) for _ in range(args.validation_batches)]
+    try:
+        stream = build_batch_stream(
+            parse_mixture(args.val_mixture),
+            tokenizer,
+            seed=args.seed + 999,
+            shuffle=False,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            skip_examples=args.validation_offset_examples,
+            partition="validation",
+            restart_on_eof=True,
+            sequence_length=args.sequence_length,
+            max_document_tokens=args.max_document_tokens,
+            micro_batch_size=args.micro_batch_size,
+        )
+        return [convert_batch(next(stream)) for _ in range(args.validation_batches)]
+    except EmptyPartitionError as exc:
+        print(f"Warning: validation skipped; {exc}", flush=True)
+        return []
 
 
 def evaluate(model: MLXBitNet, batches) -> dict[str, float]:
@@ -1141,6 +1148,7 @@ def main() -> None:
         shuffle=True,
         shuffle_buffer_size=args.shuffle_buffer_size,
         skip_examples=0,
+        partition="train",
         restart_on_eof=True,
         sequence_length=initial_seq,
         max_document_tokens=args.max_document_tokens,
@@ -1155,6 +1163,7 @@ def main() -> None:
             shuffle=True,
             shuffle_buffer_size=args.shuffle_buffer_size,
             skip_examples=0,
+            partition="train",
             restart_on_eof=True,
             sequence_length=initial_seq,
             max_document_tokens=args.max_document_tokens,
@@ -1162,8 +1171,12 @@ def main() -> None:
         )
     if args.resume_from:
         stream_state = saved.get("stream_state")
-        if stream_state is None:
-            print("Warning: checkpoint has no dataset stream state; training data restarts.", flush=True)
+        if stream_state is None or stream_state.get("partition") != "text_hash_v1":
+            print(
+                "Warning: checkpoint has no partitioned dataset stream state; "
+                "training data restarts with the disjoint validation holdout.",
+                flush=True,
+            )
         else:
             early_stream.load_state_dict(stream_state["early"])
             if late_stream is not None and stream_state.get("late") is not None:
@@ -1171,6 +1184,7 @@ def main() -> None:
 
     def current_stream_state() -> dict:
         return {
+            "partition": "text_hash_v1",
             "early": early_stream.state_dict(),
             "late": late_stream.state_dict() if late_stream is not None else None,
         }

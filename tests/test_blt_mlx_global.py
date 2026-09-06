@@ -194,14 +194,35 @@ def test_fixed_patch_count_takes_precedence_over_length_cap(monkeypatch):
     assert int(mx.sum(lengths)) == 16
 
 
-def test_boundaries_by_count_picks_the_highest_entropy_positions():
+def test_boundaries_by_count_is_uniform_and_ignores_future_entropy():
     from blt.mlx_entropy_model import boundaries_by_count
 
     entropy = mx.array([[0.1, 9.0, 0.2, 8.0, 0.3, 0.4]])
-    # entropy[j-1] decides position j, so 9.0 at index 1 opens position 2.
+    # Same shape/count fixes positions; suffix entropy cannot displace a start.
     assert np.asarray(boundaries_by_count(entropy, 3))[0].tolist() == [
         True, False, True, False, True, False
     ]
+    changed = mx.array([[0.1, 9.0, 0.2, 80.0, 90.0, 100.0]])
+    assert np.array_equal(
+        np.asarray(boundaries_by_count(entropy, 3)),
+        np.asarray(boundaries_by_count(changed, 3)),
+    )
+
+
+@pytest.mark.parametrize("count", [1, 3, 7])
+def test_fixed_count_is_uniform_without_running_entropy(monkeypatch, count):
+    from blt.mlx_entropy_model import MLXByteEntropyModel
+
+    patcher = MLXByteEntropyModel(_config(), dim=32, num_layers=1, num_heads=4)
+
+    def fail(_):
+        raise AssertionError("Fixed positional patching must not run the entropy model")
+
+    monkeypatch.setattr(patcher, "entropy", fail)
+    lengths = np.asarray(patcher.predict_patch_lengths(_tokens(2, 7), num_patches=count))
+    assert lengths.shape == (2, count)
+    assert np.all(lengths.sum(axis=1) == 7)
+    assert lengths.max() - lengths.min() <= 1
 
 
 def test_boundaries_by_count_rejects_an_impossible_count():

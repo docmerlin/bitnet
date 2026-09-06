@@ -27,7 +27,7 @@ from data.presets import parse_mixture
 from data.streams import PrefetchStream, build_batch_stream
 from layers.rfmoe import DensityController, iter_rfmoe, rfmoe_density, rfmoe_diversity_loss
 from model import BitNetDeep
-from training.checkpoint import TrainerState, load_checkpoint, save_checkpoint
+from training.checkpoint import TrainerState, load_checkpoint, restore_resume_args, save_checkpoint
 from training.losses import compute_train_loss
 from training.runtime import (
     JsonlLogger,
@@ -97,10 +97,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="fineweb_edu=0.45,code_search_net_all=0.20,finemath_3plus=0.35",
     )
     parser.add_argument("--shuffle-buffer-size", type=int, default=10_000)
-    parser.add_argument("--validation-offset-examples", type=int, default=25_000)
+    parser.add_argument("--validation-offset-examples", type=int, default=25_000,
+                        help="Raw records to skip before selecting the stable 1%% validation holdout.")
     parser.add_argument("--max-document-tokens", type=int, default=32_768)
     parser.add_argument("--tokenizer-max-patch-size", type=int, default=8)
-    parser.add_argument("--vocab-size", type=int, default=131_072)
+    parser.add_argument("--vocab-size", type=int, default=131_072,
+                        help="Tokenizer merge-vocabulary ceiling; new models use the actual defined ID count.")
 
     parser.add_argument("--hidden-size", type=int, default=defaults.hidden_size)
     parser.add_argument(
@@ -306,6 +308,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    saved_config = None
+    if args.resume_from:
+        payload = load_checkpoint_payload(Path(args.resume_from), map_location="cpu")
+        restore_resume_args(args, payload.get("args", {}))
+        saved_config = payload.get("model_config")
+        del payload
     _validate_sequence_path_window(args)
 
     if args.hidden_size % args.num_heads != 0:
@@ -352,15 +360,13 @@ def main() -> None:
         vocab_size_target=args.vocab_size,
     )
     model_config = build_model_config(args, tokenizer)
-    if args.resume_from:
-        saved_config = load_checkpoint_payload(Path(args.resume_from), map_location="cpu").get("model_config")
-        if saved_config:
-            valid_fields = {f.name for f in fields(TernaryConfig)}
-            checkpoint_config = {
-                k: v for k, v in migrate_quant_config(saved_config).items() if k in valid_fields
-            }
-            checkpoint_config.setdefault("use_engram", False)
-            model_config = TernaryConfig(**checkpoint_config)
+    if saved_config:
+        valid_fields = {f.name for f in fields(TernaryConfig)}
+        checkpoint_config = {
+            k: v for k, v in migrate_quant_config(saved_config).items() if k in valid_fields
+        }
+        checkpoint_config.setdefault("use_engram", False)
+        model_config = TernaryConfig(**checkpoint_config)
     base_model = BitNetDeep(model_config)
     base_model.gradient_checkpointing = args.gradient_checkpointing
     base_model.checkpoint_granularity = args.checkpoint_granularity
@@ -446,6 +452,7 @@ def main() -> None:
             shuffle=True,
             shuffle_buffer_size=args.shuffle_buffer_size,
             skip_examples=0,
+            partition="train",
             restart_on_eof=True,
             sequence_length=args.sequence_length,
             max_document_tokens=args.max_document_tokens,
@@ -463,6 +470,7 @@ def main() -> None:
                 shuffle=True,
                 shuffle_buffer_size=args.shuffle_buffer_size,
                 skip_examples=0,
+                partition="train",
                 restart_on_eof=True,
                 sequence_length=args.sequence_length,
                 max_document_tokens=args.max_document_tokens,

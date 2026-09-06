@@ -212,12 +212,15 @@ def test_generation_treats_the_entropy_model_as_predictive():
 
 
 @pytest.mark.parametrize("speculation_window", [0, 4, 8])
-def test_speculation_still_matches_the_reference_under_entropy_patching(speculation_window):
-    config = _config()
+@pytest.mark.parametrize("cap_only", [False, True])
+def test_speculation_still_matches_the_reference_under_entropy_patching(speculation_window, cap_only):
+    config = _config(max_patch_length=3 if cap_only else 32)
     torch.manual_seed(0)
     model = TernaryBLTModel(config).eval()
     entropy = _entropy_model(config)
     calibrate_threshold(entropy, torch.randint(4, 260, (2, 128)), target_patch_size=4.0)
+    if cap_only:
+        entropy.set_threshold(100.0)
     prompt = torch.randint(config.offset, config.offset + 256, (1, 8))
 
     patching = _Patching(entropy)
@@ -235,6 +238,22 @@ def test_speculation_still_matches_the_reference_under_entropy_patching(speculat
         model, prompt, max_new_bytes=20, patcher=entropy, speculation_window=speculation_window
     )
     assert torch.equal(tokens, reference)
+
+
+@pytest.mark.parametrize("cap", [0, 1, 3, 8])
+def test_next_patch_decision_shares_capped_segmentation(monkeypatch, cap):
+    model = _entropy_model(_config(max_patch_length=cap or 32))
+    model.max_patch_length = cap
+    # Row 1 includes an entropy boundary that resets the cap clock.
+    entropy = torch.tensor([[0.0] * 17, [0.0, 9.0] + [0.0] * 15])
+    monkeypatch.setattr(model, "entropy", lambda ids: entropy[:, :ids.size(1)])
+    tokens = torch.ones(2, 17, dtype=torch.long)
+    for cut in range(1, 17):
+        lengths = model.predict_patch_lengths(tokens[:, :cut + 1], threshold=1.0)
+        starts = (lengths.cumsum(dim=1)[:, :-1] == cut).any(dim=1)
+        assert torch.equal(model.opens_new_patch(tokens[:, :cut], threshold=1.0), starts)
+        if cap:
+            assert int(lengths.max()) <= cap
 
 
 def test_oversized_sequence_is_refused():

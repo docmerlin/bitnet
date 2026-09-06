@@ -224,9 +224,10 @@ class InfiniAttention(nn.Module):
         """Softmax attention over the top-k most similar whole blocks before ``start``.
 
         Mirrors ``mlx_model.MLXPaTHAttention._topk_context``: past tokens are split
-        into ``topk_block_size`` blocks, scored by mean-key against the chunk's mean
+        into ``topk_block_size`` blocks, scored by mean-key against the chunk's first
         query, and the best ``topk_blocks`` are attended in full. Selected tokens all
-        precede the chunk, so causality needs no mask.
+        precede the chunk, and shared selection cannot depend on later queries,
+        so causality needs no mask.
         """
         block = int(self.config.topk_block_size)
         num_blocks = start // block
@@ -239,7 +240,7 @@ class InfiniAttention(nn.Module):
         value_blocks = v[:, :, : num_blocks * block].reshape(shape)
 
         summary = key_blocks.float().mean(dim=3)
-        probe = q_chunk.float().mean(dim=2, keepdim=True)
+        probe = q_chunk[:, :, :1].float()
         scores = (summary * probe).sum(dim=-1)
         chosen = scores.topk(take, dim=-1).indices[..., None, None]
         chosen = chosen.expand(-1, -1, -1, block, dim)

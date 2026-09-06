@@ -212,6 +212,23 @@ class CMUD(Optimizer):
         }
         super().__init__(params, defaults)
 
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # Optimizer's default loader casts all buffers to the parameter dtype.
+        # Keep quantized buffers out of that cast to avoid a transient 4x expansion
+        # and preserve scales before loading into reduced-precision parameters.
+        quantized_keys = {"exp_avg_q": torch.int8, "exp_avg_scale": torch.float32}
+        ordinary_state = {
+            key: {name: value for name, value in state.items() if name not in quantized_keys}
+            for key, state in state_dict["state"].items()
+        }
+        super().load_state_dict({**state_dict, "state": ordinary_state})
+        for saved_group, group in zip(state_dict["param_groups"], self.param_groups):
+            for saved_id, param in zip(saved_group["params"], group["params"]):
+                saved_state = state_dict["state"].get(saved_id, {})
+                for name, dtype in quantized_keys.items():
+                    if name in saved_state:
+                        self.state[param][name] = saved_state[name].to(device=param.device, dtype=dtype)
+
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[torch.Tensor]:
         loss = None

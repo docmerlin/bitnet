@@ -150,6 +150,23 @@ def test_opens_new_patch_matches_torch():
         assert np.array_equal(actual, expected)
 
 
+@pytest.mark.parametrize("cap", [0, 1, 3, 8])
+def test_next_patch_decision_shares_capped_segmentation(monkeypatch, cap):
+    _, model = _pair()
+    model.max_patch_length = cap
+    entropy = mx.array([[0.0] * 17, [0.0, 9.0] + [0.0] * 15])
+    monkeypatch.setattr(model, "entropy", lambda ids: entropy[:, :ids.shape[1]])
+    tokens = mx.ones((2, 17), dtype=mx.int32)
+    for cut in range(1, 17):
+        lengths = model.predict_patch_lengths(tokens[:, :cut + 1], threshold=1.0)
+        starts = mx.any(mx.cumsum(lengths, axis=1)[:, :-1] == cut, axis=1)
+        assert np.array_equal(
+            np.asarray(model.opens_new_patch(tokens[:, :cut], threshold=1.0)), np.asarray(starts)
+        )
+        if cap:
+            assert int(mx.max(lengths)) <= cap
+
+
 def test_calibration_agrees_across_stacks():
     torch_model, mlx_model = _pair()
     tokens = _tokens(batch=4, seq=64, seed=5)

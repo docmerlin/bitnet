@@ -87,8 +87,8 @@ class TrainingConfig:
     # Ignored when patches_per_sequence is set, and unsafe with the BitNet
     # global backbone -- see blt.mlx_global.
     patch_bucket: int = 32
-    # Fixed patches per sequence. Gives stable shapes without any padding, which
-    # is what the BitNet global backbone needs to run compiled.
+    # Fixed positional uniform patches, not entropy-ranked. Gives causal, stable
+    # shapes without padding, which the BitNet backbone needs to run compiled.
     patches_per_sequence: int | None = None
     grad_accumulation_steps: int = 1
     mtp_loss_coef: float = 0.3

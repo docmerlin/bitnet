@@ -64,32 +64,19 @@ def boundaries_from_entropy(
 
 
 def boundaries_by_count(entropy: mx.array, num_patches: int) -> mx.array:
-    """Boundary mask with exactly ``num_patches`` patches per row.
+    """Uniform positional boundaries with exactly ``num_patches`` per row.
 
-    Same rule as the threshold version -- a boundary goes where the model was
-    least sure about the byte -- but the cutoff is chosen per row so the count
-    comes out fixed. Position 0 always starts a patch, so ``num_patches - 1``
-    boundaries are selected from the remaining positions.
+    Only the shape is used: ranking entropy across a sequence lets future bytes
+    change earlier boundaries. For a fixed sequence length/count, these starts
+    are content-independent and causal, with widths differing by at most one.
     """
     batch, seq_len = entropy.shape
     if not 0 < num_patches <= seq_len:
         raise ValueError(f"num_patches must be in (0, {seq_len}]")
-    leading = mx.ones((batch, 1), dtype=mx.bool_)
-    if seq_len == 1 or num_patches == 1:
-        return mx.concatenate([leading, mx.zeros((batch, seq_len - 1), dtype=mx.bool_)], axis=1)
-
-    predicted = entropy[:, :-1]  # entropy[j - 1] decides position j
-    wanted = num_patches - 1
-    # Rank descending and keep the top `wanted`; scatter back to positions.
-    order = mx.argsort(-predicted, axis=1)
-    ranks = mx.zeros(order.shape, dtype=mx.int32)
-    ranks = mx.put_along_axis(
-        ranks,
-        order,
-        mx.broadcast_to(mx.arange(predicted.shape[1], dtype=mx.int32)[None], order.shape),
-        axis=1,
-    )
-    return mx.concatenate([leading, ranks < wanted], axis=1)
+    positions = mx.arange(seq_len)
+    patch_ids = positions * num_patches // seq_len
+    starts = (positions == 0) | (patch_ids != (positions - 1) * num_patches // seq_len)
+    return mx.broadcast_to(starts[None], (batch, seq_len))
 
 
 def cap_patch_lengths(starts: mx.array, max_patch_length: int) -> mx.array:
@@ -223,34 +210,39 @@ class MLXByteEntropyModel(nn.Module):
     ) -> mx.array:
         """Patch widths for ``input_ids``.
 
-        ``num_patches`` switches from thresholding to a fixed count: the
-        ``num_patches - 1`` highest-entropy positions become boundaries, so every
-        batch produces the same shape. That matters because ``mx.compile`` keys
+        ``num_patches`` switches from entropy thresholding to positional uniform
+        boundaries, so every batch produces the same shape without looking at
+        future content. That matters because ``mx.compile`` keys
         its cache on shape, and the alternative -- zero-padding the patch axis --
         is not safe with the BitNet global backbone, where the perturbation
-        amplifies through depth (see :mod:`blt.mlx_global`). Same segmentation
-        rule, different knob: pick the most surprising boundaries rather than all
-        boundaries above a cutoff. Fixed count takes precedence over
+        amplifies through depth (see :mod:`blt.mlx_global`). Fixed count is not
+        entropy-adaptive and takes precedence over
         ``max_patch_length`` because adding cap-forced boundaries would destroy
         the shape guarantee it exists to provide.
         """
-        entropy = self.entropy(input_ids)
         if num_patches is not None:
-            starts = boundaries_by_count(entropy, num_patches)
+            starts = boundaries_by_count(input_ids, num_patches)
             # Fixed count exists to give the BitNet global backbone one stable,
             # unpadded shape. Re-applying the length cap can only add boundaries,
             # violating that contract and forcing the whole model eager.
             return patch_lengths_from_starts(starts)
         threshold = self.default_threshold if threshold is None else threshold
         starts = boundaries_from_entropy(
-            entropy, threshold=threshold, relative_threshold=relative_threshold
+            self.entropy(input_ids), threshold=threshold, relative_threshold=relative_threshold
         )
         return patch_lengths_from_starts(cap_patch_lengths(starts, self.max_patch_length))
 
     def opens_new_patch(self, input_ids: mx.array, *, threshold: float | None = None) -> mx.array:
-        """Would the byte *after* ``input_ids`` begin a patch?"""
+        """Would the next byte begin a patch under threshold and length-cap rules?"""
         threshold = self.default_threshold if threshold is None else threshold
-        return self.entropy(input_ids)[:, -1] > threshold
+        entropy = self.entropy(input_ids)
+        # A dummy final prediction exposes the next position to the same rules
+        # as full segmentation; its value is never read.
+        starts = boundaries_from_entropy(
+            mx.concatenate([entropy, mx.zeros((entropy.shape[0], 1))], axis=1),
+            threshold=threshold,
+        )
+        return cap_patch_lengths(starts, self.max_patch_length)[:, -1]
 
     @property
     def default_threshold(self) -> float:

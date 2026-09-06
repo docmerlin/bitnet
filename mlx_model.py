@@ -18,7 +18,6 @@ from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
 from mlx_ternary_kernel import (
     pack_ternary_weight,
-    ternary_fused_ffn_m1,
     ternary_fused_linear_m1,
     ternary_quantized_linear,
 )
@@ -1136,8 +1135,9 @@ class MLXPaTHAttention(nn.Module):
         """Softmax attention over the top-k most similar whole blocks before ``start``.
 
         Past tokens are split into ``topk_block_size`` blocks scored by mean-key
-        against the chunk's mean query; the best ``topk_blocks`` are attended in
-        full. Every selected token precedes the chunk, so causality needs no mask.
+        against the chunk's first query; the best ``topk_blocks`` are attended in
+        full. The shared selection cannot depend on later queries. Every selected
+        token precedes the chunk, so causality needs no mask.
         Returns None when no whole block has accumulated yet.
         """
         block = self.config.topk_block_size
@@ -1151,7 +1151,7 @@ class MLXPaTHAttention(nn.Module):
         value_blocks = values[:, :, : num_blocks * block].reshape(shape)
 
         summary = mx.mean(key_blocks.astype(mx.float32), axis=3)
-        probe = mx.mean(q_chunk.astype(mx.float32), axis=2, keepdims=True)
+        probe = q_chunk[:, :, :1].astype(mx.float32)
         scores = mx.sum(summary * probe, axis=-1)
         chosen = mx.argpartition(-scores, kth=take - 1, axis=-1)[..., :take]
         chosen = chosen[:, :, :, None, None]
@@ -1867,36 +1867,7 @@ class MLXHybridBlock(nn.Module):
         return apply_ada(self.mlp_norm(x), self.ada_mlp, cond)
 
     def _dense_mlp(self, x: mx.array) -> mx.array:
-        # Decode M=1: one Metal dispatch for up + mid + down ternary FFN.
-        hidden = int(x.shape[-1])
-        tokens = int(x.size // max(hidden, 1))
-        inter = int(self.mid.weight.shape[0])
-        # Fused FFN shared-memory kernel is for small/medium widths; 1B (h=1024, I=2048) uses qmm.
-        if (
-            tokens == 1
-            and hidden <= 512
-            and inter <= 1024
-            and not self.up.config.use_hadamard
-        ):
-            up_p = self.up._packed_weight(x)
-            mid_p = self.mid._packed_weight(x)
-            down_p = self.down._packed_weight(x)
-            if up_p is not None and mid_p is not None and down_p is not None:
-                try:
-                    return ternary_fused_ffn_m1(
-                        x,
-                        up_p[0],
-                        up_p[1],
-                        mid_p[0],
-                        mid_p[1],
-                        down_p[0],
-                        down_p[1],
-                        hidden=hidden,
-                        intermediate=inter,
-                        dtype=x.dtype,
-                    )
-                except ValueError:
-                    pass
+        # Keep per-linear FP8 preparation; the fused FFN kernel omits it.
         gate, value = mx.split(self.up(x), 2, axis=-1)
         hidden_act = nn.silu(self.mid(nn.silu(gate) * value))
         return self.down(hidden_act)
@@ -2730,11 +2701,20 @@ class MLXBitNet(nn.Module):
     def selected_mtp_logits(self, hidden: mx.array, index: mx.array) -> mx.array:
         norm_weight = self.mtp_transforms[0].layers[0].weight
         linear_weight = self.mtp_transforms[0].layers[1].weight
+        if self.config.norm_type == "dyt":
+            norm_alpha = self.mtp_transforms[0].layers[0].alpha
+            norm_bias = self.mtp_transforms[0].layers[0].bias
         for head_index, transform in enumerate(self.mtp_transforms[1:], start=1):
             selected = index == head_index
             norm_weight = mx.where(selected, transform.layers[0].weight, norm_weight)
             linear_weight = mx.where(selected, transform.layers[1].weight, linear_weight)
-        transformed = mx.fast.rms_norm(hidden, norm_weight, self.config.rms_norm_eps)
+            if self.config.norm_type == "dyt":
+                norm_alpha = mx.where(selected, transform.layers[0].alpha, norm_alpha)
+                norm_bias = mx.where(selected, transform.layers[0].bias, norm_bias)
+        if self.config.norm_type == "dyt":
+            transformed = mx.tanh(norm_alpha * hidden) * norm_weight + norm_bias
+        else:
+            transformed = mx.fast.rms_norm(hidden, norm_weight, self.config.rms_norm_eps)
         return self.logits_from(transformed @ linear_weight.T)
 
     def draft_logits(self, hidden: mx.array) -> mx.array:
@@ -3031,7 +3011,7 @@ class MLXBitNet(nn.Module):
         sigma_in_b = self._broadcast_sigma(sigma_in, z)
         sigma_out_b = self._broadcast_sigma(sigma_out, z)
         delta = (sigma_in_b - sigma_out_b) / mx.maximum(sigma_in_b, 1e-8)
-        return z + delta * (z - predicted.astype(z.dtype))
+        return z - delta * (z - predicted.astype(z.dtype))
 
     def __call__(
         self,

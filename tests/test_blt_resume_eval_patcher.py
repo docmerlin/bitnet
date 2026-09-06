@@ -2,13 +2,15 @@
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from dataclasses import fields
 
+import pytest
 import torch
 import torch.nn as nn
 
 from blt.config import TernaryBLTConfig
 from blt.model import TernaryBLTModel
-from blt.train_distill import BLTDistillationBatch, BLTDistillationTrainer, parse_args, run_distillation
+from blt.train_distill import BLTDistillationBatch, BLTDistillationTrainer, build_text_stream, parse_args, run_distillation
 
 
 class ToyTeacher:
@@ -17,7 +19,12 @@ class ToyTeacher:
 
     @torch.no_grad()
     def forward(self, input_ids, *, attention_mask=None, patch_lengths=None):
-        return self.model(input_ids, attention_mask=attention_mask, patch_lengths=patch_lengths)
+        device = next(self.model.parameters()).device
+        return self.model(
+            input_ids.to(device),
+            attention_mask=None if attention_mask is None else attention_mask.to(device),
+            patch_lengths=None if patch_lengths is None else patch_lengths.to(device),
+        )
 
 
 class RecordingTeacher(ToyTeacher):
@@ -239,7 +246,11 @@ def test_blt_resume_eval_and_student_patcher() -> bool:
     return True
 
 
-def test_student_patcher_reruns_teacher_on_selected_patch_lengths() -> bool:
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("mps", marks=pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")),
+])
+def test_student_patcher_reruns_teacher_on_selected_patch_lengths(device) -> bool:
     config = build_teacher_config()
     student = TernaryBLTModel(config)
     teacher = RecordingTeacher(TernaryBLTModel(config))
@@ -254,7 +265,7 @@ def test_student_patcher_reruns_teacher_on_selected_patch_lengths() -> bool:
         student_patcher=patcher,
         patcher_optimizer=patcher_optimizer,
         patcher_mode="student",
-        device=torch.device("cpu"),
+        device=torch.device(device),
     )
 
     batch = BLTDistillationBatch(
@@ -264,14 +275,46 @@ def test_student_patcher_reruns_teacher_on_selected_patch_lengths() -> bool:
         patch_lengths=torch.tensor([[3, 1]], dtype=torch.long),
     )
 
-    trainer.train_step(batch)
-    assert len(teacher.calls) == 2, teacher.calls
-    assert teacher.calls[0].tolist() == [[3, 1]], teacher.calls[0].tolist()
-    assert teacher.calls[1].tolist() == [[2, 2]], teacher.calls[1].tolist()
+    # Distill-only exercises the first teacher forward; student mode also reruns.
+    for mode in ("distill_only", "student"):
+        trainer.patcher_mode = mode
+        teacher.calls.clear()
+        _, teacher_output, metrics = trainer.train_step(batch)
+        assert len(teacher.calls) == (2 if mode == "student" else 1), teacher.calls
+        assert teacher.calls[0].tolist() == [[3, 1]], teacher.calls[0].tolist()
+        if mode == "student":
+            assert teacher.calls[1].tolist() == [[2, 2]], teacher.calls[1].tolist()
+        assert all(getattr(teacher_output, field.name).device.type == device for field in fields(teacher_output))
+        assert next(teacher.model.parameters()).device.type == "cpu"
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
     print("BLT teacher rerun on student patcher takeover tests passed")
     return True
 
 
+@pytest.mark.parametrize("train_source", ["text", "text-file", "hf-dataset"])
+@pytest.mark.parametrize("eval_source", [None, "text", "text-file", "hf-dataset"])
+def test_explicit_eval_source_never_inherits_competing_training_source(monkeypatch, train_source, eval_source):
+    import blt.train_distill as module
+
+    calls = []
+    monkeypatch.setattr(module, "iter_text_file", lambda path, **kwargs: iter([path]))
+
+    def fake_hf(path, **kwargs):
+        calls.append((path, kwargs))
+        return iter([path])
+
+    monkeypatch.setattr(module, "iter_hf_dataset", fake_hf)
+    argv = ["--no-teacher", f"--{train_source}", "TRAIN", "--hf-config", "config", "--hf-split", "validation"]
+    if eval_source is not None:
+        argv += [f"--eval-{eval_source}", "EVAL"]
+    args = parse_args(argv)
+    assert next(build_text_stream(args, eval_mode=True)) == ("EVAL" if eval_source else "TRAIN")
+    assert next(build_text_stream(args)) == "TRAIN"
+    if calls:
+        assert calls[0][1]["config_name"] == "config"
+        assert calls[0][1]["split"] == "validation"
+
+
 if __name__ == "__main__":
     test_blt_resume_eval_and_student_patcher()
-    test_student_patcher_reruns_teacher_on_selected_patch_lengths()
+    test_student_patcher_reruns_teacher_on_selected_patch_lengths("cpu")

@@ -16,7 +16,7 @@ from torch.optim import Optimizer
 
 from config import TernaryConfig
 from data.presets import DatasetSource
-from data.streams import build_batch_stream
+from data.streams import EmptyPartitionError, build_batch_stream
 from model import BitNetDeep
 from optim import build_cmud
 from training.losses import language_modeling_loss
@@ -175,20 +175,20 @@ def evaluate(
     memory_state = capture_infini_memory_state(runner)
     reset_infini_memory(runner)
     runner.eval()
-    eval_stream = build_batch_stream(
-        mixture,
-        tokenizer,
-        seed=args.seed + 999,
-        shuffle=False,
-        shuffle_buffer_size=args.shuffle_buffer_size,
-        skip_examples=args.validation_offset_examples,
-        restart_on_eof=True,
-        sequence_length=args.sequence_length,
-        max_document_tokens=args.max_document_tokens,
-        micro_batch_size=args.micro_batch_size,
-    )
-
     try:
+        eval_stream = build_batch_stream(
+            mixture,
+            tokenizer,
+            seed=args.seed + 999,
+            shuffle=False,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            skip_examples=args.validation_offset_examples,
+            partition="validation",
+            restart_on_eof=True,
+            sequence_length=args.sequence_length,
+            max_document_tokens=args.max_document_tokens,
+            micro_batch_size=args.micro_batch_size,
+        )
         losses: List[float] = []
         for _ in range(args.validation_batches):
             batch = next(eval_stream)
@@ -206,6 +206,9 @@ def evaluate(
         mean_loss = sum(losses) / len(losses)
         perplexity = math.exp(min(mean_loss, 20.0))
         return {"val_loss": mean_loss, "val_perplexity": perplexity}
+    except EmptyPartitionError as exc:
+        print(f"Warning: validation skipped; {exc}", flush=True)
+        return {}
     finally:
         restore_infini_memory_state(runner, memory_state)
         runner.train(was_training)

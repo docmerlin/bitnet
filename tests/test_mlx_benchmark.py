@@ -664,7 +664,8 @@ def test_mlx_sampled_mtp_matches_exact_depth_mean() -> None:
 
 
 @pytest.mark.parametrize("index", [0, 1])
-def test_mlx_selected_mtp_matches_direct_head_gradients(index: int) -> None:
+@pytest.mark.parametrize("norm_type", ["rms", "dyt"])
+def test_mlx_selected_mtp_matches_direct_head_gradients(index: int, norm_type: str) -> None:
     config = MLXBitNetConfig(
         vocab_size=16,
         hidden_size=8,
@@ -675,8 +676,13 @@ def test_mlx_selected_mtp_matches_direct_head_gradients(index: int) -> None:
         num_coda_layers=0,
         use_engram=False,
         mtp_depth=2,
+        norm_type=norm_type,
     )
     model = MLXBitNet(config)
+    if norm_type == "dyt":
+        for head_index, transform in enumerate(model.mtp_transforms):
+            transform.layers[0].alpha = mx.array(0.3 + head_index * 0.4)
+            transform.layers[0].bias = mx.full((config.hidden_size,), 0.1 + head_index * 0.2)
     hidden = mx.random.normal((1, 4, config.hidden_size))
 
     selected_step = nn.value_and_grad(
@@ -701,6 +707,11 @@ def test_mlx_selected_mtp_matches_direct_head_gradients(index: int) -> None:
         tree_flatten(selected_gradients),
     ):
         assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-5).item()
+    if norm_type == "dyt":
+        flat = dict(tree_flatten(selected_gradients))
+        for name in ("alpha", "bias"):
+            assert mx.any(flat[f"mtp_transforms.{index}.layers.0.{name}"] != 0).item()
+            assert mx.all(flat[f"mtp_transforms.{1 - index}.layers.0.{name}"] == 0).item()
 
 def test_mlx_mtp_head_schedule_is_resume_stable() -> None:
     assert [mtp_head_index(1, index, 4, 3) for index in range(4)] == [0, 1, 2, 0]
@@ -1122,9 +1133,11 @@ def test_hbitlinear_m1_uses_fused_ternary_path() -> None:
     assert mx.allclose(actual, expected, rtol=1e-3, atol=1e-3).item()
 
 
-def test_fused_ffn_m1_is_skipped_when_hadamard_is_enabled(monkeypatch) -> None:
+@pytest.mark.parametrize("use_hadamard", [False, True])
+def test_packed_dense_mlp_preserves_fp8_preparation(use_hadamard: bool) -> None:
     import mlx_model
 
+    mx.random.seed(12)
     config = MLXBitNetConfig(
         vocab_size=32,
         hidden_size=64,
@@ -1134,30 +1147,29 @@ def test_fused_ffn_m1_is_skipped_when_hadamard_is_enabled(monkeypatch) -> None:
         num_recurrent_layers=0,
         num_coda_layers=0,
         use_engram=False,
-        use_hadamard=True,
+        use_hadamard=use_hadamard,
     )
     block = mlx_model.MLXHybridBlock(config, 0)
     token = mlx_model._recurrent_quantized_matmul.set(True)
     try:
         for layer in (block.up, block.mid, block.down):
             layer.pin_inference_weight(mx.float32, prefer_packed=True)
+            assert layer._pinned_packed is not None
     finally:
         mlx_model._recurrent_quantized_matmul.reset(token)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("fused FFN omits required Hadamard transforms")
-
-    monkeypatch.setattr(mlx_model, "ternary_fused_ffn_m1", fail_if_called)
     x = mx.random.normal((1, 1, 64)).astype(mx.float32)
     output = block._dense_mlp(x)
+    batched = block._dense_mlp(mx.concatenate([x, x], axis=1))
 
     from mlx_ternary_kernel import ternary_effective_weight
 
     def project(value, layer):
-        transformed = mx.hadamard_transform(value)
+        transformed = layer.prepare_input(value)
         return transformed @ ternary_effective_weight(layer.weight).T
 
     gate, value = mx.split(project(x, block.up), 2, axis=-1)
     expected = project(nn.silu(project(nn.silu(gate) * value, block.mid)), block.down)
-    mx.eval(output, expected)
-    assert mx.allclose(output, expected, rtol=1e-3, atol=1e-3).item()
+    mx.eval(output, expected, batched)
+    assert mx.allclose(output, expected, rtol=1e-3, atol=1e-5).item()
+    assert mx.allclose(output, batched[:, :1], rtol=1e-3, atol=1e-5).item()

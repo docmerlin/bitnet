@@ -246,12 +246,17 @@ class ByteEntropyModel(nn.Module):
     def opens_new_patch(self, input_ids: torch.Tensor, *, threshold: float | None = None) -> torch.Tensor:
         """Would the byte *after* ``input_ids`` begin a patch?
 
-        The question a retrospective boundary classifier cannot answer. Here it
-        is just the entropy of the last position's prediction, which depends on
-        nothing later than the bytes already committed.
+        Uses the same entropy threshold and length cap as full segmentation,
+        depending only on bytes already committed.
         """
         threshold = self.default_threshold if threshold is None else threshold
-        return self.entropy(input_ids)[:, -1] > threshold
+        entropy = self.entropy(input_ids)
+        # The dummy prediction exposes the next position, but is never read.
+        starts = boundaries_from_entropy(
+            torch.cat([entropy, entropy.new_zeros((entropy.size(0), 1))], dim=1),
+            threshold=threshold,
+        )
+        return cap_patch_lengths(starts, self.max_patch_length)[:, -1]
 
     @property
     def default_threshold(self) -> float:

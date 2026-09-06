@@ -65,6 +65,38 @@ def test_topk_retrieval_ignores_the_future():
     assert mx.allclose(before, after).item()
 
 
+@pytest.mark.parametrize("backend", ["torch", "mlx"])
+@pytest.mark.parametrize("prefix_length", [1, 2])
+def test_topk_selection_ignores_later_queries(backend, prefix_length):
+    config = _mlx_config(topk_blocks=1)
+    if backend == "torch":
+        attention = InfiniAttention(TernaryConfig(
+            hidden_size=HIDDEN, num_attention_heads=HEADS,
+            use_topk_blocks=True, topk_blocks=1, topk_block_size=32,
+        ))
+    else:
+        attention = MLXPaTHAttention(config)
+    shape = (1, HEADS, 32, attention.head_dim)
+    keys = torch.cat([torch.ones(shape), -torch.ones(shape)], dim=2)
+    values = torch.cat([torch.ones(shape), torch.full(shape, 2.0)], dim=2)
+    queries = torch.ones((1, HEADS, 4, attention.head_dim))
+    changed = queries.clone()
+    changed[:, :, prefix_length:] = -10.0  # Would flip mean-query block selection.
+    if backend == "mlx":
+        keys, values, queries, changed = [mx.array(t.numpy()) for t in (keys, values, queries, changed)]
+
+    prefix = attention._topk_context(queries[:, :, :prefix_length], keys, values, 64)
+    full = attention._topk_context(queries, keys, values, 64)
+    tainted = attention._topk_context(changed, keys, values, 64)
+    if backend == "mlx":
+        mx.eval(prefix, full, tainted)
+        assert mx.allclose(prefix, full[:, :, :prefix_length]).item()
+        assert mx.allclose(prefix, tainted[:, :, :prefix_length]).item()
+    else:
+        assert torch.allclose(prefix, full[:, :, :prefix_length])
+        assert torch.allclose(prefix, tainted[:, :, :prefix_length])
+
+
 def test_topk_branch_changes_the_output_and_is_off_by_default():
     x = mx.random.normal((1, SEQ, HIDDEN))
     segments = mx.zeros((1, SEQ), dtype=mx.int32)

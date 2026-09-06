@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import queue
 import random
 import sys
@@ -85,6 +86,7 @@ def _nested_tuple(value):
 
 __all__ = [
     "BatchStream",
+    "EmptyPartitionError",
     "PackedSequenceStream",
     "PrefetchStream",
     "TextDatasetStream",
@@ -155,6 +157,10 @@ class PrefetchStream:
         return item
 
 
+class EmptyPartitionError(ValueError):
+    """A restartable dataset has no usable text in the requested partition."""
+
+
 class TextDatasetStream:
     """Restartable streaming Hugging Face text source."""
 
@@ -167,6 +173,7 @@ class TextDatasetStream:
         shuffle_buffer_size: int,
         skip_examples: int,
         restart_on_eof: bool,
+        partition: Optional[str] = None,
     ) -> None:
         self.source = source
         self.seed = seed
@@ -175,6 +182,9 @@ class TextDatasetStream:
         if shuffle and shuffle_buffer_size < 1:
             raise ValueError("shuffle_buffer_size must be positive when shuffle is enabled")
         self.skip_examples = skip_examples
+        if partition not in {None, "train", "validation"}:
+            raise ValueError("partition must be train, validation, or None")
+        self.partition = partition
         self.restart_on_eof = restart_on_eof
         self.restart_count = 0
         self.yielded_this_pass = False
@@ -222,6 +232,13 @@ class TextDatasetStream:
                 continue
             text = text.strip()
             if text:
+                if self.partition is not None:
+                    # Content hashing keeps duplicates together, independent of
+                    # source order, shuffle seed, mixture stage, and restarts.
+                    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+                    held_out = int.from_bytes(digest, "big") % 100 == 0
+                    if held_out != (self.partition == "validation"):
+                        continue
                 self.yielded_this_pass = True
                 return text
 
@@ -229,6 +246,13 @@ class TextDatasetStream:
         if not self.restart_on_eof:
             raise StopIteration
         if not self.yielded_this_pass:
+            if self.partition is not None:
+                raise EmptyPartitionError(
+                    f"dataset {self.source.path!r} (config={self.source.config_name!r}, "
+                    f"split={self.source.split!r}) has no non-empty text in partition "
+                    f"{self.partition!r} after skip_examples={self.skip_examples}. "
+                    "Use a larger source or reduce the skip offset."
+                )
             raise ValueError(f"dataset {self.source.path!r} produced no non-empty text records")
         self.restart_count += 1
         self.yielded_this_pass = False
@@ -270,6 +294,7 @@ class TextDatasetStream:
         if self.dataset is None or not hasattr(self.dataset, "state_dict"):
             raise RuntimeError("dataset does not support resumable streaming state")
         return {
+            "partition": self.partition,
             "restart_count": self.restart_count,
             "yielded_this_pass": self.yielded_this_pass,
             "source_exhausted": self.source_exhausted,
@@ -279,6 +304,8 @@ class TextDatasetStream:
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if state.get("partition") != self.partition:
+            raise ValueError("checkpoint data partition changed; restart training streams")
         self.restart_count = int(state["restart_count"])
         self.yielded_this_pass = bool(state["yielded_this_pass"])
         self.source_exhausted = bool(state["source_exhausted"])
@@ -443,6 +470,7 @@ def build_text_stream(
     shuffle_buffer_size: int,
     skip_examples: int,
     restart_on_eof: bool,
+    partition: Optional[str] = None,
 ) -> WeightedMixtureStream:
     streams = [
         TextDatasetStream(
@@ -452,6 +480,7 @@ def build_text_stream(
             shuffle_buffer_size=shuffle_buffer_size,
             skip_examples=skip_examples,
             restart_on_eof=restart_on_eof,
+            partition=partition,
         )
         for index, (source, _) in enumerate(mixture)
     ]
@@ -471,6 +500,7 @@ def build_batch_stream(
     sequence_length: int,
     max_document_tokens: int,
     micro_batch_size: int,
+    partition: Optional[str] = None,
 ) -> BatchStream:
     text_stream = build_text_stream(
         mixture,
@@ -479,6 +509,7 @@ def build_batch_stream(
         shuffle_buffer_size=shuffle_buffer_size,
         skip_examples=skip_examples,
         restart_on_eof=restart_on_eof,
+        partition=partition,
     )
     packed_stream = PackedSequenceStream(
         text_stream,

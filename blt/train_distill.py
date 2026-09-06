@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -193,12 +193,19 @@ class BLTDistillationTrainer:
             return teacher_outputs
         if teacher_patch_lengths is not None and torch.equal(selected_patch_lengths, teacher_patch_lengths):
             return teacher_outputs
-        with torch.no_grad():
-            return self.teacher.forward(
-                batch.input_ids,
-                attention_mask=batch.attention_mask,
-                patch_lengths=selected_patch_lengths,
-            )
+        return self._forward_teacher(batch, selected_patch_lengths)
+
+    @torch.no_grad()
+    def _forward_teacher(
+        self, batch: BLTDistillationBatch, patch_lengths: torch.Tensor | None
+    ) -> TernaryBLTOutput:
+        output = self.teacher.forward(
+            batch.input_ids, attention_mask=batch.attention_mask, patch_lengths=patch_lengths
+        )
+        return TernaryBLTOutput(**{
+            field.name: getattr(output, field.name).to(self.device)
+            for field in fields(TernaryBLTOutput)
+        })
 
     def _run_forward(
         self, batch: BLTDistillationBatch, *, step: int
@@ -215,12 +222,7 @@ class BLTDistillationTrainer:
 
         with self._autocast():
             if self.teacher is not None:
-                with torch.no_grad():
-                    teacher_outputs = self.teacher.forward(
-                        batch.input_ids,
-                        attention_mask=batch.attention_mask,
-                        patch_lengths=provided_patch_lengths,
-                    )
+                teacher_outputs = self._forward_teacher(batch, provided_patch_lengths)
 
             teacher_patch_lengths = self._teacher_patch_lengths(provided_patch_lengths, teacher_outputs)
             patcher_loss, predicted_patch_lengths, patcher_metrics = self._compute_patcher_loss(batch, teacher_patch_lengths)
@@ -237,6 +239,9 @@ class BLTDistillationTrainer:
                 selected_patch_lengths=patch_lengths,
                 using_student_patcher=using_student_patcher,
             )
+            if teacher_outputs is not None:
+                # The native teacher may split the first patch for decoder alignment.
+                patch_lengths = teacher_outputs.patch_lengths
 
             student_outputs = self.student(
                 batch.input_ids,
@@ -375,9 +380,11 @@ def build_config_from_args(
 def _source_value(args: argparse.Namespace, name: str, *, eval_mode: bool) -> Any:
     if eval_mode:
         eval_name = f"eval_{name}"
-        value = getattr(args, eval_name)
+        value = getattr(args, eval_name, None)
         if value is not None:
             return value
+        if name in {"text", "text_file", "hf_dataset"} and _has_explicit_eval_source(args):
+            return None
         if name == "shuffle_dataset":
             return False
         if name == "shuffle_buffer_size":

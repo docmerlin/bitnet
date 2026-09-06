@@ -116,7 +116,7 @@ class HierarchicalTokenizer:
                     updated_sequences.append(merged_patch)
             active_sequences = updated_sequences
 
-        self.vocab_size = max(self.vocab_size_target, self.next_token_id)
+        self.vocab_size = self.next_token_id
 
     def _bytes_to_patch(self, token_id: int) -> List[int]:
         token_bytes = self.first_stage.decode_single_token_bytes(token_id)
@@ -140,7 +140,7 @@ class HierarchicalTokenizer:
         Each patch corresponds to one first-stage BPE token compressed by the
         learned second-stage BPE rules.
         """
-        first_stage_ids = self.first_stage.encode(text)
+        first_stage_ids = self.first_stage.encode_ordinary(text)
         patches = [self._apply_merges(self._bytes_to_patch(token_id)) for token_id in first_stage_ids]
 
         if add_special_tokens:

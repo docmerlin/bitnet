@@ -609,6 +609,134 @@ forward time; generation is O(L²) without a KV cache; several NanoGPT-speedrun 
 default gates remain unmeasured. **Bench after each big change; commit between goals so
 regressions can be reverted.**
 
+**2026-09-06 audit: remove repeated work before adding kernels.**
+
+These are source-backed candidates, not measured speedups. The audit inspected the
+current worktree, including uncommitted changes, without modifying implementation files.
+Suggested first batch: bounded draft embeddings, patcher bookkeeping, and corpus indexing;
+then compiled-decode warmup and frozen-latent K/V reuse. Historical results below remain
+separate from this audit.
+
+- [ ] **Remove dummy prefills from MLX compiled decode initialization.**
+  `mlx_model.py:MLXBitNet.enable_compiled_inference` specializes by open-chunk length,
+  but each new length first prefills a fresh dummy cache and executes a dummy decode.
+  Encountering all W lengths processes W(W-1)/2 synthetic prefill tokens plus W dummy
+  decode steps: 8,128 prefill tokens at W=128. Compile against the actual incoming cache
+  and consume the first result directly; preserve lazy-error fallback. Measure cold
+  first-token/compilation cost separately from steady decode, including chunk boundaries.
+- [ ] **Bound BLT draft embedding work to the required n-gram suffix.**
+  `blt/mlx_generate.py:_draft` embeds the full prefix and keeps only its final row,
+  despite already using transformer KV caches. Embed only the final
+  `max(ngram_sizes)` tokens, then select the final row: eight tokens by default, one
+  when n-grams are disabled. A lone token is incorrect with n-grams enabled. Check
+  short prefixes, custom n-gram sizes, logits, and generated-byte parity.
+- [ ] **Cache BLT cross-attention projections of frozen draft latents.**
+  `blt/mlx_model.py:MLXLocalDecoder.extend` repeats `_prepare_latents` every draft byte;
+  `blt/mlx_layers.py:MLXTernaryCrossAttention.__call__` repeats normalization and K/V
+  projections over every patch slot in every decoder layer. Retain prepared latents
+  and per-layer K/V, or values for k=1, for the draft-cache lifetime. Invalidate on
+  global refresh or rollback. Keep existing SDPA, not the rejected gather rewrite;
+  measure projection work, retained memory, and bytes/s against prefix length.
+- [ ] **Route known-unpadded BLT batches through existing windowed attention.**
+  `blt/mlx_model.py:MLXTernaryBLTModel.__call__` always constructs/passes byte masks;
+  `blt/mlx_layers.py:MLXTernarySelfAttention._chunkable` requires `attention_mask=None`.
+  All-true corpus masks therefore disable chunking. Carry trusted unpadded status
+  from the data boundary and omit masks specifically for local self-attention;
+  retain pooling/loss masks and padded behavior. Do not add a per-step GPU mask check.
+  Dense additive bias alone is 512 MiB at B=8, L=4096, FP32. Verify whole-model
+  dispatch, outputs, and gradients; benchmark short and long sequences separately.
+- [ ] **Reuse PaTH solve results and restrict speculative verification to new queries.**
+  `mlx_model.py:MLXPaTHAttention.extend` recomputes the entire open chunk before slicing
+  away old query outputs, then calls `path_system_t_inverse` for an incomplete chunk
+  even though `path_chunk` already solved for T. First return/reuse that T; then
+  compute only appended query rows. Preserve speculative rejection, cache continuation,
+  and chunk-boundary Infini updates. Test learned-like aligned path vectors, not only
+  random vectors; do not substitute the numerically unstable Neumann-series solve.
+- [ ] **Batch independent PaTH local chunks during generation prefill.**
+  `mlx_model.py:MLXPaTHAttention.prefill` invokes `path_chunk` serially, while normal
+  forward already has `_batched_path_chunks`. Reuse it for complete equal-width chunks,
+  handle the remainder separately, and keep Infini-memory retrieval/update order exact.
+  Benchmark multi-chunk prompts and peak memory; short prompts may see little benefit.
+- [ ] **Avoid rebuilding old-old PaTH products during last-query decode.**
+  `mlx_model.py:MLXPaTHAttention.path_chunk_last_with_t` reconstructs the full
+  `tril(W @ K.T)` every token despite retaining border-updated T. Cache WK and append
+  its new border if measured compute savings justify another FP32 quadratic cache
+  per executed layer. Separately test batched matmul instead of broadcast multiply
+  plus reduction in `path_border_update_t`. Neither change makes all decode work linear.
+- [ ] **Replace entropy-patcher fixpoint and fixed-count bookkeeping.**
+  `blt/mlx_entropy_model.py:cap_patch_lengths` repeatedly scans boundaries and reads
+  `bool(mx.any(...))` on the host. Use one prefix scan over original starts, then
+  positive-distance multiples of the cap within each original interval. Preserve
+  boundary resets and disabled-cap behavior. In `predict_patch_lengths`, fixed-count
+  mode can derive widths directly from `ceil(j*L/P)`, avoiding host count extraction
+  and the [B,P,L] membership tensor. Preserve fixed-count precedence over caps.
+- [ ] **Make mmap corpus index metadata proportional to files, not sequences.**
+  `blt/mlx_data.py:ByteCorpus.__init__` retains per-sequence start/file arrays plus
+  concatenated copies: about 32 bytes per sequence on the current 64-bit platform.
+  A decimal 1 TB corpus at sequence length 512 therefore needs about 62.5 GB of index
+  metadata alone. Store per-file sequence counts and cumulative counts, resolve samples
+  with `np.searchsorted`, and derive offsets arithmetically. Preserve sampling order,
+  custom strides, skipped short files, file boundaries, and dropped tails. Measure
+  construction time, RSS, and random-batch latency.
+- [ ] **Make MLX compiled-inference weight policy consistent.**
+  `mlx_model.py:MLXBitNet.enable_compiled_inference` forces dense pins, but eligible
+  M=1 calls in `MLXHBitLinear.__call__` still enter `_packed_weight` before honoring
+  dense pins. Honor the selected policy and compare compiled decode against the
+  existing `--no-compile-step` packed path on the same checkpoint. Include pin memory,
+  cold/warm timings, packed-enabled parity, and compile-failure fallback; do not
+  infer the best default from tiny shapes or older packed-matmul measurements.
+- [ ] **Compile BLT clipping/optimizer application separately from gradients.**
+  `blt/mlx_train.py:MLXBLTTrainer` compiles loss/gradient calculation only;
+  clipping and optimizer application remain eager. Follow the separate compiled
+  optimizer closure pattern in root `mlx_train.py`, initialize state before tracing,
+  and preserve the forward/backward materialization boundary. Compare complete updates,
+  gradient norms, optimizer state, compile warmup, and sustained bytes/s. Do not revive
+  the already rejected monolithic backward/CMUD fusion without new evidence.
+- [ ] **Cache deterministic second-stage tokenizer patches.**
+  `tokenizer/hierarchical_tokenizer.py:HierarchicalTokenizer.encode_patches` decodes
+  bytes and reapplies merges for every occurrence of a first-stage token ID. Add a
+  per-instance token-ID-to-patch cache, protecting cached values from caller mutation.
+  Preserve first-stage tokenization, merge order, special tokens, and Unicode behavior.
+  Measure cold/warm prose and code throughput plus cache RSS; this serves both root
+  training backends, not the raw-byte BLT loader.
+- [ ] **Serialize periodic checkpoints once instead of twice.**
+  Root `mlx_train.py` and `train.py` write the same full state for numbered and `last`
+  checkpoints. Write the immutable numbered state once, then update crash-safe aliases
+  or use a filesystem clone/link mechanism compatible with loaders and retention.
+  Keep MLX model, optimizer, and metadata artifacts consistent; never overwrite a
+  linked numbered checkpoint in place. Measure checkpoint pauses and bytes written,
+  which ordinary step-throughput measurements can hide.
+- [ ] **Port incremental BLT encoder/decoder KV caching to PyTorch generation.**
+  `blt/generate.py:_decoder_next` reruns the full-prefix encoder and decoder for every
+  draft byte. Reuse the incremental-cache approach already present in MLX, including
+  bounded n-gram history and rollback/global-refresh invalidation. Check greedy and
+  speculative byte parity, EOS behavior, and patch boundaries. Measure latency versus
+  prompt/output length, not just the number of global-model passes.
+- [ ] **Support activation checkpointing for PyTorch Kimi AttnRes mode.**
+  `model.py:BitNetDeep._run_layer` and `_run_recurrent_iteration` disable layer and loop
+  checkpointing in Kimi mode because stream state contains Python lists. Support
+  recomputation with exact stream/Infini-state semantics and output/gradient parity.
+  This is a memory-capacity opportunity, not a free step-time win: measure peak memory,
+  recompute cost, and whether the recovered capacity permits a larger useful batch.
+- [ ] **Reuse grouped PyTorch RFMoE weights and quantify padding waste.**
+  `layers/rfmoe.py:RFMoE._grouped_weight` rebuilds stacked quantized weights, while
+  `forward` synchronizes on `int(counts.max())` and pads every expert to the hottest
+  expert's token count. Start with forward-scoped grouped-weight reuse. Record
+  `experts * max_count / active_pairs` alongside firing density before introducing
+  bucketed/ragged execution. Preserve gradients, routing, and expert-growth behavior.
+
+Audit verification: existing n-gram/windowed-attention tests passed (12 tests).
+In-memory candidate checks passed 20 final-embedding cases (maximum absolute error 0)
+and 269 patch-capping/fixed-count cases. These checks are not committed regression tests
+and do not establish speedups; add focused regression coverage with each implementation.
+No production-scale throughput benchmark was run. Performance claims require at least
+500M physical parameters, preferably 1B, with interleaved warmed A/B runs and explicit
+MLX synchronization. For full-stack training, include raw-byte ingestion through optimizer
+application; report bytes/s, seconds/update, memory, and validation/checkpoint pauses.
+Keep rejected BLT QKV/gate-up fusion, multi-slot gather attention, monolithic backward/CMUD
+fusion, and unstable Neumann-series PaTH solves out of this work unless new evidence warrants
+revisiting them.
+
 **Training throughput (Metal / M1 Max):**
 
 - [x] **Rejected: fuse BLT QKV and SwiGLU gate+up.** Implemented both stacks (torch+MLX),

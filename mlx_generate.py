@@ -57,6 +57,13 @@ class PhaseTimings:
         return lines
 
 
+def _generation_argmax(logits: mx.array, valid_vocab_size: int | None) -> mx.array:
+    """Exclude undefined trailing IDs without resizing padded checkpoint heads."""
+    if valid_vocab_size is not None and not 1 <= valid_vocab_size <= logits.shape[-1]:
+        raise ValueError("valid_vocab_size must be between 1 and the logit vocabulary size")
+    return mx.argmax(logits[..., :valid_vocab_size], axis=-1)
+
+
 def greedy_generate(
     prompt: list[int],
     max_new_tokens: int,
@@ -79,6 +86,7 @@ def dblock_greedy_generate(
     eos_token_id: int | None = None,
     *,
     euler_steps: int | None = None,
+    valid_vocab_size: int | None = None,
 ) -> list[int]:
     """Denoise the full window (same as train), then take suffix argmax.
 
@@ -87,6 +95,7 @@ def dblock_greedy_generate(
 
     B=1 Euler uses ``euler_steps`` or ``config.dblock_euler_steps`` (paper 50),
     not ``num_loops``. ``dblock_infer='loops'`` still unrolls Huginn R.
+    ``valid_vocab_size`` restricts selection to defined IDs in a padded vocabulary.
     """
     if model.config.train_mode != "dblock":
         raise ValueError("dblock_greedy_generate requires train_mode='dblock'")
@@ -134,7 +143,7 @@ def dblock_greedy_generate(
             None,
             block_id=0 if model.config.dblock_blocks == 1 else steps - 1,
         )
-    predicted = mx.argmax(model.logits_from(hidden), axis=-1)
+    predicted = _generation_argmax(model.logits_from(hidden), valid_vocab_size)
     mx.eval(predicted)
     suffix = predicted[0, prompt_len:].tolist()
     out = list(prompt)
@@ -281,8 +290,11 @@ def model_callbacks(
     model: MLXBitNet,
     *,
     profile: PhaseTimings | None = None,
+    speculative: bool = True,
+    valid_vocab_size: int | None = None,
 ) -> tuple[Proposal, Verification]:
-    depth = model.config.mtp_depth
+    """Cached greedy callbacks; optionally skip MTP and exclude padded vocabulary IDs."""
+    depth = model.config.mtp_depth if speculative else 0
     loops = getattr(model, "inference_num_loops", None)
     cache = model.new_inference_cache(num_loops=loops)
     cached_tokens: list[int] = []
@@ -346,7 +358,7 @@ def model_callbacks(
             logits = mx.concatenate((main, model.draft_logits(states)), axis=1)
         else:
             logits = main
-        result = mx.argmax(logits, axis=-1)
+        result = _generation_argmax(logits, valid_vocab_size)
         _eval(result)
         return result[0].tolist()
 
@@ -362,8 +374,11 @@ def model_callbacks(
             profile.decode_steps += 1
         pending[tuple([*prefix, *candidates])] = (branch_cache, states[:, -1:])
         verifier = model.logits_from(states)
-        verified = mx.argmax(verifier, axis=-1)
-        drafts = mx.argmax(model.draft_logits(states), axis=-1) if depth else mx.zeros((1, 0), dtype=mx.int32)
+        verified = _generation_argmax(verifier, valid_vocab_size)
+        drafts = (
+            _generation_argmax(model.draft_logits(states), valid_vocab_size)
+            if depth else mx.zeros((1, 0), dtype=mx.int32)
+        )
         _eval(verified, drafts)
         return verified[0].tolist(), drafts[0].tolist()
 
@@ -444,10 +459,14 @@ def main() -> None:
             args.max_new_tokens,
             tokenizer.eos_id,
             euler_steps=args.dblock_euler_steps,
+            valid_vocab_size=len(tokenizer),
         )
     else:
-        propose, verify = model_callbacks(model, profile=profile)
-        if args.speculative and model.config.mtp_depth:
+        speculative = args.speculative and model.config.mtp_depth > 0
+        propose, verify = model_callbacks(
+            model, profile=profile, speculative=speculative, valid_vocab_size=len(tokenizer)
+        )
+        if speculative:
             tokens = speculative_greedy_generate(
                 prompt,
                 args.max_new_tokens,

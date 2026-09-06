@@ -41,12 +41,9 @@ def import_upstream_blt(upstream_repo_path: str | Path | None = None) -> Dict[st
 
     return {
         "ByteLatentTransformer": getattr(blt_module, "ByteLatentTransformer"),
-        "compute_hash_embeddings": getattr(blt_module, "compute_hash_embeddings"),
-        "cross_attn_mask": getattr(blt_module, "cross_attn_mask"),
         "patch_ids_from_lengths": getattr(blt_module, "patch_ids_from_lengths"),
         "Patcher": getattr(patcher_module, "Patcher"),
         "PatcherArgs": getattr(patcher_module, "PatcherArgs"),
-        "downsample": getattr(importlib.import_module("bytelatent.model.utils"), "downsample"),
     }
 
 
@@ -116,121 +113,59 @@ class FacebookBLTTeacher:
             if self.patcher is None:
                 raise ValueError("No patch_lengths were provided and no teacher patcher is configured")
             patch_lengths, _ = self.patcher.patch(tokens, include_next_token=False)
-        return normalize_patch_lengths(patch_lengths.to(self.device), tokens.size(1))
+        patch_lengths = normalize_patch_lengths(patch_lengths.to(self.device), tokens.size(1))
+        # Native BLT requires one real byte in the first encoder patch (also
+        # before its BOE padding in static mode). Preserve all other boundaries.
+        rows = []
+        for row in patch_lengths:
+            lengths = row[row > 0]
+            rows.append(torch.cat([lengths.new_ones(1), lengths[:1] - 1, lengths[1:]]))
+        return torch.nn.utils.rnn.pad_sequence(
+            [row[row > 0] for row in rows], batch_first=True
+        )
 
     def _forward_trimmed(
         self,
         tokens: torch.Tensor,
         patch_lengths: torch.Tensor,
     ) -> TernaryBLTOutput:
-        patch_ids = self.upstream["patch_ids_from_lengths"](patch_lengths, tokens.size(1))
-        cross_attn_mask_enc = None
-        if self.model.cross_attn_encoder:
-            cross_attn_mask_enc = self.upstream["cross_attn_mask"](
-                patch_ids,
-                patch_lengths,
-                tokens.size(1),
-                patches_as_queries=True,
-                cross_attn_k=self.model.cross_attn_k,
-                window=self.model.cross_attn_window_encoder,
-                block_mask=self.model.cross_attn_use_flex_attention,
-            )
+        """Capture features without replacing native alignment or attention masks."""
+        captured = {}
 
-        local_encoder_embeds = self.upstream["compute_hash_embeddings"](
-            local_encoder_tokens=tokens,
-            local_encoder=self.model.local_encoder,
-            encoder_hash_tok_embedding=self.model.encoder_hash_tok_embedding,
-            encoder_hash_byte_group_nb_functions=self.model.encoder_hash_byte_group_nb_functions,
-            encoder_hash_byte_group_size=self.model.encoder_hash_byte_group_size,
-            encoder_hash_byte_group_vocab=self.model.encoder_hash_byte_group_vocab,
-        )
+        def capture_encoder(module, args, output):
+            captured["encoder_hidden"] = output[0][0]
 
-        (h_encoder, h_cross), _ = self.model.local_encoder(
-            tokens=tokens,
-            embeds=local_encoder_embeds,
-            patch_embeds=None,
-            cross_mask=cross_attn_mask_enc,
-            num_patches=patch_lengths.shape[1],
-            patch_ids=patch_ids,
-        )
+        def capture_global(module, args, kwargs, output):
+            captured["encoder_patches"] = kwargs["embeds"]
+            captured["global_hidden"] = output[0]
 
-        if not self.model.cross_attn_encoder:
-            encoder_patches = self.upstream["downsample"](
-                h_encoder,
-                patch_lengths.shape[1],
-                patch_lengths,
-                patch_ids,
-                downsampling_by_pooling=self.model.downsampling_by_pooling,
-                patch_size=self.model.patch_size,
-            )
-        else:
-            encoder_patches = h_cross.view(tokens.size(0), patch_lengths.shape[1], -1)
+        def capture_decoder(module, args):
+            captured["decoder_hidden"] = args[0]
 
-        global_tokens = tokens.new_full((encoder_patches.size(0), encoder_patches.size(1)), int(self.model.boe_id))
-        rows, cols = torch.where(tokens == self.model.eos_id)
-        eos_patch_ids = patch_ids[rows, cols]
-        global_tokens[rows, eos_patch_ids] = self.model.eos_id
-        global_hidden, _ = self.model.global_transformer(embeds=encoder_patches, tokens=global_tokens)
+        handles = [
+            self.model.local_encoder.register_forward_hook(capture_encoder),
+            self.model.global_transformer.register_forward_hook(capture_global, with_kwargs=True),
+            self.model.local_decoder.norm.register_forward_pre_hook(capture_decoder),
+        ]
+        try:
+            # Upstream owns decoder_patch_ids_from_lengths, cross-attention,
+            # and local/global causal and EOS document masks. Never replay layers.
+            # Static-mode upstream forward adds BOE lengths in place.
+            logits = self.model(tokens=tokens, patch_lengths=patch_lengths.clone())
+        finally:
+            for handle in handles:
+                handle.remove()
 
-        decoder_patch_ids = patch_ids
-        patch_for_decoder = global_hidden
-        cross_attn_mask_dec = None
-        if self.model.cross_attn_decoder:
-            cross_attn_mask_dec = self.upstream["cross_attn_mask"](
-                decoder_patch_ids,
-                patch_lengths,
-                tokens.size(1),
-                patches_as_queries=False,
-                cross_attn_k=self.model.cross_attn_k,
-                window=self.model.cross_attn_window_decoder,
-                block_mask=self.model.cross_attn_use_flex_attention,
-            )
-        else:
-            patch_for_decoder = torch.gather(
-                global_hidden,
-                1,
-                decoder_patch_ids.unsqueeze(-1).expand(-1, -1, global_hidden.size(-1)),
-            )
-
-        decoder_hidden = h_encoder
-        decoder_module = self.model.local_decoder
-        if getattr(decoder_module, "patch_embedding_projection", None) is not None:
-            patch_for_decoder = decoder_module.patch_embedding_projection(patch_for_decoder)
-            if self.model.cross_attn_k is not None:
-                patch_for_decoder = patch_for_decoder.reshape(
-                    tokens.size(0),
-                    patch_for_decoder.shape[1] * self.model.cross_attn_k,
-                    decoder_module.dim,
-                )
-
-        if patch_for_decoder is not None and not self.model.cross_attn_decoder:
-            decoder_hidden = decoder_hidden + patch_for_decoder
-
-        for layer_index, layer in enumerate(decoder_module.layers):
-            if self.model.cross_attn_decoder and (
-                layer_index == 0 or decoder_module.cross_attn_all_layers_decoder
-            ):
-                decoder_hidden = decoder_hidden + decoder_module.cross_attn_layers[layer_index](
-                    x=decoder_hidden,
-                    kv=patch_for_decoder,
-                    mask=cross_attn_mask_dec,
-                )
-            decoder_hidden = layer(
-                decoder_hidden,
-                mask=None,
-                freq_cis=decoder_module.rope(seqlen=tokens.size(1)) if decoder_module.use_rope else None,
-                attn_impl=decoder_module.attn_impl,
-            )
-
-        logits = decoder_module.output(decoder_module.norm(decoder_hidden)).float()
+        nb_boe = int(self.model.patch_size - 1) if self.model.patching_mode == "" else 0
+        num_patches = patch_lengths.size(1)
         return TernaryBLTOutput(
             logits=logits,
             patch_lengths=patch_lengths,
-            patch_ids=patch_ids,
-            encoder_hidden=h_encoder,
-            encoder_patches=encoder_patches,
-            global_hidden=global_hidden,
-            decoder_hidden=decoder_hidden,
+            patch_ids=self.upstream["patch_ids_from_lengths"](patch_lengths, tokens.size(1)),
+            encoder_hidden=captured["encoder_hidden"][:, nb_boe : nb_boe + tokens.size(1)],
+            encoder_patches=captured["encoder_patches"][:, :num_patches],
+            global_hidden=captured["global_hidden"][:, :num_patches],
+            decoder_hidden=captured["decoder_hidden"],
         )
 
     @staticmethod
@@ -245,7 +180,7 @@ class FacebookBLTTeacher:
             decoder_hidden=output.decoder_hidden[batch_index : batch_index + 1],
         )
 
-    def _forward_suffix_padded_batch(
+    def _forward_grouped_batch(
         self,
         tokens: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -267,11 +202,18 @@ class FacebookBLTTeacher:
             if batch_patch_lengths is not None:
                 group_patch_lengths = batch_patch_lengths[batch_indices]
             resolved_patch_lengths = self._resolve_patch_lengths(group_tokens, group_patch_lengths)
-            group_output = self._forward_trimmed(group_tokens, resolved_patch_lengths)
-            for local_index, batch_index in enumerate(batch_indices.tolist()):
-                row_output = self._slice_output(group_output, local_index)
-                outputs_by_index[batch_index] = (valid_length, row_output)
-                max_num_patches = max(max_num_patches, row_output.patch_lengths.size(1))
+            # Upstream's shifted decoder IDs count trailing zero lengths at the
+            # final byte. Group by patch count as well, so native sees no padding.
+            patch_counts = (resolved_patch_lengths > 0).sum(dim=1)
+            for count in patch_counts.unique(sorted=True).tolist():
+                members = torch.nonzero(patch_counts == count, as_tuple=False).flatten()
+                group_output = self._forward_trimmed(
+                    group_tokens[members], resolved_patch_lengths[members, :count]
+                )
+                for local_index, batch_index in enumerate(batch_indices[members].tolist()):
+                    row_output = self._slice_output(group_output, local_index)
+                    outputs_by_index[batch_index] = (valid_length, row_output)
+                    max_num_patches = max(max_num_patches, count)
 
         first_output = outputs_by_index[min(outputs_by_index)][1]
         hidden_dim = first_output.encoder_hidden.size(-1)
@@ -290,7 +232,7 @@ class FacebookBLTTeacher:
             dtype=first_output.encoder_patches.dtype,
         )
         batch_global_hidden = tokens.new_zeros(
-            (batch_size, max_num_patches, patch_dim),
+            (batch_size, max_num_patches, first_output.global_hidden.size(-1)),
             dtype=first_output.global_hidden.dtype,
         )
         batch_decoder_hidden = tokens.new_zeros(
@@ -336,8 +278,4 @@ class FacebookBLTTeacher:
         if patch_lengths is not None:
             batch_patch_lengths = patch_lengths.to(self.device)
 
-        if bool(torch.all(attention_mask)):
-            resolved_patch_lengths = self._resolve_patch_lengths(tokens, batch_patch_lengths)
-            return self._forward_trimmed(tokens, resolved_patch_lengths)
-
-        return self._forward_suffix_padded_batch(tokens, attention_mask, batch_patch_lengths)
+        return self._forward_grouped_batch(tokens, attention_mask, batch_patch_lengths)

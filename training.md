@@ -274,7 +274,7 @@ Remaining diffs = impl + train-trajectory parity, not missing features:
 
 - RFMoE keep independent self-gating: every expert score every token; every pair above `theta` execute. Default `--rfmoe-backend auto` → `hybrid` when Metal available else `host`. Hybrid fastest local RFMoE + one/two-block measures; `metal` keep static shapes + act recompute for lower-memory compile; `host` keep native `gather_mm` backward for parity + inference.
 - Multi-host distributed train not implemented.
-- Converted PyTorch / older MLX ckpts lack dataset stream state → first MLX resume warn + restart data. Ckpts later written by `mlx_train.py` resume exact.
+- Converted PyTorch / older MLX checkpoints without partitioned dataset stream state warn and restart data once. Checkpoints written with the current partition resume the exact stream.
 
 At hidden size 512, 8 experts, expert width 256, 512 tokens, BF16, 25% active density, RFMoE layer measures:
 
@@ -391,3 +391,10 @@ python3 mlx_train.py \
 ```
 
 Ckpts created before optimizer param names saved need `--allow-legacy-optimizer-order`. Use that flag only for unmodified ckpt written by this repo.
+
+### Data and resume contracts
+
+- Both trainers reserve a stable 1% text-hash holdout before shuffle and packing. Training (including early/late mixtures) excludes it; validation uses only it. BLAKE2b over stripped UTF-8 text keeps identical documents together across sources and seeds. This does not deduplicate near-duplicates.
+- `--validation-offset-examples` skips raw source records before selecting validation documents; it does not define the split. If a source has no held-out text after the offset, validation warns and skips the entire evaluation, discarding partial results without falling back to training data or dropping that source from the mixture. Use a larger source or reduce the offset. Empty training partitions still fail explicitly. Old checkpoints may already have trained on these records, so resumed validation is not guaranteed historically unseen.
+- `--vocab-size` is a tokenizer merge-vocabulary ceiling, not the number of defined IDs. New models use `len(tokenizer)` (1,067 IDs for patch size 8 and target 32,768); resumed models retain saved embedding/output dimensions. Corpus special-token literals are encoded as ordinary text. Legacy oversized output heads require generation to mask undefined IDs.
+- PyTorch resume restores saved LR schedule arguments before constructing `LambdaLR`, including total token budget, batch geometry, warmup/cooldown, floor, and base rates. CLI overrides to these settings are ignored on resume; checkpoints missing schedule arguments fail explicitly. Same-architecture resumes preserve uninterrupted LR, but PyTorch data/RNG still restart. Architecture-upgrade resumes retain the documented fresh-optimizer/re-warm behavior.

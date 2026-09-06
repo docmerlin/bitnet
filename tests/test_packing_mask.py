@@ -98,6 +98,7 @@ def test_packed_stream_partitions_and_rebases_documents() -> bool:
 def test_restartable_stream_rejects_pass_without_text() -> None:
     stream = TextDatasetStream.__new__(TextDatasetStream)
     stream.source = SimpleNamespace(path="broken", text_field="text")
+    stream.partition = None
     stream.restart_on_eof = True
     stream.restart_count = 0
     stream.yielded_this_pass = False
@@ -177,6 +178,7 @@ def test_batch_stream_state_restores_exact_next_batch(monkeypatch) -> None:
             shuffle=True,
             shuffle_buffer_size=5,
             skip_examples=0,
+            partition="train",
             restart_on_eof=True,
             sequence_length=7,
             max_document_tokens=32,

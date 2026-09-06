@@ -26,6 +26,7 @@ __all__ = [
     "filter_ffn_mid_keys",
     "is_ffn_mid_key",
     "load_checkpoint",
+    "restore_resume_args",
     "save_checkpoint",
 ]
 
@@ -36,6 +37,21 @@ class TrainerState:
     tokens_processed: int = 0
     samples_processed: int = 0
     best_val_loss: float = float("inf")
+
+
+def restore_resume_args(args: Any, saved_args: dict) -> None:
+    """Restore the inputs to LambdaLR's closure, which its state does not save."""
+    schedule_keys = (
+        "total_tokens", "micro_batch_size", "sequence_length", "grad_accumulation_steps",
+        "warmup_steps", "warmup_ratio", "cooldown_steps", "cooldown_ratio", "min_lr_ratio",
+        "learning_rate", "mud_learning_rate",
+    )
+    missing = [key for key in schedule_keys if key not in saved_args]
+    if missing:
+        raise ValueError(f"Cannot resume LR schedule: checkpoint args missing {missing}")
+    for key in (*schedule_keys, "tokenizer_max_patch_size", "vocab_size", "path_window_size"):
+        if key in saved_args:
+            setattr(args, key, saved_args[key])
 
 
 def save_checkpoint(

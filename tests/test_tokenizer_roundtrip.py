@@ -34,6 +34,19 @@ def test_encode_truncates_at_max_length() -> bool:
     return True
 
 
+def test_corpus_special_token_literals_and_actual_vocabulary() -> None:
+    tokenizer = HierarchicalTokenizer(max_patch_size=8, vocab_size_target=32768)
+    sample = "Corpus literals: <|endoftext|> and <|fim_prefix|>."
+    encoded = tokenizer.encode(sample, add_special_tokens=True)
+    assert tokenizer.decode(encoded) == sample
+    assert encoded[0] == tokenizer.bos_id and encoded[-1] == tokenizer.eos_id
+    assert len(tokenizer) == tokenizer.next_token_id == 260 + len(tokenizer.merges)
+    assert len(tokenizer) < tokenizer.vocab_size_target
+    assert all(0 <= token < len(tokenizer) for token in encoded)
+    assert all(0 <= byte < 256 for token in range(len(tokenizer))
+               for byte in tokenizer._expand_token(token))
+
+
 if __name__ == "__main__":
     test_encode_decode_roundtrip_ascii()
     test_encode_decode_roundtrip_unicode()

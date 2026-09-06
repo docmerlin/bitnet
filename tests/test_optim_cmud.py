@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -179,9 +180,40 @@ def test_cmud_8bit_state_serializes_and_resumes() -> bool:
     restored = build_cmud(model, lr=0.05, fallback_lr=0.02, weight_decay=0.0, eight_bit=True)
     restored.load_state_dict(payload)
     restored_state = restored.state[model[0].weight]
+    assert restored_state["exp_avg_q"].dtype == torch.int8
+    assert restored_state["exp_avg_scale"].dtype == torch.float32
     assert torch.equal(restored_state["exp_avg_q"], emb_state["exp_avg_q"])
     print("C-MUD 8-bit state serialization tests passed")
     return True
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cmud_resume_preserves_quantized_buffers_before_next_step(dtype):
+    torch.manual_seed(12)
+    source = nn.Parameter(torch.randn(4096))
+    optimizer = CMUD([source])
+    source.grad = torch.randn_like(source)
+    optimizer.step()
+    payload = optimizer.state_dict()
+    restored_param = nn.Parameter(source.detach().to(dtype).clone())
+    restored = CMUD([restored_param])
+    restored.load_state_dict(payload)
+
+    state = restored.state[restored_param]
+    assert state["exp_avg_q"].dtype == torch.int8
+    assert state["exp_avg_q"].element_size() == 1
+    assert state["exp_avg_scale"].dtype == torch.float32
+    torch.testing.assert_close(state["exp_avg_q"], optimizer.state[source]["exp_avg_q"])
+    torch.testing.assert_close(state["exp_avg_scale"], optimizer.state[source]["exp_avg_scale"])
+    restored.step()  # Parameters without gradients must retain compact state too.
+    assert state["exp_avg_q"].dtype == torch.int8
+
+    if dtype == torch.float32:
+        source.grad = torch.randn_like(source)
+        restored_param.grad = source.grad.clone()
+        optimizer.step()
+        restored.step()
+        torch.testing.assert_close(restored_param, source, rtol=0, atol=0)
 
 
 def test_mud_decorrelate_handles_zero_rows() -> bool:

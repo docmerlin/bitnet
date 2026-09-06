@@ -84,6 +84,16 @@ def test_dblock_logits_are_finite() -> None:
     assert bool(mx.all(mx.isfinite(logits)).item())
 
 
+@pytest.mark.parametrize("sigma_out", [0.0, 1.0, 2.0])
+def test_euler_perfect_denoiser_reduces_noise(monkeypatch, sigma_out) -> None:
+    model = MLXBitNet(_dblock_config())
+    clean = mx.eye(model.config.hidden_size)[:1][None]
+    monkeypatch.setattr(model, "dblock_forward_from_z", lambda *args, **kwargs: clean)
+    noise = mx.ones_like(clean)
+    actual = model.dblock_euler_step(clean + 2.0 * noise, mx.array(2.0), mx.array(sigma_out))
+    assert mx.allclose(actual, clean + sigma_out * noise).item()
+
+
 def test_dblock_ce_ignores_shifted_targets() -> None:
     mx.random.seed(7)
     model = MLXBitNet(_dblock_config())
@@ -219,6 +229,21 @@ def test_dblock_greedy_generate_returns_prompt_plus_suffix() -> None:
     assert out[:2] == prompt
     assert len(out) == 5
     assert all(0 <= token < 32 for token in out)
+
+
+@pytest.mark.parametrize("infer", ["euler", "loops"])
+def test_dblock_generation_excludes_undefined_ids(monkeypatch, infer) -> None:
+    from mlx_generate import dblock_greedy_generate
+
+    model = MLXBitNet(_dblock_config(dblock_infer=infer))
+    monkeypatch.setattr(
+        model, "logits_from",
+        lambda hidden: mx.broadcast_to(mx.arange(32), (*hidden.shape[:-1], 32)),
+    )
+    assert dblock_greedy_generate(
+        model, [1, 2], 3, euler_steps=1, valid_vocab_size=7,
+    ) == [1, 2, 6, 6, 6]
+    assert model.embedding.weight.shape[0] == 32
 
 
 def test_dblock_generate_honors_inference_num_loops_and_loops_mode() -> None:
