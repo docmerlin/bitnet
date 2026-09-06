@@ -433,7 +433,9 @@ class MLXHBitLinear(nn.Module):
     def prepare_input(self, x: mx.array) -> mx.array:
         if self.config.use_hadamard and self.input_dims & (self.input_dims - 1) == 0:
             x = mx.hadamard_transform(x)
-        return x
+        # Native fp8 e4m3. from_fp8 has no VJP, so STE keeps an identity gradient.
+        quantized = mx.from_fp8(mx.to_fp8(x), x.dtype)
+        return x + mx.stop_gradient(quantized - x)
 
     def effective_weight(
         self,

@@ -103,11 +103,13 @@ def test_config_from_saved_drops_retired_activation_fields() -> None:
             "use_4bit_activations": False,
             "quantize_activations": True,
             "activation_bits": 4,
+            "activation_dtype": "compute",
         }
     )
     assert not hasattr(config, "use_4bit_activations")
     assert not hasattr(config, "quantize_activations")
     assert not hasattr(config, "activation_bits")
+    assert not hasattr(config, "activation_dtype")
 
 
 def test_config_from_saved_still_rejects_an_unknown_field() -> None:

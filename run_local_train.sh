@@ -21,7 +21,6 @@ python3 train.py \
   --weight-decay 0.05 \
   --warmup-ratio 0.08 \
   --cooldown-ratio 0.05 \
-  --stage1-ratio 0.12 \
   --initial-blocks 8 \
   --final-blocks 16 \
   --hidden-size 512 \

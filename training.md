@@ -221,7 +221,7 @@ Primary throughput = non-padding raw input **bytes/second**, counted before patc
 
 ## MLX Training-Step Benchmark: 2026-07-13
 
-`mlx_benchmark.py` ports dominant dense block path to MLX: ternary weight + activation STE, dense Hadamard preprocess, exact chunked PaTH-FoX attention, sandwich RMSNorm, SwiGLU FFN, tied embeddings. Intentionally exclude Engram, Infini state writes, RFMoE, loop HC — isolate dense train path. Same dims + 100 optimizer steps over one fixed synthetic batch; loss not quality/convergence measure.
+`mlx_benchmark.py` ports dominant dense block path to MLX: ternary weight STE + native fp8 e4m3 activation STE (`mx.to_fp8` / `mx.from_fp8`; identity VJP), dense Hadamard preprocess, exact chunked PaTH-FoX attention, sandwich RMSNorm, SwiGLU FFN, tied embeddings. Intentionally exclude Engram, Infini state writes, RFMoE, loop HC — isolate dense train path. Same dims + 100 optimizer steps over one fixed synthetic batch; loss not quality/convergence measure.
 
 Small launch-bound shape (`2` layers, hidden `64`, sequence `64`, vocabulary `2,048`, PaTH window `16`):
 
@@ -258,10 +258,11 @@ python3 mlx_benchmark.py --backend torch --steps 100 --warmup-steps 5 \
 
 Implemented:
 
-- `mlx_model.py`: ternary blocks, native Hadamard, custom Metal PaTH solve, packed-document mask, Engram, Infini memory, grouped sparse RFMoE via conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda, MTP heads, dense square mid (cold-start mid master = identity).
+- `mlx_model.py`: ternary STE from step 0, native fp8 e4m3 activation STE on `MLXHBitLinear`, native Hadamard, custom Metal PaTH solve, packed-document mask, Engram, Infini memory, grouped sparse RFMoE via conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda, MTP heads, dense square mid (cold-start mid master = identity), opt-in DiffusionBlocks (`train_mode='dblock'`: Fourier σ embed + AdaRMS).
+- `dblocks/`: VE/EDM equi-probability schedule (`NoiseSchedule`) and DiT-style AdaRMS / `log σ` Fourier embedding. B=1 is the Huginn unique stack; B>1 slices unique layers equally (not prelude|recurrent|coda).
 - `mlx_rfmoe_kernel.py`: conditional grouped expert projections + sparse custom input/weight VJPs. Default hybrid: one host compaction, compact `gather_mm` forwards, compact route-wise backward kernels.
-- `mlx_train.py`: stream HF mixtures via existing tokenizer/packer, compiled BF16 grads + optimizer updates, activation ckpt, grad accum, CE/z/MTP/RF aux losses, quantization/loop/block/RF/data/LR curricula, val, JSONL metrics, resumable safetensor model/optimizer ckpts. Resume restore MLX RNG, mixture RNG, HF iterator positions, shuffle buffers, partial packed sequences.
-- `mlx_generate.py`: vanilla + MTP speculative greedy. MTP proposals use final hidden position only; verification accept only target-model argmax matches → generated tokens = vanilla greedy.
+- `mlx_train.py`: stream HF mixtures via existing tokenizer/packer, compiled BF16 grads + optimizer updates, activation ckpt, grad accum, CE/z/MTP/RF aux losses, loop/block/RF/data/LR curricula, val, JSONL metrics, resumable safetensor model/optimizer ckpts. Resume restore MLX RNG, mixture RNG, HF iterator positions, shuffle buffers, partial packed sequences. `--train-mode dblock` swaps the step for EDM-weighted denoise-CE on the noised tokens (not AR-shifted targets); val is denoise-CE on a fixed σ grid. `--precision` is `bfloat16` or `float32` (no float16). Startup prints `activations=fp8-e4m3`. Retired mix/bit keys still load and are dropped.
+- `mlx_generate.py`: vanilla + MTP speculative greedy on AR checkpoints. MTP proposals use final hidden position only; verification accept only target-model argmax matches → generated tokens = vanilla greedy. dblock checkpoints denoise the full window with VE Euler (B=1: `--dblock-euler-steps`, default 50, independent of `--num-loops`) then take suffix argmax.
 - `mlx_optim.py`: 64-row blockwise C-MUD for non-embedding mats + blockwise-int8 C-Lion for embeddings/norms/biases/gates; cautious mask, Metal triangular whitening, independent LRs, optional int8 CMUD matrix momentum, resumable optimizer state.
 - MLX default: four 4-sequence microbatches per optimizer update; activation ckpt off. Sampled MTP default depth 4; `--mtp-depth 0` disable. Smaller microbatches + `--gradient-checkpointing` on memory-tight machines. Override whitening `--mud-block-size`; converted/legacy ckpts keep original full-matrix C-MUD.
 - Five 4-sequence val batches keep previous default sample count; avoid 4x val expansion from larger microbatches. Val batches materialize once — repeated eval no rescan held-out offset.
@@ -287,17 +288,17 @@ Hybrid train beat static Metal 2.99x at 12.5% density, 3.86x at 50%, 4.05x at 10
 
 256-row C-MUD blocks + 16 accumulated 512-token microbatches: full dense MLX trainer 2,760 tok/s at curriculum depth 8, 1,304 tok/s at max depth 20. Synthetic-step figures include act recompute, grad clip, optimizer updates; exclude data load, val, ckpts.
 
-Same M1 Max, fixed max-depth real-data steps: 1,297 tok/s w/ original one-sequence, 16-accum checkpointed defaults. Disable act ckpt → 1,711; four-sequence microbatches × four accum → 2,594 tok/s, matching short-run loss + grad norms. Eight-sequence microbatches +~4% w/ less memory headroom; 16 sequences exceed practical unified-memory. Four-by-four = new default. Compile irregular curriculum layouts +17-30% short probes but regress sustained train via retained-graph memory pressure → stay eager. FP16 +~2% only, change loss trajectory immediately → BF16 stay default. 100-update run new defaults: train loss 2.7600, avg 2,999 tok/s over max-depth ckpts vs 2.7644 and 1,306 tok/s previous defaults. Val loss not directly comparable (new run 20 sequences vs earlier five-sequence A/B sample).
+Same M1 Max, fixed max-depth real-data steps: 1,297 tok/s w/ original one-sequence, 16-accum checkpointed defaults. Disable act ckpt → 1,711; four-sequence microbatches × four accum → 2,594 tok/s, matching short-run loss + grad norms. Eight-sequence microbatches +~4% w/ less memory headroom; 16 sequences exceed practical unified-memory. Four-by-four = new default. Compile irregular curriculum layouts +17-30% short probes but regress sustained train via retained-graph memory pressure → stay eager. FP16 +~2% only, change loss trajectory immediately → BF16 stay default; `--precision` no longer accepts `float16`. 100-update run new defaults: train loss 2.7600, avg 2,999 tok/s over max-depth ckpts vs 2.7644 and 1,306 tok/s previous defaults. Val loss not directly comparable (new run 20 sequences vs earlier five-sequence A/B sample).
 
 Effective ternary-weight reuse measure at production param scale. 32M-param proxy inconclusive; full 1.089B physical model hidden 1024, `8 + 48×4 + 8` layers, sequence 64, BF16 → repeatable gain. Two 20-step runs/mode: median 69.35 tok/s normal, 73.38 w/ forward-scoped recurrent weight reuse (+5.8%, identical loss). Reuse default on; recompute each forward so optimizer updates stay visible. Reproduce A/B w/ `mlx_benchmark.py` using `--num-prelude-layers 8 --num-layers 48 --num-coda-layers 8 --num-loops 4`; add `--reuse-recurrent-weights` for cached run.
 
-Recurrent dense projections use packed 2-bit Metal path once ternary curriculum reach full weight quant. `mlx_ternary_kernel.py` fuse row-scale reduction + ternary packing; MLX native `quantized_matmul` forward + input-grad; custom VJP keep STE weight grad. Full 1.089B physical model sequence 256: two 10-step BF16 → 55.38 vs 44.19 tok/s (+25.3%). Sequence 64 packing overhead → 4.6% regression, so `mlx_train.py` enable path only seq ≥128. Equal-token 48.33M sampled-MTP: 247.3 vs 285s (1.15x), val PPL 18.67 vs 18.58. New MLX runs enable by default; `--no-recurrent-quantized-matmul` for strict old arithmetic. Ckpts before flag resume old path.
+Recurrent dense projections use packed 2-bit Metal path. Ternary STE is on from step 0 (the old mix ramp is gone), so the only remaining gate is sequence length. `mlx_ternary_kernel.py` fuse row-scale reduction + ternary packing; MLX native `quantized_matmul` forward + input-grad; custom VJP keep STE weight grad. Full 1.089B physical model sequence 256: two 10-step BF16 → 55.38 vs 44.19 tok/s (+25.3%). Sequence 64 packing overhead → 4.6% regression, so `mlx_train.py` enable path only seq ≥128. Equal-token 48.33M sampled-MTP: 247.3 vs 285s (1.15x), val PPL 18.67 vs 18.58. New MLX runs enable by default; `--no-recurrent-quantized-matmul` for strict old arithmetic. Ckpts before flag resume old path.
 
 CMUD matrix momentum blockwise-int8 by default; not standalone MUD train path. Full 1.089B: optimizer state 7.68 → 5.03 GiB, init peak mem 9.98 → 7.28 GiB. Three compiled CMUD-only apply steps 0.123 → 0.234 steps/s. Seeded 48.33M equal-token: no end-to-end speed gain; val PPL 18.67 → 18.91. `--no-cmud-momentum-8bit` restore FP32 momentum. Legacy optimizer configs omit `mud_eight_bit` → FP32 momentum on resume. Full 1.089B sequence 256: three end-to-end CMUD steps 5.11 → 18.24 tok/s (3.57x), matching loss; FP32 state push 32 GiB M1 Max into severe unified-memory pressure.
 
 Dominant CMUD op = blockwise triangular decorrelation: 22.46 ms of 23.76 ms `2048×1024` matrix update. Cut independent whitening blocks 256 → 64 rows + batch all block solves one Metal launch: preserve exact blockwise arithmetic; common `1024×1024` + `2048×1024` decorrelation → 0.98 + 1.20 ms. 48M bench shape: CMUD 0.286 → 0.046s, end-to-end throughput 2,319 → 2,900 tok/s (+25%). Physical-1.089B active-loop-1 A/B keep optimizer size identical, limit thermal interference: CMUD 2.405→0.893s, end-to-end 75.17→134.09 tok/s (+78%). Full-depth sequential 1B runs stay thermally unstable on M1 Max.
 
-Smaller blocks not hurt short quality check. Equal-token 48.33M: val PPL 17.19, train loss 3.644 vs 18.91 / 3.758 w/ 256-row blocks. 274.6s wall excluded from speed compare (ran after multiple full-1B thermal stress tests). New MLX default `--mud-block-size 64`; resumed ckpts reconstruct saved optimizer block size.
+Smaller blocks not hurt short quality check. Equal-token 48.33M: val PPL 17.19, train loss 3.644 vs 18.91 / 3.758 w/ 256-row blocks. 274.6s wall excluded from speed compare (ran after multiple full-1B thermal stress tests). New MLX default `--mud-block-size 32` (small A/B beat 64 on val CE); `run_mlx_1b.sh` still passes 64. Resumed ckpts reconstruct saved optimizer block size.
 
 New MLX runs: BF16 MUD master weights, C-Lion masters stay FP32; `--cmud-master-dtype float32` restore FP32 MUD masters. Seeded 400-update, 3,276,800-token 48.33M A/B end 20-batch val loss/PPL 1.87602/6.52745 BF16 masters vs 1.87144/6.49765 FP32 masters (0.46% PPL regression). BF16 cut physical-1.089B active-loop-1 peak 10.57 → 8.80 GiB, matching five-step loss. Sequential runtime thermally unstable → memory save not speed supports default. Saved optimizer configs w/o dtype field retain FP32 masters on resume.
 
@@ -347,6 +348,35 @@ Full BLT + BitNet MLX benchmark, 2026-08-04: byte MTP belongs after BLT's causal
 Incremental MLX inference retain effective weights across prefill, token steps, batched verification; fully ternary ckpts use same packed 2-bit rep for cache lifetime. Interleaved six-sample synthetic 1.086B BF16, full-four-loop M1 Max: 1.23 tok/s rebuild dense effective weights each call, 3.71 persistent dense, 4.38 persistent packed. Random weights validate structural throughput only; speculative acceptance still need trained 1B MTP ckpt.
 
 100-update real-data A/B identical seed, stream, curriculum, five val batches every 20 updates: 256-row blocks vs full-matrix whitening. Blockwise C-MUD: val loss 2.7053 vs 2.7601, sustained 1,306 vs 1,118 tok/s at max depth, complete 1,078 vs 1,181s. Single seed support faster default; not statistical convergence study.
+
+### DiffusionBlocks (opt-in)
+
+`--train-mode dblock` (default remains `ar`) trains the unique stack as an
+embedding-space VE denoiser (Shing, Koyama, Akiba, ICLR 2026, arXiv:2506.14202).
+Not token-level LLaDA / BLT-D block diffusion.
+
+- **B=1** (`--dblock-blocks 1`): Huginn unique stack. Train samples σ from the
+  full truncated log-normal. Infer: K VE Euler evals of that stack
+  (`--dblock-euler-steps`, paper default 50). Independent of `--num-loops` (Huginn R).
+- **B>1**: unique layers sliced equal-width (remainder on the last block), not
+  prelude|recurrent|coda. Train picks a random block + σ on that block's overlapped
+  interval. Infer: one Euler step per block (`T=B`). `--dblock-layers-per-block N`
+  sets `B = ceil(L / N)`.
+- **Loss:** EDM weight `w(σ) = (σ² + σ_data²) / (σ · σ_data)²` times CE that
+  reconstructs the **noised tokens**, not AR-shifted targets. Logs `denoise_ce`
+  (unweighted) plus `dblock_block_id` / `dblock_sigma`.
+- **Val:** mean denoise-CE on σ ∈ {0.1, 1.0, 10.0}, not AR PPL.
+- **Constraints:** Engram forced off (clean ids leak the target). MTP rejected.
+  AdaRMS zero-init (identity residual norm until cond learns). Noisy embeds skip
+  SubLN (would rescale σ).
+- **Generate:** noise the full window at σ_max, Euler down to σ_min, suffix argmax.
+  Prompt prefix is returned unchanged. `--dblock-infer loops` is B=1 debug unroll.
+
+```bash
+python3 mlx_train.py --train-mode dblock --dblock-blocks 1 --mtp-depth 0
+python3 mlx_generate.py runs/mlx_bitnet/checkpoints/final.safetensors \
+  --prompt "The quick brown fox" --dblock-euler-steps 50
+```
 
 Use `mlx_train.py` for native MLX experiments; do not expect identical step-by-step loss vs `train.py` (backend kernels + RFMoE execution order differ).
 

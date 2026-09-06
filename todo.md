@@ -3,8 +3,10 @@
 Direction: MoE for **local, memory-bound** inference (single node, VRAM/RAM/disk),
 not data-center load-balanced serving. Concentrate expert usage into small hot set,
 stay VRAM-resident; offload cold tail. Self-gating experts → also extensible
-(append experts to cold tier). Repo already got ternary weights + 4-bit acts
-(`layers/h_bitlinear.py`) + logit z-loss.
+(append experts to cold tier). Repo already got ternary weights (STE from step 0) + logit z-loss.
+MLX BitNet activations are native fp8 e4m3 (`mx.to_fp8` / `mx.from_fp8` + STE);
+torch `HBitLinear` and BLT keep compute-dtype activations. Absmax fake-quant
+(`activation_bits`, mix ramps) is gone.
 
 ## Status
 
@@ -50,8 +52,8 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
   pre/post + loop embeds at each recurrent iteration. Hardcoded, not config knobs.
 - RFMoE grouped/padded GEMM execution: scores batch across experts; active token/expert pairs
   pack into batched expert-body matmuls while checkpoint parameter keys stay stable.
-- Ternary RFMoE experts: all score, gate, and body projections use `HBitLinear` weight/
-  activation quantization while retaining grouped execution.
+- Ternary RFMoE experts: all score, gate, and body projections use `HBitLinear`
+  (ternary STE weights; MLX also fp8-e4m3 activations) while retaining grouped execution.
 - Extensible RFMoE primitive: append cold experts dynamically, inherit quantization state,
   grow usage buffers, freeze old model weights, and train only appended experts with existing
   diversity loss as niche objective. Model config tracks new count for checkpoint reconstruction.
@@ -59,6 +61,8 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
   transitions plus forget gates use paper-exact logits. Local UT attention is capped by
   `--path-window-size` (64 default), so attention storage/work stays linear in total context;
   fixed-size Infini memory carries compressed information beyond local windows. BLT keeps RoPE.
+- **DiffusionBlocks** (MLX, opt-in `--train-mode dblock`): embedding-space VE, Huginn B=1
+  / 50 Euler, EDM-weighted denoise-CE. Not AR decode. See README / `training.md`.
 
 ## Next actions
 
@@ -76,7 +80,8 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
 6. **PaTH performance:** replace the current correct PyTorch PaTH-FoX UT reference path with
    a full optimized Triton kernel (FlashLinearAttention-style block scan, online softmax,
    efficient transformed-query/key preprocessing, and decode/cache support).
-7. **Diffusion (thread 3):** large new direction; locality reg (built) is prerequisite (see below).
+7. **Diffusion (thread 3):** embedding-space DiffusionBlocks is in (`--train-mode dblock`).
+   Token-level diffusion + local MoE serving is still open (see below).
 8. **Looped follow-ups (optional):** stochastic/Poisson R, input injection each loop,
    adaptive halt at eval, thinner middle rebalance.
 9. **Implemented trainability (2026-07):** R curriculum (`--min-num-loops` → `--num-loops` over
@@ -111,7 +116,7 @@ off when `min(weight.shape) < 512`; production Infini/PaTH geometry
   `inference_extend` now share one cache instead of re-scaling, thresholding, casting, and
   running fresh dense BF16 weights on every token and recurrent loop. Fully ternary checkpoints
   loaded by `mlx_generate.py` enable packed inference automatically.
-- [x] **Fused ternary M=1 decode kernel.** `ternary_fused_linear_m1` (act quant + add/sub GEMV) and `ternary_fused_ffn_m1` (up/mid/down) in one Metal dispatch for token decode; wired into `MLXHBitLinear` / dense FFN when M=1 and fully quantized.
+- [x] **Fused ternary M=1 decode kernel.** `ternary_fused_linear_m1` (ternary add/sub GEMV) and `ternary_fused_ffn_m1` (up/mid/down) in one Metal dispatch for token decode; wired into `MLXHBitLinear` / dense FFN when M=1. Activations are already fp8-e4m3 from `prepare_input`; the kernel no longer absmax-quantizes them.
 - [x] **Benchmark the 2-bit decode kernel at M=1.** An interleaved six-sample full-depth
   1.086B BF16 benchmark measured uncached dense at 1.23 tok/s, persistent dense at 3.71 tok/s,
   and persistent packed `mx.quantized_matmul` at 4.38 tok/s. The generic packed kernel wins;
@@ -247,10 +252,11 @@ No hidden pathology left; the remaining time is genuinely arithmetic.
   pass count scales with the *input* width while the matmul scales with input x output; that
   layer measured **4.10x a plain matmul**. One Metal kernel, one threadgroup per row: 2-7x on
   the quantiser, and the down projection drops to 1.80x a plain matmul (5.37 -> 2.60 ms).
-  Bit-identical for float32 and bfloat16 at every bit width, verified in
-  `tests/test_mlx_fused_activation_quant.py`; float16 at 16 bits can differ by one
-  quantisation step, a degenerate combination. Levels are a runtime input, not a template
-  constant, so ramping the bit width does not recompile. Wired into both stacks.
+  **Superseded 2026-09:** absmax fake-quant and this kernel are gone
+  (`tests/test_mlx_fused_activation_quant.py` deleted). MLX BitNet `prepare_input` now
+  uses native `mx.to_fp8` / `mx.from_fp8` (e4m3) with the same STE identity because
+  `from_fp8` has no VJP. Torch/BLT activations stay compute dtype. `--precision`
+  is `bfloat16` or `float32` (float16 dropped).
 - [x] **Chunked local sliding-window attention.** `local_window=256` at sequence 1024 built a
   dense [1024, 1024] bias and threw away 75% of the scores. Each query block now sees only the
   previous and current key blocks, folded onto the batch axis — one SDPA call, bit-identical
@@ -395,9 +401,10 @@ because MLX frees the fp32 copy before the peak); R43/R50 Cautious Weight Decay;
 LR decays to a floor rather than to zero; R26 long cooldown fraction (their `cooldown_frac`
 is 0.45-0.60, `--lr-schedule wsd` enforces >= 0.1 and documents ~0.4).
 
-**Not applicable.** FP8 head and FP8 MLP up-projection (R19, R84) — no FP8 path on Metal and
-the weights here are ternary. Triton kernels (R27, R59, R60, R79) — would be Metal kernels,
-and the fused-FFN M=1 decode kernel already exists. Flash Attention 3 (R29). All the
+**Not applicable.** FP8 *weights* for the head / MLP up-projection (R19, R84) — weights
+here are ternary. MLX BitNet *activations* now *are* native fp8 e4m3 (`mx.to_fp8`).
+Triton kernels (R27, R59, R60, R79) — would be Metal kernels, and the fused-FFN M=1
+decode kernel already exists. Flash Attention 3 (R29). All the
 distributed-communication records (R6, R22-24, R36, R71) — single device. PyTorch version
 bumps.
 
@@ -523,44 +530,40 @@ Superseded detail from the earlier pass:
   model collapses to uniform output after one update (loss lands exactly on ln(vocab))
   and NaNs on the next, at every width, learning rate and optimizer variant tried.
   Ternary weights are innocent -- `weight_mix=1.0` with `activation_mix=0.0` trains fine.
-  `mlx_train.py` had always ramped (`--stage1-activation-mix-start 0.0`); the BLT trainer
-  did not, and BLT's own `MLXHBitLinear` had no `set_quantization_state` at all, so it
-  could not be ramped. Added the knobs to match `layers/h_bitlinear.py`, plus
-  `MLXTernaryBLTModel.set_quantization_state` and a ramp in `MLXBLTTrainer`. Both the
-  plain and BitNet global backbones now train under CMUD.
-- [x] **Resolved by 8-bit activations.** The residual instability was specific to 4-bit.
-  Measured on the BitNet backbone at 8 patches over 64 bytes: 4-bit reaches NaN once the
-  ramp completes, 8-bit trains (5.674 -> 5.561). Costs nothing: activation quantisation
-  here is fake (`x + stop_gradient(q - x)`), the tensor stays float and the matmul is
-  float x ternary regardless, so bit width only sets the rounding grid. Benchmarked at
-  86M, batch 4, sequence 512: 4-bit 354.6ms/step, 8-bit 345.4ms, 16-bit 348.3ms, no
-  quantisation 345.9ms -- and on the forward alone, skipping quantisation entirely is
-  1.29x (110.3ms -> 85.5ms). `TernaryBLTConfig.activation_bits` now defaults to 8.
-- [x] **BitNet activation width defaulted to 8** (see performance backlog). CLI
-  `--final-activation-bits` and `MLXBitNetConfig.activation_bits` are 8; checkpoints that
-  saved 4 still load that value.
+  Historical: `mlx_train.py` ramped `--stage1-activation-mix-start`; BLT did not.
+- [x] **Resolved by 8-bit activations, then superseded.** Residual instability was
+  specific to 4-bit absmax fake-quant. 8-bit trained (5.674 -> 5.561) at the same
+  wall-clock because fake-quant left the tensor float. **2026-09:** absmax fake-quant,
+  mix ramps, `--final-activation-bits`, and `activation_bits` are gone. Ternary STE
+  is on from step 0. MLX BitNet activations are native fp8 e4m3 (`mx.to_fp8` /
+  `mx.from_fp8` + STE; `from_fp8` has no VJP). BLT `MLXHBitLinear` activations stay
+  full precision. Old mix/bit checkpoint keys still load and are dropped
+  (`migrate_quant_config` / `RETIRED_CONFIG_FIELDS`).
+- [x] **BitNet activation width defaulted to 8, then dropped.** See 2026-09 native
+  fp8-e4m3 note above. Checkpoints that saved `final_activation_bits: 4` still load;
+  the field is ignored.
 
 - [ ] **Padding is not inert for the BitNet backbone.** Zero-length patches perturb it:
   measured drift 0.0 / 1.4e-3 / 2.2e-1 at 1 / 2 / 8 layers, the last a relative error of
   1.0. It does not grow with the amount of padding, so a small perturbation is being
-  amplified through depth by the 4-bit activation quantisation (a step function -- one
-  flipped bucket cascades). Fixing the PaTH block width does not help, so the cause is
-  elsewhere in the block, most likely the AttnRes stream mixing across layers. Worked
-  around by patching to a fixed count (`patches_per_sequence`) so no padding exists;
-  worth finding the real cause, since it also means the backbone's output depends on
-  sequence length in a way it probably should not.
-- [ ] **Hash n-gram embeddings in the local encoder.** Engram cannot follow BLT into the
-  global model -- it hashes token n-grams and patches have no ids. Meta's BLT puts hash
-  n-gram embeddings in the local *encoder*, over bytes, which is the level at which
-  n-grams exist, and this repo has none. Closest existing code is `MLXEngram`.
+  amplified through depth. Originally blamed on 4-bit absmax fake-quant (a step
+  function -- one flipped bucket cascades); that path is gone. Re-measure under
+  native fp8-e4m3 before treating it as the same bug. Worked around by patching to a
+  fixed count (`patches_per_sequence`) so no padding exists; worth finding the real
+  cause, since it also means the backbone's output depends on sequence length in a
+  way it probably should not.
+- [x] **Hash n-gram embeddings in the local encoder.** Landed (`blt/ngram_hash.py`,
+  `MLXHashNgramEmbedding`); Engram still cannot follow BLT into the global model
+  (patches have no ids). See throughput-pass note above.
 - [ ] **Deduplicate HBitLinear.** Three implementations: `layers/h_bitlinear.py` (torch),
-  `mlx_model.py` (BitNet MLX), `blt/mlx_layers.py` (BLT MLX). The two MLX ones use
-  identical quantisation maths -- verified numerically -- but BitNet's adds weight
-  pinning, packed ternary kernels and quantisation-state ramping that BLT's lacks. BLT
-  should adopt it and inherit the fast paths; the blocker is that it takes an
-  `MLXBitNetConfig` and reads `activation_bits`, which `TernaryBLTConfig` has no field
-  for. The two MLX transformer blocks are *not* redundant: BLT's plain SwiGLU block is
-  right for the local encoder/decoder, where PaTH and Infini would not be.
+  `mlx_model.py` (BitNet MLX), `blt/mlx_layers.py` (BLT MLX). Weight STE maths still
+  match (abs-mean ternary + `sg(q)+(w-sg(w))`), but BitNet MLX now also does native
+  fp8-e4m3 STE in `prepare_input`, plus weight pinning and packed ternary kernels
+  that BLT's layer lacks. BLT activations stay full precision on purpose. Blocker is
+  no longer `activation_bits` (removed); it is that BitNet's layer takes
+  `MLXBitNetConfig` and the fp8 path is BitNet-only. The two MLX transformer blocks
+  are *not* redundant: BLT's plain SwiGLU block is right for the local encoder/decoder,
+  where PaTH and Infini would not be.
 
 ### BLT generation performance
 
@@ -636,7 +639,8 @@ regressions can be reverted.**
   arrays. Measure before adopting; prefer full unify + packed path for train.
 - [x] **Re-measured `--recurrent-quantized-matmul` (2026-08-04); keep default on.** Prior note
   claimed packed loses at every small training token count and only wins at full 1B. Fresh
-  interleaved A/B on current kernels (train fwd+bwd, weight_mix=1, act 8-bit):
+  interleaved A/B on current kernels (train fwd+bwd; then: weight_mix=1, act 8-bit
+  fake-quant — both retired; packed path now gates on seq ≥ 128 only):
 
   | setup | dense | packed | packed/dense |
   |---|---|---|---|
@@ -646,17 +650,23 @@ regressions can be reverted.**
 
   Isolated 1024→2048 GEMM still slows at ≥1024 tokens (1.10–1.12×), but end-to-end steps
   stay mildly faster with packed on — the old 52M “turn it off → 1.10×” result does not
-  reproduce. Keep CLI default True with existing guards (`seq ≥ 128`, `weight_mix ≥ 1`).
-  No scale gate flip.
+  reproduce. Keep CLI default True with the remaining guard (`seq ≥ 128`). The
+  `weight_mix ≥ 1` gate is gone (ternary STE from step 0). No scale gate flip.
 - [x] **Wall-clock curricula:** batch R46 default **1→4**; seq R72 still opt-in.
   Attention-window direction decided: default **grows** windows (16→8 blocks).
 - [x] **Drop first prelude MLP / first attention (R30/R35).** Implemented as flags;
   small A/Bs: MLP no speed win + slight quality loss; attn ~12% faster but clear
   quality loss. Defaults off.
-- [x] **BitNet activation width → 8-bit default.** BLT already at 8 (4-bit collapses after
-  ramp; fake-quant so train speed is flat). `MLXBitNetConfig.activation_bits`,
-  `--final-activation-bits` (torch+MLX trainers), and convert/generate fallbacks now 8.
-  Old checkpoints that saved `final_activation_bits: 4` still load that value.
+- [x] **BitNet activation width → 8-bit default, then dropped.** 4-bit absmax collapsed
+  after the ramp; 8-bit fake-quant was flat vs no-quant on train ms. **2026-09:** mix/bit
+  ramps and `--final-activation-bits` removed. MLX BitNet uses native fp8 e4m3 STE;
+  BLT stays full-precision activations. Old `final_activation_bits: 4` keys still load
+  and are ignored.
+- [x] **DiffusionBlocks on MLX** (`--train-mode dblock`). Embedding-space VE
+  (arXiv:2506.14202): Huginn B=1 unique stack, 50 Euler evals independent of
+  `--num-loops`; B>1 equal unique-layer slices. EDM-weighted CE on noised tokens;
+  val is denoise-CE. Engram off, MTP off. Generate is full-window Euler, not AR
+  decode. Not the MoE+token-diffusion local-serving bet in thread 3 below.
 
 **Generation:**
 
@@ -817,6 +827,11 @@ joint-optimality loss vs from-scratch (frozen olds can't co-adapt); new-expert u
 first, then cold); needs task boundaries (online append unsolved).
 
 ## Diffusion + MoE (thread 3) — locality reg is LOAD-BEARING
+
+Implemented on the MLX BitNet path, **not** this token-diffusion + MoE serving bet:
+`--train-mode dblock` is embedding-space VE DiffusionBlocks (Huginn B=1, 50 Euler).
+See README / `training.md`. The notes below are still the local-MoE + *token*
+diffusion argument; they are not the dblock trainer.
 
 Why: local inference (batch=1, idle parallel compute) → diffusion beats AR on latency (T≪N parallel
 denoising steps vs N sequential). Mercury 2 ~1000 tok/s; LLaDA 2.0 = MoE+diffusion @100B; DiffusionGemma

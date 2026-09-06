@@ -10,10 +10,13 @@ Early-stage research code. Interfaces, defaults, training behavior evolving fast
 ⚠️ **No checkpoint compatibility before 1.0.** Checkpoints are not portable across
 commits. Architecture and optimizer state layout change whenever a change is worth
 more than the old runs, and there is no migration path — resume from a checkpoint
-only within the commit that wrote it. Most recent break: the output head is now
-untied from the input embedding by default (`--no-tie-word-embeddings`), which adds
-an `lm_head.weight` parameter and splits the optimizer into three groups instead of
-two, so both model and optimizer state shapes moved.
+only within the commit that wrote it. Known *loadable* retired keys (dropped, not
+migrated): activation-quant mix/bit fields (`activation_bits`, `activation_dtype`,
+`use_4bit_activations`, `quantize_activations`, mix arrays) and Mamba/QK-Clip
+fields. Most recent structural breaks: DiffusionBlocks adds `sigma_embed` / AdaRMS
+when `--train-mode dblock`; the output head is untied by default
+(`--no-tie-word-embeddings`), which adds `lm_head.weight` and splits the optimizer
+into three groups.
 
 **Distillation teacher.** This repo distills from [Ornith 1.0](https://huggingface.co/deepreinforce-ai) (DeepReinforce AI) — an open-weights, MIT-licensed model family on HuggingFace. Open-weights teachers under permissive licenses only.
 
@@ -34,7 +37,12 @@ Original path, around:
 
 Key properties:
 
-- ternary linear layers via `HBitLinear`
+- ternary linear layers via `HBitLinear` — STE from step 0 (no mix ramp)
+- activations: MLX BitNet uses native fp8 e4m3 (`mx.to_fp8` / `mx.from_fp8` + STE);
+  PyTorch BitNet and BLT stay in the compute dtype. Absmax fake-quant and
+  `--final-activation-bits` are gone
+- opt-in MLX **DiffusionBlocks** (`--train-mode dblock`): embedding-space VE denoiser
+  (Huginn B=1, 50 Euler by default). AR next-token CE remains the default
 - compact DeepSeek Engram conditional memory (default injects e.g. layers 1 and 15 when in range):
   hashed bigram/trigram lookup; table size auto-scales to **~5% of body params**
   (`--engram-param-fraction`, or force `--engram-vocab-size`; `--no-engram` disables)
@@ -97,18 +105,23 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 - `data/`: dataset presets, mixture parsing, packing
 - `training/`: losses, schedules, checkpoints, runtime helpers
 - `mlx_model.py` / `mlx_train.py`: native MLX model and curriculum trainer
+  (AR default; `--train-mode dblock` for DiffusionBlocks)
+- `mlx_generate.py`: AR (+ MTP speculative) generate; dblock checkpoints use
+  full-window VE Euler, not token-by-token decode
 - `mlx_convert.py`: warm-convert PyTorch C-MUD checkpoints to MLX
 - `mlx_path_kernel.py`: trainable custom Metal solve for PaTH-FoX
 - `mlx_rfmoe_kernel.py`: differentiable conditional Metal expert projections
 - `mlx_ternary_kernel.py`: packed 2-bit recurrent ternary Metal matmul with STE backward
 - `mlx_optim.py`: native blockwise C-MUD with default int8 matrix momentum and int8 C-Lion
+- `dblocks/`: DiffusionBlocks VE/EDM schedule (`schedule.py`) and Fourier σ /
+  AdaRMS conditioning (`condition.py`)
 - `utils.py`: shared BLT RoPE, attention-mask, and checkpoint helpers
 - `data/streams.py`: packing + PrefetchStream
 - `training/runtime.py`: choose_device, AMP, logger, evaluate
 - `layers/hybrid_block.py`: main hybrid transformer block
 - `layers/engram.py`: DeepSeek Engram-style hashed N-gram conditional memory
 - `layers/infini_attention.py`: local PaTH-FoX attention + Infini memory handling
-- `layers/h_bitlinear.py`: ternary / Hadamard linear layer
+- `layers/h_bitlinear.py`: ternary / Hadamard linear (torch; activations unquantized)
 - `layers/rfmoe.py`: routing-free MoE FFN
 - `tokenizer/`: hierarchical tokenizer
 - `run_train.sh`: full BitNet training launcher
@@ -139,6 +152,9 @@ BitNet path examples:
 - `tests/test_infini_attention_memory.py`
 - `tests/test_h_bitlinear.py`
 - `tests/test_config_validation.py`
+- `tests/test_mlx_dblock.py`
+- `tests/test_mlx_fp8_activations.py`
+- `tests/test_dblocks_schedule.py`
 
 BLT path examples:
 
@@ -211,12 +227,51 @@ These launchers drive `train.py`, not BLT stack.
 
 Generate from a native MLX checkpoint. Checkpoints trained with `--mtp-depth` use exact
 greedy speculative decoding by default; pass `--no-speculative` for the vanilla baseline.
-Generation retains ternary weights across the whole cache lifetime and automatically uses
-packed 2-bit matmul once the checkpoint has reached full weight quantization.
+Weights are ternary from step 0; generation pins them for the cache lifetime and uses
+packed 2-bit matmul when packing is valid (`min(shape) >= 32`, last dim `% 32 == 0`).
 
 ```bash
 python3 mlx_generate.py runs/bitnet/checkpoints/final.safetensors \
   --prompt "The quick brown fox" --max-new-tokens 64
+```
+
+A `--train-mode dblock` checkpoint does **not** AR-decode. `mlx_generate.py` noises the
+full window, runs VE Euler (B=1: `--dblock-euler-steps`, paper 50, independent of
+`--num-loops`; B>1: one step per block), then takes suffix argmax. Prompt tokens are
+returned unchanged. `--dblock-infer loops` is a B=1 debug unroll of Huginn R.
+
+### MLX quantization
+
+Ternary STE is on from step 0. There is no `--stage1-ratio` / weight-activation mix
+ramp, and `--final-activation-bits` / `activation_bits` are gone.
+
+- **Weights:** per-output abs-mean ternary `{-1, 0, 1}` with STE on every `HBitLinear`.
+- **MLX BitNet activations:** native fp8 e4m3. `mx.from_fp8` has no VJP, so
+  `prepare_input` uses an identity STE: `x + stop_gradient(q - x)`. Compute dtype is
+  `--precision {bfloat16,float32}` (float16 is not a trainer option). Startup logs
+  `activations=fp8-e4m3`.
+- **PyTorch BitNet and BLT:** activations stay in the compute dtype (Hadamard only).
+
+Packed 2-bit *training* matmul (`--recurrent-quantized-matmul`) still requires
+sequence length ≥ 128.
+
+### DiffusionBlocks (opt-in MLX)
+
+`--train-mode dblock` trains the unique stack as an embedding-space VE denoiser
+(Shing, Koyama, Akiba, ICLR 2026, [arXiv:2506.14202](https://arxiv.org/abs/2506.14202)).
+Default remains AR next-token CE.
+
+- `B=1` (`--dblock-blocks 1`): Huginn unique stack. Infer uses
+  `--dblock-euler-steps` (default 50), **not** `--num-loops`.
+- `B>1`: equal unique-layer slices; infer is one Euler step per block.
+  `--dblock-layers-per-block N` sets `B = ceil(unique_layers / N)`.
+- Train loss is EDM-weighted CE on the **noised tokens** (not AR-shifted targets).
+  Val reports denoise-CE on a fixed σ grid, not AR perplexity.
+- Engram is forced off (clean token ids would leak the diffusion target). MTP is
+  AR-only (`mtp_depth` is zeroed). AdaRMS is zero-init; noisy embeds skip SubLN.
+
+```bash
+python3 mlx_train.py --train-mode dblock --dblock-blocks 1 --mtp-depth 0
 ```
 
 ### MLX activation checkpointing
@@ -240,8 +295,8 @@ python3 mlx_train.py --profile-phases
 Logs separate data, forward/backward, CMUD, synchronization wait, and validation timing.
 Synchronization wait overlaps compute phases because MLX evaluates lazy graphs in `mx.eval`.
 
-New MLX runs use batched 64-row CMUD whitening. `--mud-block-size` remains available for
-ablation; resumed checkpoints retain their saved block size.
+New MLX runs use batched 32-row CMUD whitening (A/B vs 64). `--mud-block-size` remains
+available; `run_mlx_1b.sh` still passes 64. Resumed checkpoints retain their saved block size.
 
 New MLX runs store MUD matrix masters in BF16 while retaining FP32 C-Lion masters for
 embeddings and other fallback parameters. `--cmud-master-dtype float32` restores FP32 MUD
@@ -345,7 +400,8 @@ Relevant flags:
   540M seq 64→128 was slower wall with no quality free lunch
 - `--mud-passes` — triangular-whitening passes `p` (default `1` = MUD1; `2` for
   harder landscapes)
-- `--mud-block-size` — independent whitening rows per block (default `64`)
+- `--mud-block-size` — independent whitening rows per block (default `32`;
+  `run_mlx_1b.sh` keeps 64)
 - `--no-cautious` — drop cautious mask (plain MUD + Lion)
 - `--no-optimizer-8bit` — keep C-Lion fallback momentum full precision
 
@@ -577,12 +633,12 @@ python3 tests/test_blt_distill_smoke.py
 python3 tests/test_blt_teacher_adapter.py
 python3 tests/test_blt_train_cli.py
 python3 tests/test_blt_resume_eval_patcher.py
+```
 
-Or run the full script-style suite with pytest from the repo root:
+Or run the full suite with pytest from the repo root:
 
 ```bash
 python3 -m pytest
-```
 ```
 
 Syntax-only verification for edited files:
@@ -601,6 +657,9 @@ python3 -m py_compile path/to/file.py
 - Cache and performance optimizations must be benchmarked with at least 500M physical
   parameters, preferably the full 1B configuration. Smaller shapes are smoke tests only.
 - BitNet and BLT paths intentionally separate; features added to one not auto-mirrored in other.
+  Native fp8-e4m3 activations are MLX BitNet only; BLT activations stay full precision.
+- `--train-mode dblock` eval is denoise-CE, not AR perplexity; generate is full-window
+  Euler, not token-by-token decode.
 
 ## Notes
 

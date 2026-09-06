@@ -103,7 +103,7 @@ def _ternary_quantized_linear_vjp(primals, cotangent, _output):
 
 
 # ---------------------------------------------------------------------------
-# Decode-optimized M=1 path: optional absmax act quant + ternary add/sub GEMV
+# Decode-optimized M=1 path: ternary add/sub GEMV (activations already prepared)
 # Pack layout matches pack_ternary_weight: 2 bits/weight, 16 codes per uint32,
 # code 0 -> -1, 1 -> 0, 2 -> +1, times per-row (replicated per-group) scale.
 # ---------------------------------------------------------------------------

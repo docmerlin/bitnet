@@ -23,6 +23,7 @@ def migrate_quant_config(settings: dict) -> dict:
         "use_4bit_activations",
         "quantize_activations",
         "activation_bits",
+        "activation_dtype",
     ):
         settings.pop(key, None)
     return settings

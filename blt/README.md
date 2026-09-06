@@ -32,6 +32,8 @@ Quick smoke run:
 
 Notes:
 
+- Activations stay full precision. Absmax fake-quant / `activation_bits` were removed;
+  native fp8-e4m3 is MLX BitNet only (`mlx_model.MLXHBitLinear`), not this stack.
 - Run from repo root, or let scripts relocate there automatically.
 - BLT package lives under `blt/`, but runs as Python module from repo root via `python3 -m blt`.
 - `run_train.sh` and `run_local_train.sh` stay for old BitNet stack. Not BLT entrypoints.

@@ -67,6 +67,7 @@ RETIRED_CONFIG_FIELDS = frozenset(
         "use_4bit_activations",
         "quantize_activations",
         "activation_bits",
+        "activation_dtype",
     }
 )
 
@@ -386,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rfmoe-zipf-s", type=float, default=1.0)
     parser.add_argument("--rfmoe-uniform-alpha", type=float, default=0.1)
     parser.add_argument("--rfmoe-curriculum-ratio", type=float, default=0.0)
-    parser.add_argument("--precision", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--precision", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gradient-checkpoint-scope", choices=("recurrent", "all"), default="recurrent")
@@ -1084,8 +1085,9 @@ def main() -> None:
             flush=True,
         )
     model = MLXBitNet(config)
-    dtype = {"bfloat16": mx.bfloat16, "float16": mx.float16, "float32": mx.float32}[args.precision]
+    dtype = {"bfloat16": mx.bfloat16, "float32": mx.float32}[args.precision]
     model.set_dtype(dtype)
+    print(f"precision={args.precision} activations=fp8-e4m3", flush=True)
     if args.resume_from and saved.get("optimizer_config"):
         # Drop retired CMUD fields so older checkpoints still load.
         optimizer_config = {
