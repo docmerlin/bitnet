@@ -173,3 +173,35 @@ class AttnResStream:
         if self.partial is not None:
             return self.mlp_mix(self.completed, self.partial)
         return self.completed[-1]
+
+    def pack(self) -> tuple[tuple[torch.Tensor, ...], Optional[torch.Tensor], bool, int, torch.Tensor]:
+        """Immutable snapshot for non-reentrant checkpointing, without tensor copies.
+
+        Python bookkeeping stays on the host; no device-to-host scalar reads are
+        needed during forward or recomputation. Tuples protect the completed list
+        from later stream mutation while retaining its autograd connections.
+        """
+        return tuple(self.completed), self.partial, self.partial is not None, self.layers_in_block, self.last_hidden
+
+    @classmethod
+    def unpack(
+        cls,
+        completed: tuple[torch.Tensor, ...],
+        partial: Optional[torch.Tensor],
+        has_partial: bool,
+        layers: int,
+        last_hidden: torch.Tensor,
+        *,
+        group_size: int,
+        attn_mix: DepthAttnMix,
+        mlp_mix: DepthAttnMix,
+    ) -> "AttnResStream":
+        return cls(
+            completed=list(completed),
+            partial=partial if has_partial else None,
+            layers_in_block=layers,
+            group_size=group_size,
+            last_hidden=last_hidden,
+            attn_mix=attn_mix,
+            mlp_mix=mlp_mix,
+        )

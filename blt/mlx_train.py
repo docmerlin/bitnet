@@ -103,6 +103,19 @@ def learning_rate_at(step: int, config: TrainingConfig) -> float:
     return config.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _source_is_unpadded(source) -> bool:
+    """Host-side: ByteCorpus never pads; a teacher cache may.
+
+    Used once at trainer init so compiled steps do not inspect masks on device.
+    """
+    if isinstance(source, ByteCorpus):
+        return True
+    arrays = getattr(source, "_arrays", None)
+    if not arrays or "mask" not in arrays:
+        return False
+    return bool(np.all(np.asarray(arrays["mask"])))
+
+
 def clip_gradients(gradients, max_norm: float):
     """Global-norm clip. Returns ``(gradients, norm)``; norm is pre-clip."""
     flat = [g for _, g in tree_flatten(gradients)]
@@ -184,8 +197,13 @@ class MLXBLTTrainer:
             weight_decay=config.weight_decay,
             block_size=config.mud_block_size,
         )
+        # CMUD masters contain parameter values, so lazy initialization from
+        # gradients would corrupt the very first eager update as well.
+        self.optimizer.init(self.model.trainable_parameters())
         self._rng = np.random.default_rng(config.seed)
+        self._unpadded = _source_is_unpadded(source)
         self._loss_and_grad = nn.value_and_grad(self.model, self._loss)
+        self._apply_step = None
         # Config-time rather than per-batch: detecting padding means reading the
         # mask, which forces a sync and blocks compilation.
         if (
@@ -212,12 +230,33 @@ class MLXBLTTrainer:
             self._loss_and_grad = mx.compile(
                 self._loss_and_grad, inputs=[self.model.state], outputs=[self.model.state]
             )
+            # Clip + optimizer are a separate compiled closure, matching root
+            # mlx_train.create_apply_step. Init state before tracing so the
+            # first apply does not rebuild the graph. Do not fuse this with
+            # the gradient transform.
+            apply_state = [self.model.state, self.optimizer.state]
+            grad_clip = config.grad_clip
+            learning_rate = config.learning_rate
+
+            def apply_step(gradients, lr_scale):
+                if hasattr(self.optimizer, "set_lr_multiplier"):
+                    self.optimizer.set_lr_multiplier(lr_scale)
+                else:
+                    self.optimizer.learning_rate = lr_scale * learning_rate
+                gradients, grad_norm = clip_gradients(gradients, grad_clip)
+                self.optimizer.update(self.model, gradients)
+                return grad_norm
+
+            self._apply_step = mx.compile(
+                apply_step, inputs=apply_state, outputs=apply_state
+            )
 
     def _terms(self, batch: dict[str, mx.array]):
         output = self.model(
             batch["tokens"],
             attention_mask=batch["mask"],
             patch_lengths=batch["patch_lengths"],
+            unpadded=self._unpadded,
         )
         loss, metrics = blt_distillation_loss(
             output.logits,
@@ -315,21 +354,21 @@ class MLXBLTTrainer:
     ) -> dict[str, float]:
         rate = learning_rate_at(step_index, self.config)
         multiplier = rate / self.config.learning_rate if self.config.learning_rate else 0.0
-        if hasattr(self.optimizer, "set_lr_multiplier"):
-            self.optimizer.set_lr_multiplier(multiplier)
-        else:
-            self.optimizer.learning_rate = rate
 
         (loss, loss_metrics), gradients = self._loss_and_grad(batch)
-        gradients, grad_norm = clip_gradients(gradients, self.config.grad_clip)
-        self.optimizer.update(self.model, gradients)
-        mx.eval(
-            self.model.parameters(),
-            self.optimizer.state,
-            loss,
-            grad_norm,
-            *(loss_metrics.values() if breakdown else ()),
-        )
+        # Materialize the gradient graph before the optimizer closure, the same
+        # boundary root mlx_train keeps between create_gradient_step and apply.
+        mx.eval(loss, gradients, *(loss_metrics.values() if breakdown else ()))
+        if self._apply_step is not None:
+            grad_norm = self._apply_step(gradients, mx.array(multiplier, dtype=mx.float32))
+        else:
+            if hasattr(self.optimizer, "set_lr_multiplier"):
+                self.optimizer.set_lr_multiplier(multiplier)
+            else:
+                self.optimizer.learning_rate = rate
+            gradients, grad_norm = clip_gradients(gradients, self.config.grad_clip)
+            self.optimizer.update(self.model, gradients)
+        mx.eval(self.model.parameters(), self.optimizer.state, grad_norm)
 
         metrics = {"loss": float(loss), "grad_norm": float(grad_norm), "learning_rate": rate}
         if breakdown:
@@ -347,10 +386,6 @@ class MLXBLTTrainer:
             raise ValueError("accumulated_step needs at least one batch")
         rate = learning_rate_at(step_index, self.config)
         multiplier = rate / self.config.learning_rate if self.config.learning_rate else 0.0
-        if hasattr(self.optimizer, "set_lr_multiplier"):
-            self.optimizer.set_lr_multiplier(multiplier)
-        else:
-            self.optimizer.learning_rate = rate
 
         accumulated = None
         metric_sums: dict[str, float] = {}
@@ -367,8 +402,16 @@ class MLXBLTTrainer:
                 metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
 
         accumulated = tree_map(lambda gradient: gradient / len(batches), accumulated)
-        accumulated, grad_norm = clip_gradients(accumulated, self.config.grad_clip)
-        self.optimizer.update(self.model, accumulated)
+        mx.eval(accumulated)
+        if self._apply_step is not None:
+            grad_norm = self._apply_step(accumulated, mx.array(multiplier, dtype=mx.float32))
+        else:
+            if hasattr(self.optimizer, "set_lr_multiplier"):
+                self.optimizer.set_lr_multiplier(multiplier)
+            else:
+                self.optimizer.learning_rate = rate
+            accumulated, grad_norm = clip_gradients(accumulated, self.config.grad_clip)
+            self.optimizer.update(self.model, accumulated)
         mx.eval(self.model.parameters(), self.optimizer.state, grad_norm)
 
         metrics = {name: value / len(batches) for name, value in metric_sums.items()}

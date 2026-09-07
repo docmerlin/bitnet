@@ -100,6 +100,24 @@ def _ones_mask(tokens: mx.array) -> mx.array:
     return mx.ones(tokens.shape, dtype=mx.bool_)
 
 
+def _ngram_embed_window(model: MLXTernaryBLTModel) -> int:
+    """Bytes the last position's hash n-grams can see, or 1 when n-grams are off."""
+    ngrams = model.ngram_embeddings
+    return 1 if ngrams is None else max(ngrams.sizes)
+
+
+def _embed_last_byte(model: MLXTernaryBLTModel, tokens: mx.array) -> mx.array:
+    """Embedding of the last byte, using only the n-gram suffix.
+
+    Hash n-grams of size ``n`` need ``n - 1`` previous bytes; a lone tail token
+    hashes as if padded. Transformer KV caches already hold the prefix, so the
+    rest of the sequence does not need to be re-embedded.
+    """
+    window = min(tokens.shape[1], _ngram_embed_window(model))
+    suffix = tokens[:, -window:]
+    return model.embed_bytes(suffix, _ones_mask(suffix))[:, -1:]
+
+
 def _run_global(
     model: MLXTernaryBLTModel, tokens: mx.array, patching: _Patching, stats: GenerationStats
 ) -> tuple[mx.array, mx.array]:
@@ -120,14 +138,17 @@ def _run_global(
 class _DraftCache:
     """Self-attn K/V for encoder and decoder while drafting against frozen latents.
 
-    Invalidated after every global pass. ``last_logits`` holds the head input
-    (decoder hidden at the last committed position) for the next argmax.
+    Invalidated after every global pass. ``last_hidden`` holds the decoder
+    hidden at the last committed position for the next argmax. Cross-attn
+    projections of the frozen latents are reused for the cache lifetime.
     """
 
     encoder: list[tuple[mx.array, mx.array]] | None = None
     decoder: list[tuple[mx.array, mx.array]] | None = None
     length: int = 0
     last_hidden: mx.array | None = None
+    prepared_latents: mx.array | None = None
+    cross_projected: list | None = None
 
 
 def _decoder_patches(latents: mx.array) -> mx.array:
@@ -152,6 +173,7 @@ def _ensure_draft_prefill(
         draft_cache.encoder is not None
         and draft_cache.decoder is not None
         and draft_cache.last_hidden is not None
+        and draft_cache.prepared_latents is not None
         and draft_cache.length == length
     ):
         return
@@ -159,14 +181,16 @@ def _ensure_draft_prefill(
     embeds = model.embed_bytes(tokens, attention_mask)
     hidden, enc_caches = model.local_encoder.encode_bytes_prefill(embeds)
     stats.draft_encoder += 1
-    decoded, dec_caches = model.local_decoder.prefill(
-        hidden, _decoder_patches(latents), patch_ids
-    )
+    decoder_patches = _decoder_patches(latents)
+    decoded, dec_caches = model.local_decoder.prefill(hidden, decoder_patches, patch_ids)
     stats.decoder += 1
+    latent, projected = model.local_decoder.prepare_cross_cache(decoder_patches)
     draft_cache.encoder = enc_caches
     draft_cache.decoder = dec_caches
     draft_cache.length = length
     draft_cache.last_hidden = decoded[:, -1:]
+    draft_cache.prepared_latents = latent
+    draft_cache.cross_projected = projected
 
 
 def _draft(
@@ -198,21 +222,26 @@ def _draft(
             [patch_ids, mx.full((1, 1), next_id, dtype=patch_ids.dtype)], axis=1
         )
         # Fold the newly committed byte into the caches and refresh last_hidden
-        # for the next prediction. Embed over the *full* prefix: hash n-grams
-        # need the preceding bytes (a lone tail token hashes as if padded).
+        # for the next prediction. Hash n-grams only need max(ngram_sizes)
+        # trailing bytes; the self-attn cache already holds the prefix.
         offset = tokens.shape[1] - 1
-        full_embed = model.embed_bytes(tokens, _ones_mask(tokens))
-        new_embed = full_embed[:, -1:]
+        new_embed = _embed_last_byte(model, tokens)
         new_hidden, enc_caches = model.local_encoder.encode_bytes_extend(
             new_embed, draft_cache.encoder, offset=offset
         )
         stats.draft_encoder += 1
+        if draft_cache.prepared_latents is None:
+            latent, projected = model.local_decoder.prepare_cross_cache(decoder_patches)
+            draft_cache.prepared_latents = latent
+            draft_cache.cross_projected = projected
         decoded, dec_caches = model.local_decoder.extend(
             new_hidden,
             decoder_patches,
             patch_ids[:, -1:],
             draft_cache.decoder,
             offset=offset,
+            latent=draft_cache.prepared_latents,
+            cross_projected=draft_cache.cross_projected,
         )
         stats.decoder += 1
         draft_cache.encoder = enc_caches

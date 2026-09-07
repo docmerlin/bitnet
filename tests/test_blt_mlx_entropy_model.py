@@ -14,11 +14,13 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from blt.config import TernaryBLTConfig
 from blt.mlx_entropy_model import MLXByteEntropyModel
+from blt.mlx_entropy_model import boundaries_by_count as mlx_boundaries_by_count
 from blt.mlx_entropy_model import boundaries_from_entropy as mlx_boundaries
 from blt.mlx_entropy_model import calibrate_threshold as mlx_calibrate
 from blt.mlx_entropy_model import cap_patch_lengths as mlx_cap
 from blt.mlx_entropy_model import next_byte_entropy as mlx_entropy
 from blt.mlx_entropy_model import patch_lengths_from_starts as mlx_lengths
+from blt.mlx_entropy_model import uniform_patch_lengths
 from blt.patching.entropy_model import (
     ByteEntropyModel,
     boundaries_from_entropy,
@@ -208,3 +210,35 @@ def test_oversized_sequence_is_refused():
     model = MLXByteEntropyModel(_config(), dim=32, num_layers=1, num_heads=4, max_seq_len=16)
     with pytest.raises(ValueError, match="exceeds max_seq_len"):
         model(mx.zeros((1, 17), dtype=mx.int32))
+
+
+def test_disabled_cap_is_identity():
+    starts = mx.array([[True, False, True, False]])
+    assert np.array_equal(np.asarray(mlx_cap(starts, 0)), np.asarray(starts))
+    assert np.array_equal(np.asarray(mlx_cap(starts, -1)), np.asarray(starts))
+    empty = mx.zeros((2, 0), dtype=mx.bool_)
+    assert np.array_equal(np.asarray(mlx_cap(empty, 4)), np.asarray(empty))
+
+
+@pytest.mark.parametrize("seq_len,num_patches", [(1, 1), (8, 1), (8, 8), (10, 3), (64, 16), (7, 4)])
+def test_fixed_count_widths_match_positional_starts(seq_len, num_patches):
+    dummy = mx.zeros((3, seq_len))
+    expected = mlx_lengths(mlx_boundaries_by_count(dummy, num_patches))
+    actual = uniform_patch_lengths(3, seq_len, num_patches)
+    assert np.array_equal(np.asarray(actual), np.asarray(expected))
+    assert np.all(np.asarray(actual).sum(axis=1) == seq_len)
+    widths = np.asarray(actual)[0]
+    assert widths.max() - widths.min() <= 1
+
+
+def test_predict_patch_lengths_fixed_count_skips_entropy(monkeypatch):
+    _, model = _pair()
+    tokens = mx.array(_tokens(seq=16))
+
+    def boom(_ids):
+        raise AssertionError("fixed-count mode must not run entropy")
+
+    monkeypatch.setattr(model, "entropy", boom)
+    lengths = np.asarray(model.predict_patch_lengths(tokens, num_patches=4))
+    assert lengths.shape == (2, 4)
+    assert np.all(lengths.sum(axis=1) == 16)

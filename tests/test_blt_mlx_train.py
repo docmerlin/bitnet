@@ -201,6 +201,48 @@ def test_gradient_clipping_caps_the_norm():
     assert float(total) == pytest.approx(1.0, abs=1e-5)
 
 
+@pytest.mark.parametrize("accumulation", [1, 2])
+@pytest.mark.parametrize("optimizer_kind", ["cmud", "adam"])
+def test_separate_compiled_apply_matches_eager(tmp_path, accumulation, optimizer_kind):
+    import mlx.optimizers as optim
+
+    config = _config()
+    source = _cache(tmp_path, config)
+    trainers = []
+    for compiled in (False, True):
+        mx.random.seed(12)
+        model = MLXTernaryBLTModel(config)
+        optimizer = optim.Adam(learning_rate=2e-3) if optimizer_kind == "adam" else None
+        trainers.append(MLXBLTTrainer(
+            model, source,
+            TrainingConfig(steps=5, batch_size=2, compile_step=compiled, grad_clip=0.1, warmup_steps=2),
+            optimizer=optimizer,
+        ))
+    eager, compiled = trainers
+    assert compiled._apply_step is not None
+    loss_and_grad = eager._loss_and_grad
+    for step in range(3):
+        batches = [eager.sample_batch() for _ in range(accumulation)]
+        # Compare optimizer closures on identical gradients. Tiny fused-forward
+        # rounding can cross a ternary threshold on subsequent model passes.
+        results = [loss_and_grad(batch) for batch in batches]
+        mx.eval(results)
+        for trainer in trainers:
+            pending = iter(results)
+            trainer._loss_and_grad = lambda batch, pending=pending: next(pending)
+        a = eager.accumulated_step(batches, step) if accumulation > 1 else eager.step(batches[0], step)
+        b = compiled.accumulated_step(batches, step) if accumulation > 1 else compiled.step(batches[0], step)
+        assert a["grad_norm"] == pytest.approx(b["grad_norm"], rel=3e-4, abs=2e-5)
+        assert a["loss"] == pytest.approx(b["loss"], rel=3e-5)
+        for left, right in ((eager.model.parameters(), compiled.model.parameters()),
+                            (eager.optimizer.state, compiled.optimizer.state)):
+            left, right = dict(tree_flatten(left)), dict(tree_flatten(right))
+            assert left.keys() == right.keys()
+            for name, x in left.items():
+                y = right[name]
+                assert mx.allclose(x, y, atol=3e-5, rtol=3e-4).item(), (step, name, float(mx.max(mx.abs(x.astype(mx.float32) - y.astype(mx.float32)))))
+
+
 def test_gradient_clipping_leaves_small_gradients_alone():
     gradients = {"a": mx.array([0.3, 0.4])}
     clipped, norm = clip_gradients(gradients, 1.0)

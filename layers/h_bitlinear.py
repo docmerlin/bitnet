@@ -22,16 +22,26 @@ _HADAMARD_DEVICE_CACHE: dict[tuple[int, str, int | None, torch.dtype], torch.Ten
 _EFFECTIVE_WEIGHT_CACHE: ContextVar[dict[tuple[int, torch.dtype], torch.Tensor] | None] = ContextVar(
     "effective_weight_cache", default=None
 )
+_GROUPED_WEIGHT_CACHE: ContextVar[dict[tuple[int, int, int, torch.dtype], torch.Tensor] | None] = ContextVar(
+    "grouped_weight_cache", default=None
+)
 
 
 @contextlib.contextmanager
 def reuse_effective_weights():
     """Reuse quantized weights within one recurrent forward scope."""
     token = _EFFECTIVE_WEIGHT_CACHE.set({})
+    grouped = _GROUPED_WEIGHT_CACHE.set({})
     try:
         yield
     finally:
         _EFFECTIVE_WEIGHT_CACHE.reset(token)
+        _GROUPED_WEIGHT_CACHE.reset(grouped)
+
+
+def grouped_weight_cache() -> dict[tuple[int, int, int, torch.dtype], torch.Tensor] | None:
+    """Forward-scoped grouped ternary stacks, or None outside a reuse scope."""
+    return _GROUPED_WEIGHT_CACHE.get()
 
 
 def hadamard_matrix(size: int) -> torch.Tensor:

@@ -104,6 +104,35 @@ def test_degenerate_seq_len_is_refused(tmp_path):
         ByteCorpus(path, seq_len=1)
 
 
+def test_corpus_index_is_per_file_not_per_sequence(tmp_path):
+    paths = [write_byte_corpus(tmp_path / f"{i}.bin", bytes(range(40))) for i in range(3)]
+    corpus = ByteCorpus(paths, seq_len=8, stride=2)
+    assert not hasattr(corpus, "_all_starts")
+    assert not hasattr(corpus, "_all_files")
+    assert corpus._counts.shape == (3,)
+    assert corpus._cumulative.shape == (3,)
+    # 40-byte file, seq 8, stride 2 -> (40-8)//2+1 = 17 sequences each.
+    assert corpus._counts.tolist() == [17, 17, 17]
+    assert len(corpus) == 51
+
+
+def test_corpus_searchsorted_matches_explicit_file_offsets(tmp_path):
+    first = write_byte_corpus(tmp_path / "a.bin", bytes(range(20)))
+    second = write_byte_corpus(tmp_path / "b.bin", bytes(range(50, 80)))
+    seq_len, stride, offset = 5, 3, 4
+    corpus = ByteCorpus([first, second], seq_len=seq_len, stride=stride, offset=offset)
+    files = [np.frombuffer(first.read_bytes(), dtype=np.uint8), np.frombuffer(second.read_bytes(), dtype=np.uint8)]
+    expected_rows = []
+    for data in files:
+        for start in range(0, data.size - seq_len + 1, stride):
+            expected_rows.append((data[start : start + seq_len].astype(np.int32) + offset).tolist())
+    assert len(corpus) == len(expected_rows)
+    order = [0, len(corpus) - 1, 1, len(corpus) // 2]
+    tokens = corpus.batch(order)["tokens"]
+    for row, index in enumerate(order):
+        assert tokens[row].tolist() == expected_rows[index]
+
+
 def _trainer(tmp_path, *, patcher=None, **overrides):
     config = _config()
     mx.random.seed(0)

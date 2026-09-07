@@ -47,6 +47,19 @@ def test_corpus_special_token_literals_and_actual_vocabulary() -> None:
                for byte in tokenizer._expand_token(token))
 
 
+def test_second_stage_patch_cache_copies_and_hits() -> None:
+    tokenizer = HierarchicalTokenizer(max_patch_size=8, vocab_size_target=4096)
+    sample = "Hello, hierarchical tokenizer round-trip!"
+    first = tokenizer.encode_patches(sample)
+    assert tokenizer._patch_cache
+    first[0].append(999)
+    second = tokenizer.encode_patches(sample)
+    assert 999 not in second[0]
+    assert first[1:] == second[1:]
+    assert tokenizer.encode(sample) == tokenizer.encode(sample)
+    assert tokenizer.decode(tokenizer.encode(sample)) == sample
+
+
 if __name__ == "__main__":
     test_encode_decode_roundtrip_ascii()
     test_encode_decode_roundtrip_unicode()

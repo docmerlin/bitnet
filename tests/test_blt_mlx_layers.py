@@ -286,3 +286,21 @@ def test_cross_attention_zeroes_fully_masked_queries():
     _close(expected, actual)
     # Only the projected residual survives on the dead row -- never attention output.
     assert not np.allclose(np.asarray(actual)[0, 3], 0.0)
+
+
+def test_cross_attention_reuses_projected_kv():
+    config = _config()
+    attn = MLXTernaryCrossAttention(64, 64, hidden_dim=64, num_heads=4, config=config)
+    gather = MLXTernaryPatchGather(64, 64, hidden_dim=64, num_heads=4, config=config)
+    rng = np.random.default_rng(8)
+    query = mx.array(rng.standard_normal((2, 3, 64)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((2, 5, 64)).astype(np.float32))
+    projected = attn.project_kv(kv)
+    live = attn(query, kv)
+    cached = attn(query, kv, projected_kv=projected)
+    assert np.allclose(np.asarray(live), np.asarray(cached), atol=1e-5)
+    values = gather.project_values(kv)
+    patch_ids = mx.array([[0, 1, 4], [2, 2, 0]], dtype=mx.int32)
+    live_g = gather(query, kv, patch_ids)
+    cached_g = gather(query, kv, patch_ids, values=values)
+    assert np.allclose(np.asarray(live_g), np.asarray(cached_g), atol=1e-5)

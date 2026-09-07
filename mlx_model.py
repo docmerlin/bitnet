@@ -487,6 +487,8 @@ class MLXHBitLinear(nn.Module):
 
     def _packed_weight(self, x: mx.array):
         """Return (packed, scales, group_size) from pin or generation weight cache."""
+        if self._pinned_dense is not None:
+            return None
         if self._pinned_packed is not None:
             return self._pinned_packed
         if not (_recurrent_quantized_matmul.get() and self.weight.shape[-1] % 32 == 0):
@@ -1002,6 +1004,9 @@ class MLXPaTHAttention(nn.Module):
         self.config = config
         self.num_blocks = config.block_size
         self.fixed_block_width = None
+        # Experimental: 594M A/B found no decode win for another quadratic
+        # cache. Keep it available for profiling, disabled in normal inference.
+        self.cache_path_products = False
         hidden = config.hidden_size
         self.head_dim = hidden // config.num_attention_heads
         self.qkv = MLXHBitLinear(hidden, hidden * 3, config)
@@ -1292,6 +1297,7 @@ class MLXPaTHAttention(nn.Module):
             cache.w, cache.beta, cache.log_forget = w, beta, log_forget
             cache.open_len = 1
             cache.t_inverse = None
+            cache.wk = None
         else:
             cache.q = mx.concatenate((cache.q, q), axis=2)
             cache.k = mx.concatenate((cache.k, k), axis=2)
@@ -1302,15 +1308,27 @@ class MLXPaTHAttention(nn.Module):
             cache.open_len = cache.open_len + 1
 
         if _path_decode_mode.get() == "recompute":
-            full = self.path_chunk(cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, None)
+            full, t_inverse, wk = self.path_chunk_with_state(
+                cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, None
+            )
             last = cache.open_len - 1
             local = full[:, :, last : last + 1]
-            # Keep running T in sync for mixed-mode / branch clones.
-            cache.t_inverse = self.path_system_t_inverse(cache.w, cache.beta)
+            # Keep running T / WK in sync for mixed-mode / branch clones.
+            cache.t_inverse = t_inverse
+            cache.wk = wk if self.cache_path_products else None
         else:
             cache.t_inverse = self.path_border_update_t(cache.t_inverse, cache.w, cache.beta)
+            cache.wk = self.path_wk_extend(cache.wk, cache.w, cache.k) if self.cache_path_products else None
             local = self.path_chunk_last_with_t(
-                cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, cache.t_inverse, None
+                cache.q,
+                cache.k,
+                cache.v,
+                cache.w,
+                cache.beta,
+                cache.log_forget,
+                cache.t_inverse,
+                None,
+                wk=cache.wk,
             )
         memory_context = self._retrieve_memory(q, cache.memory_m, cache.memory_z).astype(v.dtype)
         gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
@@ -1362,7 +1380,7 @@ class MLXPaTHAttention(nn.Module):
             else:
                 chunk_q, chunk_k, chunk_v = q_new, k_new, v_new
                 chunk_w, chunk_beta, chunk_forget = w_new, beta_new, forget_new
-            local = self.path_chunk(
+            local, t_inverse, wk = self.path_chunk_with_state(
                 chunk_q,
                 chunk_k,
                 chunk_v,
@@ -1370,7 +1388,8 @@ class MLXPaTHAttention(nn.Module):
                 chunk_beta,
                 chunk_forget,
                 None,
-            )[:, :, open_length:]
+                query_start=open_length,
+            )
             memory_context = self._retrieve_memory(q_new, cache.memory_m, cache.memory_z).astype(v.dtype)
             gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
             mixed = (1.0 - gate) * local + gate * memory_context
@@ -1390,7 +1409,8 @@ class MLXPaTHAttention(nn.Module):
                 cache.q, cache.k, cache.v = chunk_q, chunk_k, chunk_v
                 cache.w, cache.beta, cache.log_forget = chunk_w, chunk_beta, chunk_forget
                 cache.open_len = chunk_q.shape[2]
-                cache.t_inverse = self.path_system_t_inverse(cache.w, cache.beta)
+                cache.t_inverse = t_inverse
+                cache.wk = wk if self.cache_path_products else None
             offset += take
         context = mx.concatenate(outputs, axis=2).transpose(0, 2, 1, 3).reshape(batch, length, hidden)
         return self.out(context)
@@ -1405,42 +1425,78 @@ class MLXPaTHAttention(nn.Module):
         q, k, v, w, beta, log_forget, projected = self._project(x, None)
         chunks = []
         chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
-        for start in range(0, length, chunk_width):
-            end = min(start + chunk_width, length)
-            local = self.path_chunk(
-                q[:, :, start:end],
-                k[:, :, start:end],
-                v[:, :, start:end],
-                w[:, start:end],
-                beta[:, start:end],
-                log_forget[:, start:end],
+        n_complete = length // chunk_width
+        remainder_start = n_complete * chunk_width
+        stacked = (
+            self._batched_path_chunks(
+                q[:, :, :remainder_start],
+                k[:, :, :remainder_start],
+                v[:, :, :remainder_start],
+                w[:, :remainder_start],
+                beta[:, :remainder_start],
+                log_forget[:, :remainder_start],
                 None,
+                n_complete,
             )
+            if n_complete > 1
+            else None
+        )
+        for index in range(n_complete):
+            start = index * chunk_width
+            end = start + chunk_width
+            if stacked is not None:
+                local = stacked[:, index]
+            else:
+                local = self.path_chunk(
+                    q[:, :, start:end],
+                    k[:, :, start:end],
+                    v[:, :, start:end],
+                    w[:, start:end],
+                    beta[:, start:end],
+                    log_forget[:, start:end],
+                    None,
+                )
             memory_context = self._retrieve_memory(
                 q[:, :, start:end], cache.memory_m, cache.memory_z
             ).astype(v.dtype)
             gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
             mixed = (1.0 - gate) * local + gate * memory_context
             local = mx.where(cache.memory_initialized[:, None, None, None], mixed, local)
-            if end - start == chunk_width:
-                if update_memory:
-                    cache.memory_m, cache.memory_z, cache.memory_initialized = self._next_memory(
-                        k[:, :, start:end],
-                        v[:, :, start:end],
-                        mx.ones((batch,), dtype=mx.bool_),
-                        cache.memory_m,
-                        cache.memory_z,
-                        cache.memory_initialized,
-                    )
-            else:
-                cache.q = q[:, :, start:end]
-                cache.k = k[:, :, start:end]
-                cache.v = v[:, :, start:end]
-                cache.w = w[:, start:end]
-                cache.beta = beta[:, start:end]
-                cache.log_forget = log_forget[:, start:end]
-                cache.open_len = end - start
-                cache.t_inverse = self.path_system_t_inverse(cache.w, cache.beta)
+            if update_memory:
+                cache.memory_m, cache.memory_z, cache.memory_initialized = self._next_memory(
+                    k[:, :, start:end],
+                    v[:, :, start:end],
+                    mx.ones((batch,), dtype=mx.bool_),
+                    cache.memory_m,
+                    cache.memory_z,
+                    cache.memory_initialized,
+                )
+            chunks.append(local)
+        if remainder_start < length:
+            local, t_inverse, wk = self.path_chunk_with_state(
+                q[:, :, remainder_start:],
+                k[:, :, remainder_start:],
+                v[:, :, remainder_start:],
+                w[:, remainder_start:],
+                beta[:, remainder_start:],
+                log_forget[:, remainder_start:],
+                None,
+            )
+            memory_context = self._retrieve_memory(
+                q[:, :, remainder_start:], cache.memory_m, cache.memory_z
+            ).astype(v.dtype)
+            gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
+            mixed = (1.0 - gate) * local + gate * memory_context
+            local = mx.where(cache.memory_initialized[:, None, None, None], mixed, local)
+            cache.q = q[:, :, remainder_start:]
+            cache.k = k[:, :, remainder_start:]
+            cache.v = v[:, :, remainder_start:]
+            cache.w = w[:, remainder_start:]
+            cache.beta = beta[:, remainder_start:]
+            cache.log_forget = log_forget[:, remainder_start:]
+            cache.open_len = length - remainder_start
+            cache.t_inverse = t_inverse
+            cache.wk = wk if self.cache_path_products else None
             chunks.append(local)
         plen = projected.shape[1]
         cache.path_projected = projected if plen <= 2 else projected[:, plen - 2 : plen]
@@ -1474,25 +1530,59 @@ class MLXPaTHAttention(nn.Module):
         log_forget: mx.array,
         segment_ids: mx.array | None,
     ) -> mx.array:
+        output, _, _ = self.path_chunk_with_state(q, k, v, w, beta, log_forget, segment_ids)
+        return output
+
+    def path_chunk_with_state(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        w: mx.array,
+        beta: mx.array,
+        log_forget: mx.array,
+        segment_ids: mx.array | None,
+        query_start: int = 0,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """PaTH chunk; returns ``(output, T, WK)`` so callers can reuse the solve.
+
+        ``query_start`` scores only query rows ``[query_start:]`` against the full
+        key set. The triangular solve still uses every token — T depends on all
+        path vectors — but old query outputs are not formed and thrown away.
+        """
         length = q.shape[2]
         qf, kf = q.astype(mx.float32), k.astype(mx.float32)
         wf = w.transpose(0, 2, 1, 3)
-        beta = beta.transpose(0, 2, 1)
+        beta_h = beta.transpose(0, 2, 1)
         gram = wf @ wf.transpose(0, 1, 3, 2)
         eye = mx.eye(length, dtype=mx.float32)
-        system = eye + mx.tril(beta[..., None] * gram, k=-1)
-        t_inverse = self._path_solve(system, eye * beta[..., :, None], compile_friendly=False)
-        qk = qf @ kf.transpose(0, 1, 3, 2)
-        qw = mx.tril(qf @ wf.transpose(0, 1, 3, 2))
+        system = eye + mx.tril(beta_h[..., None] * gram, k=-1)
+        t_inverse = self._path_solve(system, eye * beta_h[..., :, None], compile_friendly=False)
         wk = mx.tril(wf @ kf.transpose(0, 1, 3, 2), k=-1)
-        logits = (qk - (qw @ t_inverse) @ wk) * self.head_dim**-0.5
+        q_used = qf if query_start <= 0 else qf[:, :, query_start:]
+        qk = q_used @ kf.transpose(0, 1, 3, 2)
+        qw = q_used @ wf.transpose(0, 1, 3, 2)
         prefix = mx.cumsum(log_forget.transpose(0, 2, 1), axis=-1)
-        logits = logits + prefix[..., :, None] - prefix[..., None, :]
-        keep = mx.tril(mx.ones((length, length), dtype=mx.bool_))
-        if segment_ids is not None:
-            keep = keep & (segment_ids[:, None, :, None] == segment_ids[:, None, None, :])
+        if query_start <= 0:
+            qw = mx.tril(qw)
+            keep = mx.tril(mx.ones((length, length), dtype=mx.bool_))
+            logits = (qk - (qw @ t_inverse) @ wk) * self.head_dim**-0.5
+            logits = logits + prefix[..., :, None] - prefix[..., None, :]
+            if segment_ids is not None:
+                keep = keep & (segment_ids[:, None, :, None] == segment_ids[:, None, None, :])
+        else:
+            q_pos = mx.arange(query_start, length)[:, None]
+            k_pos = mx.arange(length)[None, :]
+            keep = q_pos >= k_pos
+            qw = mx.where(keep, qw, mx.array(0.0, dtype=qw.dtype))
+            logits = (qk - (qw @ t_inverse) @ wk) * self.head_dim**-0.5
+            logits = logits + prefix[:, :, query_start:, None] - prefix[:, :, None, :]
+            if segment_ids is not None:
+                keep = keep & (
+                    segment_ids[:, None, query_start:, None] == segment_ids[:, None, None, :]
+                )
         logits = mx.where(keep, logits, -1e9)
-        return mx.softmax(logits, axis=-1).astype(v.dtype) @ v
+        return mx.softmax(logits, axis=-1).astype(v.dtype) @ v, t_inverse, wk
 
     def path_system_t_inverse(self, w: mx.array, beta: mx.array) -> mx.array:
         """Full open-chunk T = S^{-1} D (used to seed running state after prefill/extend)."""
@@ -1520,20 +1610,40 @@ class MLXPaTHAttention(nn.Module):
         heads = self.config.num_attention_heads
         beta_h = beta.transpose(0, 2, 1).astype(mx.float32)  # B,H,L
         beta_new = beta_h[:, :, length - 1]  # B,H
-        if length == 1 or t_prev is None:
+        if length == 1:
             return beta_new[:, :, None, None]
+        if t_prev is None:
+            return self.path_system_t_inverse(w, beta)
         wf = w.transpose(0, 2, 1, 3).astype(mx.float32)  # B,H,L,D
         w_new = wf[:, :, length - 1 : length, :]  # B,H,1,D
         w_prev = wf[:, :, : length - 1, :]  # B,H,L-1,D
-        # s_j = beta_new * (w_new · w_j)
-        dots = mx.sum(w_new * w_prev, axis=-1)  # B,H,L-1
+        # s_j = beta_new * (w_new · w_j); matmul instead of broadcast-mul + reduce.
+        dots = (w_new @ w_prev.transpose(0, 1, 3, 2)).squeeze(axis=2)  # B,H,L-1
         s = beta_new[:, :, None] * dots  # B,H,L-1
-        # t_row = -s @ T_prev  -> (B,H,L-1)
-        t_row = -mx.sum(s[:, :, :, None] * t_prev, axis=2)
+        t_row = -(s[:, :, None, :] @ t_prev).squeeze(axis=2)  # B,H,L-1
         zeros_col = mx.zeros((batch, heads, length - 1, 1), dtype=mx.float32)
         top = mx.concatenate((t_prev, zeros_col), axis=-1)
         bottom = mx.concatenate((t_row[:, :, None, :], beta_new[:, :, None, None]), axis=-1)
         return mx.concatenate((top, bottom), axis=2)
+
+    def path_wk_extend(self, wk_prev: mx.array | None, w: mx.array, k: mx.array) -> mx.array:
+        """Grow ``tril(W @ K.T, k=-1)`` by one token without rebuilding old-old products."""
+        length = w.shape[1]
+        batch = w.shape[0]
+        heads = self.config.num_attention_heads
+        if length == 1:
+            return mx.zeros((batch, heads, 1, 1), dtype=mx.float32)
+        wf = w.transpose(0, 2, 1, 3).astype(mx.float32)
+        kf = k.astype(mx.float32)
+        if wk_prev is None:
+            return mx.tril(wf @ kf.transpose(0, 1, 3, 2), k=-1)
+        w_new = wf[:, :, length - 1 : length, :]
+        row = w_new @ kf.transpose(0, 1, 3, 2)  # B,H,1,L
+        zeros_last = mx.zeros((batch, heads, 1, 1), dtype=mx.float32)
+        row = mx.concatenate((row[:, :, :, : length - 1], zeros_last), axis=-1)
+        zeros_col = mx.zeros((batch, heads, length - 1, 1), dtype=mx.float32)
+        top = mx.concatenate((wk_prev, zeros_col), axis=-1)
+        return mx.concatenate((top, row), axis=2)
 
     def path_chunk_last_with_t(
         self,
@@ -1545,6 +1655,8 @@ class MLXPaTHAttention(nn.Module):
         log_forget: mx.array,
         t_inverse: mx.array,
         segment_ids: mx.array | None = None,
+        *,
+        wk: mx.array | None = None,
     ) -> mx.array:
         """Last-query PaTH using a provided running T (no system rebuild or re-solve)."""
         length = q.shape[2]
@@ -1553,7 +1665,8 @@ class MLXPaTHAttention(nn.Module):
         q_last = qf[:, :, length - 1 : length]
         qk = q_last @ kf.transpose(0, 1, 3, 2)
         qw_last = q_last @ wf.transpose(0, 1, 3, 2)
-        wk = mx.tril(wf @ kf.transpose(0, 1, 3, 2), k=-1)
+        if wk is None:
+            wk = mx.tril(wf @ kf.transpose(0, 1, 3, 2), k=-1)
         corrected = (qw_last @ t_inverse) @ wk
         logits = (qk - corrected) * self.head_dim**-0.5
         prefix = mx.cumsum(log_forget.transpose(0, 2, 1).astype(mx.float32), axis=-1)
@@ -1751,10 +1864,14 @@ class MLXPaTHInferenceCache:
     # Running S^{-1} D for the open chunk; border-updated O(L^2) per decode token.
     t_inverse: mx.array | None = None
     open_len: int = 0
+    # Running tril(W @ K.T, k=-1); border-appended with T so last-query decode
+    # does not rebuild old-old products.
+    wk: mx.array | None = None
 
     def clear_open_chunk(self) -> None:
         self.q = self.k = self.v = self.w = self.beta = self.log_forget = None
         self.t_inverse = None
+        self.wk = None
         self.open_len = 0
 
     def clone(self) -> "MLXPaTHInferenceCache":
@@ -1771,6 +1888,7 @@ class MLXPaTHInferenceCache:
             self.log_forget,
             self.t_inverse,
             self.open_len,
+            self.wk,
         )
 
     def arrays(self) -> list[mx.array]:
@@ -1788,6 +1906,7 @@ class MLXPaTHInferenceCache:
                 self.beta,
                 self.log_forget,
                 self.t_inverse,
+                self.wk,
             )
             if value is not None
         ]
@@ -2321,6 +2440,10 @@ class MLXBitNet(nn.Module):
                 arrays.append(att.t_inverse)
             else:
                 arrays.append(mx.zeros((batch, heads, open_len, open_len), dtype=mx.float32))
+            if att.wk is not None:
+                arrays.append(att.wk)
+            else:
+                arrays.append(mx.zeros((batch, heads, 0, 0), dtype=mx.float32))
             if layer.engram is not None:
                 eng = layer.engram.normalized
                 if eng is None:
@@ -2355,6 +2478,8 @@ class MLXBitNet(nn.Module):
             q_arr = nonempty(q, 2)
             t_inv = arrays[idx]
             idx += 1
+            wk = arrays[idx]
+            idx += 1
             open_len = 0 if q_arr is None else int(q_arr.shape[2])
             attention = MLXPaTHInferenceCache(
                 memory_m,
@@ -2369,6 +2494,7 @@ class MLXBitNet(nn.Module):
                 nonempty(log_forget, 1),
                 t_inverse=None if open_len == 0 else t_inv,
                 open_len=open_len,
+                wk=None if wk.shape[-1] == 0 else wk,
             )
             engram = None
             if has_engram:
@@ -2395,6 +2521,8 @@ class MLXBitNet(nn.Module):
             idx += 6
             t_inv = arrays[idx]
             idx += 1
+            wk = arrays[idx]
+            idx += 1
             att.path_projected = None if pp.shape[1] == 0 else pp
             att.q = None if q.shape[2] == 0 else q
             att.k = None if k.shape[2] == 0 else k
@@ -2404,6 +2532,7 @@ class MLXBitNet(nn.Module):
             att.log_forget = None if log_forget.shape[1] == 0 else log_forget
             att.open_len = 0 if att.q is None else att.q.shape[2]
             att.t_inverse = None if att.open_len == 0 else t_inv
+            att.wk = None if wk.shape[-1] == 0 else wk
             if layer.engram is not None:
                 eng = arrays[idx]
                 idx += 1
@@ -2411,7 +2540,11 @@ class MLXBitNet(nn.Module):
 
     def enable_compiled_inference(self) -> bool:
 
-        """Enable functionalized compiled steps specialized lazily by open-chunk length."""
+        """Enable compiled steps specialized lazily by open-chunk length.
+
+        The first real decode for each open length traces and is consumed; no
+        dummy prefill or discarded dummy token. Compile errors fall back to eager.
+        """
         self._compiled_inference_step = None
         self._compiled_by_open_len = None
         try:
@@ -2434,10 +2567,9 @@ class MLXBitNet(nn.Module):
             weight_cache = probe.weight_cache
             compiled: dict[int, object] = {}
 
-            def compile_open_before(open_before: int):
-                if open_before in compiled:
-                    return compiled[open_before]
-
+            def make_pure_step():
+                # One closure per open-chunk length so mx.compile specialises on
+                # that cache layout. The first real step traces and is consumed.
                 def pure_step(step_tokens: mx.array, *flat: mx.array):
                     cache = self._unflatten_inference_cache(
                         list(flat), layout, loops, weight_cache, position=1
@@ -2450,22 +2582,7 @@ class MLXBitNet(nn.Module):
                         hidden = self._inference_step(step_tokens, cache)
                     return (hidden, *self._flatten_inference_cache(cache))
 
-                warm = self.new_inference_cache(num_loops=loops)
-                if open_before:
-                    pref = mx.array([list(range(1, open_before + 1))], dtype=mx.int32)
-                    with self._inference_weight_context(warm):
-                        states = self._prefill(pref, warm)
-                        mx.eval(states, *warm.arrays())
-                for layer in warm.layers:
-                    layer.attention.open_len = (
-                        0 if layer.attention.q is None else layer.attention.q.shape[2]
-                    )
-                compiled_fn = mx.compile(pure_step)
-                flat = self._flatten_inference_cache(warm)
-                out = compiled_fn(mx.array([[0]], dtype=mx.int32), *flat)
-                mx.eval(out[0])
-                compiled[open_before] = compiled_fn
-                return compiled_fn
+                return pure_step
 
             def _first_path_open_len(cache: MLXInferenceCache) -> int:
                 for layer in cache.layers:
@@ -2473,14 +2590,15 @@ class MLXBitNet(nn.Module):
                 return 0
 
             def step(tokens: mx.array, cache: MLXInferenceCache) -> mx.array:
-                open_before = _first_path_open_len(cache)
-                open_before = int(open_before)
+                open_before = int(_first_path_open_len(cache))
                 if open_before < 0 or open_before >= width:
                     return self._inference_step(tokens, cache)
                 try:
-                    fn = compile_open_before(open_before)
-                    flat_in = self._flatten_inference_cache(cache)
-                    result = fn(tokens, *flat_in)
+                    fn = compiled.get(open_before)
+                    if fn is None:
+                        fn = mx.compile(make_pure_step())
+                        compiled[open_before] = fn
+                    result = fn(tokens, *self._flatten_inference_cache(cache))
                     mx.eval(result)
                 except Exception:
                     self._compiled_inference_step = None

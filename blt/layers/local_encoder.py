@@ -61,6 +61,32 @@ class LocalEncoder(nn.Module):
             hidden = hidden.masked_fill(~byte_mask.unsqueeze(-1), 0.0)
         return hidden
 
+    def encode_bytes_prefill(
+        self, byte_embeddings: torch.Tensor
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Generation prefill: full-prefix encode + per-block self-attn K/V."""
+        hidden = byte_embeddings
+        caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for block in self.blocks:
+            hidden, cache = block.prefill(hidden)
+            caches.append(cache)
+        return self.output_norm(hidden), caches
+
+    def encode_bytes_extend(
+        self,
+        byte_embeddings: torch.Tensor,
+        caches: list[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        offset: int,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Generation step: encode only new byte positions against cached K/V."""
+        hidden = byte_embeddings
+        new_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for block, cache in zip(self.blocks, caches):
+            hidden, cache = block.extend(hidden, cache, offset=offset)
+            new_caches.append(cache)
+        return self.output_norm(hidden), new_caches
+
     def forward(
         self,
         byte_embeddings: torch.Tensor,

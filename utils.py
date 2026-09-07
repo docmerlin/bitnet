@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -202,6 +203,41 @@ def load_checkpoint_payload(
         return torch.load(path, weights_only=True, **load_kwargs)
     except TypeError as exc:
         raise RuntimeError("installed PyTorch does not support safe checkpoint loading") from exc
+
+
+def replace_with_hardlink(source: str | Path, dest: str | Path) -> None:
+    """Point ``dest`` at ``source`` without rewriting ``source``.
+
+    Prefers a hard link so a numbered checkpoint stays immutable when an alias
+    such as ``last`` is updated. Falls back to copy if the filesystem refuses
+    links. Never opens ``dest`` for in-place write, which would clobber a
+    linked numbered file.
+    """
+    source = Path(source)
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.linktmp")
+    tmp.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(source, tmp)
+        except OSError:
+            shutil.copy2(source, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def replace_with_symlink(source: str | Path, dest: str | Path) -> None:
+    """Atomically publish a relative symlink, including when dest already exists."""
+    source, dest = Path(source), Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{dest.name}.", dir=dest.parent) as staging:
+        link = Path(staging) / "link"
+        # Relative to its final parent, not the staging directory.
+        link.symlink_to(os.path.relpath(source, dest.parent))
+        os.replace(link, dest)
 
 
 def atomic_torch_save(payload: object, destination: str | Path) -> None:

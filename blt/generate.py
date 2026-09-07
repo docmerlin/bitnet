@@ -189,37 +189,74 @@ def _run_global(
     return latents, patch_ids
 
 
-def _decoder_next(
+def _ngram_embed_window(model: TernaryBLTModel) -> int:
+    """Bytes the last position's hash n-grams can see, or 1 when n-grams are off."""
+    ngrams = model.ngram_embeddings
+    return 1 if ngrams is None else max(ngrams.sizes)
+
+
+def _embed_last_byte(model: TernaryBLTModel, tokens: torch.Tensor) -> torch.Tensor:
+    """Embedding of the last byte, using only the n-gram suffix."""
+    window = min(tokens.size(1), _ngram_embed_window(model))
+    suffix = tokens[:, -window:]
+    return model.embed_bytes(suffix, _ones_mask(suffix))[:, -1:]
+
+
+@dataclass(slots=True)
+class _DraftCache:
+    """Self-attn K/V for encoder and decoder while drafting against frozen latents.
+
+    Invalidated after every global pass. Cross-attn projections of the frozen
+    latents are reused for the cache lifetime.
+    """
+
+    encoder: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    decoder: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    length: int = 0
+    last_hidden: torch.Tensor | None = None
+    prepared_latents: torch.Tensor | None = None
+    cross_projected: list | None = None
+
+
+def _decoder_patches(latents: torch.Tensor) -> torch.Tensor:
+    # new_zeros, not zeros_like(latents[:, :1]): after a rollback ``latents`` can
+    # legitimately hold zero patches, and slicing an empty tensor stays empty.
+    leading = latents.new_zeros((latents.size(0), 1, latents.size(2)))
+    return torch.cat([leading, latents], dim=1)
+
+
+def _ensure_draft_prefill(
     model: TernaryBLTModel,
     tokens: torch.Tensor,
     latents: torch.Tensor,
     patch_ids: torch.Tensor,
     stats: GenerationStats,
-) -> torch.Tensor:
-    """One byte from the local decoder against frozen patch latents.
-
-    ``latents`` is shifted by one so a byte in patch ``i`` reads ``latents[i-1]``,
-    matching :meth:`TernaryBLTModel.forward`. Shifting rather than truncating
-    leaves room for patch index ``len(latents)``, the not-yet-encoded patch that
-    freshly drafted bytes belong to -- that is the "last available latent".
-
-    ponytail: no KV cache -- every draft byte re-runs the encoder and decoder
-    over the whole prefix, so this is O(L^2) in the sequence length. Add caching
-    when generation length rather than global-model calls becomes the cost.
-    """
+    draft_cache: _DraftCache,
+) -> None:
+    length = tokens.size(1)
+    if (
+        draft_cache.encoder is not None
+        and draft_cache.decoder is not None
+        and draft_cache.last_hidden is not None
+        and draft_cache.prepared_latents is not None
+        and draft_cache.length == length
+    ):
+        return
     attention_mask = _ones_mask(tokens)
-    hidden = model.local_encoder.encode_bytes(
-        model.embed_bytes(tokens, attention_mask),
-        attention_mask=attention_mask,
+    hidden, enc_caches = model.local_encoder.encode_bytes_prefill(
+        model.embed_bytes(tokens, attention_mask)
     )
     stats.draft_encoder += 1
-    # new_zeros, not zeros_like(latents[:, :1]): after a rollback ``latents`` can
-    # legitimately hold zero patches, and slicing an empty tensor stays empty.
-    leading = latents.new_zeros((latents.size(0), 1, latents.size(2)))
-    decoder_patches = torch.cat([leading, latents], dim=1)
-    decoded = model.local_decoder(hidden, decoder_patches, patch_ids, attention_mask=attention_mask)
+    decoder_patches = _decoder_patches(latents)
+    decoded, dec_caches = model.local_decoder.prefill(hidden, decoder_patches, patch_ids)
     stats.decoder += 1
-    return model.output_head(decoded[:, -1:]).argmax(dim=-1)
+    latent, projected = model.local_decoder.prepare_cross_cache(decoder_patches)
+    draft_cache.encoder = enc_caches
+    draft_cache.decoder = dec_caches
+    draft_cache.length = length
+    draft_cache.last_hidden = decoded[:, -1:]
+    draft_cache.prepared_latents = latent
+    draft_cache.cross_projected = projected
 
 
 def _draft(
@@ -231,6 +268,7 @@ def _draft(
     next_id: int,
     count: int,
     stats: GenerationStats,
+    draft_cache: _DraftCache | None = None,
 ) -> torch.Tensor:
     """Extend ``tokens`` by ``count`` bytes, all charged to patch ``next_id``.
 
@@ -238,10 +276,39 @@ def _draft(
     boundaries, so a byte that really belongs to a later patch is conditioned on
     a latent that predates it. Verification is what catches those.
     """
+    if draft_cache is None:
+        draft_cache = _DraftCache()
+    decoder_patches = _decoder_patches(latents)
+
     for _ in range(count):
-        byte = _decoder_next(model, tokens, latents, patch_ids, stats)
+        _ensure_draft_prefill(model, tokens, latents, patch_ids, stats, draft_cache)
+        assert draft_cache.last_hidden is not None
+        byte = model.output_head(draft_cache.last_hidden).argmax(dim=-1)
         tokens = torch.cat([tokens, byte], dim=1)
         patch_ids = torch.cat([patch_ids, patch_ids.new_full((1, 1), next_id)], dim=1)
+        offset = tokens.size(1) - 1
+        new_hidden, enc_caches = model.local_encoder.encode_bytes_extend(
+            _embed_last_byte(model, tokens), draft_cache.encoder, offset=offset
+        )
+        stats.draft_encoder += 1
+        if draft_cache.prepared_latents is None:
+            latent, projected = model.local_decoder.prepare_cross_cache(decoder_patches)
+            draft_cache.prepared_latents = latent
+            draft_cache.cross_projected = projected
+        decoded, dec_caches = model.local_decoder.extend(
+            new_hidden,
+            decoder_patches,
+            patch_ids[:, -1:],
+            draft_cache.decoder,
+            offset=offset,
+            latent=draft_cache.prepared_latents,
+            cross_projected=draft_cache.cross_projected,
+        )
+        stats.decoder += 1
+        draft_cache.encoder = enc_caches
+        draft_cache.decoder = dec_caches
+        draft_cache.length = tokens.size(1)
+        draft_cache.last_hidden = decoded
     return tokens
 
 
@@ -367,6 +434,7 @@ def generate(
     try:
         latents, patch_ids = _run_global(model, tokens, patching, stats)
         next_id = int(patch_ids[0, -1].item()) + int(patching.positional and patching.opens_new_patch(tokens))
+        draft_cache = _DraftCache()
 
         while tokens.size(1) - prompt_length < max_new_bytes:
             budget = max_new_bytes - (tokens.size(1) - prompt_length)
@@ -378,7 +446,14 @@ def generate(
                 # falls, so it re-patches every byte instead of drifting.
                 while budget > 0:
                     tokens = _draft(
-                        model, tokens, latents, patch_ids, next_id=next_id, count=1, stats=stats
+                        model,
+                        tokens,
+                        latents,
+                        patch_ids,
+                        next_id=next_id,
+                        count=1,
+                        stats=stats,
+                        draft_cache=draft_cache,
                     )
                     patch_ids = torch.cat([patch_ids, patch_ids.new_full((1, 1), next_id)], dim=1)
                     budget -= 1
@@ -401,8 +476,10 @@ def generate(
                     next_id=next_id,
                     count=min(speculation_window, budget),
                     stats=stats,
+                    draft_cache=draft_cache,
                 )
                 tokens, latents, patch_ids, next_id = _verify(model, tokens, candidate, patching, stats)
+                draft_cache = _DraftCache()
 
             tokens, finished = _trim_at_eos(tokens, prompt_length, eos_id)
             if finished:
@@ -411,6 +488,7 @@ def generate(
             if speculation_window == 0 and tokens.size(1) - prompt_length < max_new_bytes:
                 latents, patch_ids = _run_global(model, tokens, patching, stats)
                 next_id = int(patch_ids[0, -1].item()) + int(opened)
+                draft_cache = _DraftCache()
     finally:
         model.train(was_training)
 

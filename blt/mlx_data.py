@@ -52,8 +52,7 @@ class ByteCorpus:
             raise ValueError("stride must be positive")
 
         self._files: list[np.memmap] = []
-        self._starts: list[np.ndarray] = []
-        self._file_index: list[np.ndarray] = []
+        counts: list[int] = []
         for path in paths:
             path = Path(path)
             if not path.is_file():
@@ -61,20 +60,19 @@ class ByteCorpus:
             data = np.memmap(path, dtype=np.uint8, mode="r")
             if data.size < seq_len:
                 continue  # too short to yield even one sequence
-            starts = np.arange(0, data.size - seq_len + 1, self.stride, dtype=np.int64)
-            self._files.append(data)
-            self._starts.append(starts)
             # Index into self._files, which skips files that were too short.
-            self._file_index.append(np.full(starts.size, len(self._files) - 1))
+            nseq = (data.size - seq_len) // self.stride + 1
+            self._files.append(data)
+            counts.append(int(nseq))
 
         if not self._files:
             raise ValueError(f"no file in the corpus holds {seq_len} bytes")
 
-        self._all_starts = np.concatenate(self._starts)
-        self._all_files = np.concatenate(self._file_index)
+        self._counts = np.asarray(counts, dtype=np.int64)
+        self._cumulative = np.cumsum(self._counts, dtype=np.int64)
 
     def __len__(self) -> int:
-        return int(self._all_starts.size)
+        return int(self._cumulative[-1])
 
     @property
     def total_bytes(self) -> int:
@@ -82,11 +80,15 @@ class ByteCorpus:
 
     def batch(self, indices: np.ndarray | list[int]) -> dict[str, np.ndarray]:
         """Materialise one batch. Keys match the teacher cache's, minus the teacher."""
-        indices = np.asarray(indices)
+        indices = np.asarray(indices, dtype=np.int64)
         tokens = np.empty((indices.size, self.seq_len), dtype=np.int32)
-        for row, index in enumerate(indices):
-            data = self._files[self._all_files[index]]
-            start = int(self._all_starts[index])
+        if indices.size == 0:
+            return {"tokens": tokens, "mask": np.ones_like(tokens, dtype=bool)}
+        file_ids = np.searchsorted(self._cumulative, indices, side="right")
+        prev = np.where(file_ids > 0, self._cumulative[file_ids - 1], 0)
+        starts = (indices - prev) * self.stride
+        for row, (file_id, start) in enumerate(zip(file_ids.tolist(), starts.tolist())):
+            data = self._files[file_id]
             tokens[row] = data[start : start + self.seq_len].astype(np.int32) + self.offset
         return {"tokens": tokens, "mask": np.ones_like(tokens, dtype=bool)}
 

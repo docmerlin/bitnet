@@ -72,6 +72,42 @@ def test_a_checkpoint_round_trips(tmp_path) -> None:
         assert float(mx.max(mx.abs(value - after[key]))) == 0.0, key
 
 
+def test_alias_load_survives_interrupted_sidecar_update(tmp_path, monkeypatch):
+    import mlx_train
+
+    config = _config()
+    model, optimizer = MLXBitNet(config), _optimizer()
+    optimizer.init(model.trainable_parameters())
+    first = save_checkpoint(tmp_path, model, optimizer, config, {"step": 1}, "step_0000001")
+    mlx_train.alias_checkpoint(tmp_path, first.stem, "last")
+    model.embedding.weight = model.embedding.weight + 1
+    second = save_checkpoint(tmp_path, model, optimizer, config, {"step": 2}, "step_0000002")
+    alias = first.with_name("last.safetensors")
+    original = mlx_train.replace_with_symlink
+
+    def interrupt(source, dest):
+        if dest.name == alias.name:
+            raise OSError("simulated interruption before model pointer commit")
+        original(source, dest)
+
+    monkeypatch.setattr(mlx_train, "replace_with_symlink", interrupt)
+    with pytest.raises(OSError, match="simulated interruption"):
+        mlx_train.alias_checkpoint(tmp_path, second.stem, "last")
+    assert alias.resolve() == first.resolve()
+    # Sidecar aliases now point at step 2, but the loader must use step 1's
+    # siblings after resolving the model pointer exactly once.
+    assert load_checkpoint(alias, model, optimizer)["step"] == 1
+    monkeypatch.setattr(mlx_train, "replace_with_symlink", original)
+    mlx_train.alias_checkpoint(tmp_path, second.stem, "last")
+    assert load_checkpoint(alias, model, optimizer)["step"] == 2
+    # Saving directly over last must replace the alias, never modify step 2.
+    save_checkpoint(tmp_path, model, optimizer, config, {"step": 3}, "last")
+    assert json.loads(second.with_suffix(".json").read_text())["trainer_state"]["step"] == 2
+    assert load_checkpoint(alias, model, optimizer)["step"] == 3
+    with pytest.raises(FileExistsError):
+        save_checkpoint(tmp_path, model, optimizer, config, {"step": 4}, second.stem)
+
+
 def test_cli_resume_keeps_legacy_vocab_dimensions(monkeypatch, tmp_path):
     import mlx_train
 

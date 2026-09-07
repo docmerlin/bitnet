@@ -135,9 +135,15 @@ class MLXLocalEncoder(nn.Module):
         patch_lengths: mx.array,
         *,
         attention_mask: mx.array | None = None,
+        unpadded: bool = False,
     ) -> tuple[mx.array, mx.array, mx.array]:
         byte_mask = None if attention_mask is None else attention_mask.astype(mx.bool_)
-        hidden = self.encode_bytes(byte_embeddings, attention_mask=byte_mask)
+        # Pooling/patch ids keep ``attention_mask``; local self-attn may omit it
+        # when the caller trusts the batch is unpadded (windowed/chunked path).
+        hidden = self.encode_bytes(
+            byte_embeddings,
+            attention_mask=None if unpadded else byte_mask,
+        )
 
         patch_ids = patch_ids_from_lengths(patch_lengths, hidden.shape[1])
         if byte_mask is not None:
@@ -228,6 +234,7 @@ class MLXLocalDecoder(nn.Module):
         patch_ids: mx.array,
         *,
         attention_mask: mx.array | None = None,
+        unpadded: bool = False,
     ) -> mx.array:
         hidden = self.byte_state_proj(byte_states) if self.byte_state_proj is not None else byte_states
         latent = self.patch_state_proj(patch_states) if self.patch_state_proj is not None else patch_states
@@ -235,6 +242,7 @@ class MLXLocalDecoder(nn.Module):
         byte_mask = None
         if attention_mask is not None:
             byte_mask = attention_mask[:, : hidden.shape[1]].astype(mx.bool_)
+        block_mask = None if unpadded else attention_mask
 
         # patch_ids is -1 on padded bytes, which is exactly where the membership
         # mask is empty, so the two notions of "no patch" coincide.
@@ -261,7 +269,7 @@ class MLXLocalDecoder(nn.Module):
             )
             if byte_mask is not None:
                 hidden = mx.where(byte_mask[..., None], hidden, 0.0)
-            hidden = block(hidden, attention_mask=attention_mask)
+            hidden = block(hidden, attention_mask=block_mask)
             if byte_mask is not None:
                 hidden = mx.where(byte_mask[..., None], hidden, 0.0)
 
@@ -276,6 +284,15 @@ class MLXLocalDecoder(nn.Module):
             batch_size, num_patches = patch_states.shape[0], patch_states.shape[1]
             latent = latent.reshape(batch_size, num_patches * self.cross_attn_k, -1)
         return latent
+
+    def prepare_cross_cache(self, patch_states: mx.array) -> tuple[mx.array, list]:
+        """Prepared latents plus per-layer K/V (or values at k=1) for frozen draft."""
+        latent = self._prepare_latents(patch_states)
+        if self.cross_attn_k > 1:
+            projected = [layer.project_kv(latent) for layer in self.cross_attn_layers]
+        else:
+            projected = [layer.project_values(latent) for layer in self.cross_attn_layers]
+        return latent, projected
 
     def prefill(
         self,
@@ -313,10 +330,13 @@ class MLXLocalDecoder(nn.Module):
         caches: list[tuple[mx.array, mx.array]],
         *,
         offset: int,
+        latent: mx.array | None = None,
+        cross_projected: list | None = None,
     ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
         """Decode only new positions (typically one byte) with self-attn K/V cache."""
         hidden = self.byte_state_proj(byte_states) if self.byte_state_proj is not None else byte_states
-        latent = self._prepare_latents(patch_states)
+        if latent is None:
+            latent = self._prepare_latents(patch_states)
         cross_valid = patch_ids >= 0
         cross_mask = None
         if self.cross_attn_k > 1:
@@ -326,14 +346,16 @@ class MLXLocalDecoder(nn.Module):
             cross_mask = mx.repeat(membership, self.cross_attn_k, axis=-1) & cross_valid[..., None]
 
         new_caches: list[tuple[mx.array, mx.array]] = []
-        for cross_attn, block, cache in zip(self.cross_attn_layers, self.blocks, caches):
+        for index, (cross_attn, block, cache) in enumerate(
+            zip(self.cross_attn_layers, self.blocks, caches)
+        ):
             # Cross-attn over frozen latents is pointwise in query length; run only
             # on the new rows. For k=1 gather, only the new patch_ids matter.
-            hidden = (
-                cross_attn(hidden, latent, mask=cross_mask)
-                if self.cross_attn_k > 1
-                else cross_attn(hidden, latent, patch_ids, valid=cross_valid)
-            )
+            projected = None if cross_projected is None else cross_projected[index]
+            if self.cross_attn_k > 1:
+                hidden = cross_attn(hidden, latent, mask=cross_mask, projected_kv=projected)
+            else:
+                hidden = cross_attn(hidden, latent, patch_ids, valid=cross_valid, values=projected)
             hidden, cache = block.extend(hidden, cache, offset=offset)
             new_caches.append(cache)
         return self.output_norm(hidden), new_caches
@@ -443,12 +465,14 @@ class MLXTernaryBLTModel(nn.Module):
         *,
         attention_mask: mx.array | None = None,
         patch_lengths: mx.array | None = None,
+        unpadded: bool = False,
     ) -> MLXTernaryBLTOutput:
         if attention_mask is None:
             if self.config.pad_id >= 0:
                 attention_mask = input_ids != self.config.pad_id
             else:
                 attention_mask = mx.ones(input_ids.shape, dtype=mx.bool_)
+                unpadded = True
         if attention_mask.shape != input_ids.shape:
             raise ValueError("attention_mask must have the same shape as input_ids")
 
@@ -463,9 +487,16 @@ class MLXTernaryBLTModel(nn.Module):
             )
         patch_lengths = normalize_patch_lengths_to_targets(patch_lengths, valid_lengths)
 
+        # Trusted unpadded batches omit the byte mask from local self-attention
+        # so the existing windowed/chunked path can run. Pooling, loss, patch
+        # membership, and the global backbone still see the real mask. Do not
+        # inspect mask contents on device — the caller must know.
         byte_embeddings = self.embed_bytes(input_ids, attention_mask)
         encoder_hidden, encoder_patches, patch_ids = self.local_encoder(
-            byte_embeddings, patch_lengths, attention_mask=attention_mask
+            byte_embeddings,
+            patch_lengths,
+            attention_mask=attention_mask,
+            unpadded=unpadded,
         )
         global_mask = patch_presence_mask(patch_lengths)
         global_hidden = self.global_transformer(encoder_patches, attention_mask=global_mask)
@@ -473,7 +504,11 @@ class MLXTernaryBLTModel(nn.Module):
             [mx.zeros_like(global_hidden[:, :1]), global_hidden[:, :-1]], axis=1
         )
         decoder_hidden = self.local_decoder(
-            encoder_hidden, decoder_patches, patch_ids, attention_mask=attention_mask
+            encoder_hidden,
+            decoder_patches,
+            patch_ids,
+            attention_mask=attention_mask,
+            unpadded=unpadded,
         )
         return MLXTernaryBLTOutput(
             logits=self.output_head(decoder_hidden),

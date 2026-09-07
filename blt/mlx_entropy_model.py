@@ -82,23 +82,32 @@ def boundaries_by_count(entropy: mx.array, num_patches: int) -> mx.array:
 def cap_patch_lengths(starts: mx.array, max_patch_length: int) -> mx.array:
     """Force a boundary wherever a run would exceed ``max_patch_length``.
 
-    Fixpoint rather than a per-row loop; each pass marks only positions sitting
-    exactly ``max_patch_length`` past the last boundary, because marking every
-    over-long position at once would turn the tail of a long run into
-    all-boundaries.
+    One prefix scan over the original starts, then every positive multiple of
+    the cap inside each original interval. Same positions as the old fixpoint
+    that marked only the byte exactly ``max_patch_length`` past the last
+    boundary each pass, without a host round-trip per pass.
     """
     if max_patch_length <= 0 or starts.shape[1] == 0:
         return starts
 
     seq_len = starts.shape[1]
     positions = mx.arange(seq_len, dtype=mx.int32).reshape(1, -1)
-    for _ in range(seq_len // max_patch_length + 1):
-        last_start = mx.cummax(mx.where(starts, positions, mx.array(-1, dtype=mx.int32)), axis=1)
-        forced = (positions - last_start) == max_patch_length
-        if not bool(mx.any(forced)):
-            break
-        starts = starts | forced
-    return starts
+    last_start = mx.cummax(mx.where(starts, positions, mx.array(-1, dtype=mx.int32)), axis=1)
+    distance = positions - last_start
+    return starts | ((distance > 0) & (distance % max_patch_length == 0))
+
+
+def uniform_patch_lengths(batch: int, seq_len: int, num_patches: int) -> mx.array:
+    """Content-independent widths from ``ceil(j * L / P)`` edges.
+
+    Matches :func:`boundaries_by_count` (floor ``i * P / L`` patch ids). Widths
+    differ by at most one and sum to ``seq_len``.
+    """
+    if not 0 < num_patches <= seq_len:
+        raise ValueError(f"num_patches must be in (0, {seq_len}]")
+    index = mx.arange(num_patches + 1, dtype=mx.int32)
+    edges = (index * seq_len + num_patches - 1) // num_patches
+    return mx.broadcast_to((edges[1:] - edges[:-1])[None], (batch, num_patches))
 
 
 def patch_lengths_from_starts(starts: mx.array) -> mx.array:
@@ -221,11 +230,11 @@ class MLXByteEntropyModel(nn.Module):
         the shape guarantee it exists to provide.
         """
         if num_patches is not None:
-            starts = boundaries_by_count(input_ids, num_patches)
             # Fixed count exists to give the BitNet global backbone one stable,
             # unpadded shape. Re-applying the length cap can only add boundaries,
             # violating that contract and forcing the whole model eager.
-            return patch_lengths_from_starts(starts)
+            batch, seq_len = input_ids.shape
+            return uniform_patch_lengths(batch, seq_len, num_patches)
         threshold = self.default_threshold if threshold is None else threshold
         starts = boundaries_from_entropy(
             self.entropy(input_ids), threshold=threshold, relative_threshold=relative_threshold

@@ -53,19 +53,29 @@ class TernaryCrossAttention(nn.Module):
         if query_dim != self.output_dim:
             self.residual_proj = HBitLinear(query_dim, self.output_dim, config=config)
 
+    def project_kv(self, key_value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """K/V of frozen latents, reusable across draft queries."""
+        batch_size, kv_len, _ = key_value.shape
+        normed = self.kv_norm(key_value)
+        k = self.k_proj(normed).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(normed).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
+        return k, v
+
     def forward(
         self,
         query: torch.Tensor,
         key_value: torch.Tensor,
         *,
         mask: torch.Tensor | None = None,
+        projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size, query_len, _ = query.shape
-        kv_len = key_value.size(1)
-
         q = self.q_proj(self.query_norm(query)).view(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(self.kv_norm(key_value)).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(self.kv_norm(key_value)).view(batch_size, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if projected_kv is None:
+            k, v = self.project_kv(key_value)
+        else:
+            k, v = projected_kv
+        kv_len = k.size(2)
 
         attn_bias, query_valid = combine_attention_bias(
             mask,
@@ -132,6 +142,10 @@ class TernaryPatchGather(nn.Module):
         if query_dim != self.output_dim:
             self.residual_proj = HBitLinear(query_dim, self.output_dim, config=config)
 
+    def project_values(self, key_value: torch.Tensor) -> torch.Tensor:
+        """Value projection of frozen latents, reusable across draft queries."""
+        return self.v_proj(self.kv_norm(key_value))
+
     def forward(
         self,
         query: torch.Tensor,
@@ -139,9 +153,11 @@ class TernaryPatchGather(nn.Module):
         patch_ids: torch.Tensor,
         *,
         valid: torch.Tensor | None = None,
+        values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``patch_ids`` is [batch, queries]; ``valid`` marks queries with a patch."""
-        values = self.v_proj(self.kv_norm(key_value))
+        if values is None:
+            values = self.project_values(key_value)
         # patch_ids is -1 on padded bytes; clamp so the gather stays in range and
         # zero those rows afterwards, matching what a fully masked attention row did.
         gathered = values.gather(

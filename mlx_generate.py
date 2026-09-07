@@ -206,6 +206,7 @@ def load_model(
     pin_weights: bool = True,
     compile_step: bool = True,
 ) -> tuple[MLXBitNet, dict]:
+    checkpoint = checkpoint.resolve()
     metadata = json.loads(checkpoint.with_suffix(".json").read_text(encoding="utf-8"))
     config_data = dict(metadata["model_config"])
     config_data["engram_layer_ids"] = tuple(config_data["engram_layer_ids"])

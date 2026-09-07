@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layers.h_bitlinear import HBitLinear
+from layers.h_bitlinear import HBitLinear, grouped_weight_cache
 
 
 class RFMoEExpert(nn.Module):
@@ -100,6 +100,8 @@ class RFMoE(nn.Module):
         # an outer residual wrapper (e.g. AttnRes) already owns the residual.
         self.residual = residual
         self._last_density = 0.0   # mean fire fraction over (token, expert) pairs (float, for logging)
+        # experts * max_count / active_pairs; 1.0 means no padding. 0.0 if idle.
+        self._last_padding_waste = 0.0
         # Per-expert differentiable usage (mean gate activity per expert) for the
         # locality/staircase loss, plus a detached EMA used only to RANK experts
         # (which one is hot) so the permutation is stable batch-to-batch while
@@ -113,10 +115,16 @@ class RFMoE(nn.Module):
     def _grouped_linear_input(x: torch.Tensor, layers: list[HBitLinear]) -> torch.Tensor:
         return layers[0].prepare_input(x)
 
-    @staticmethod
-    def _grouped_weight(layers: list[HBitLinear], dtype: torch.dtype) -> torch.Tensor:
+    def _grouped_weight(self, layers: list[HBitLinear], dtype: torch.dtype) -> torch.Tensor:
+        cache = grouped_weight_cache()
+        key = (id(self), id(layers[0]), len(layers), dtype)
+        if cache is not None and key in cache:
+            return cache[key]
         weights = torch.stack([layer.weight for layer in layers])
-        return layers[0].effective_weight(dtype, weights)
+        result = layers[0].effective_weight(dtype, weights)
+        if cache is not None:
+            cache[key] = result
+        return result
 
     def add_expert(self, bias: float = 10.0) -> RFMoEExpert:
         """Append a cold expert without changing existing expert parameters or keys."""
@@ -158,9 +166,14 @@ class RFMoE(nn.Module):
         fire = gate_stack >= self.theta
         active = fire.nonzero()                       # (K, 2): expert, token
 
+        self._last_padding_waste = 0.0
         if active.numel():
             counts = fire.sum(dim=1)
             max_count = int(counts.max())
+            active_pairs = int(active.size(0))
+            self._last_padding_waste = (
+                len(self.experts) * max_count / max(active_pairs, 1)
+            )
             expert_idx, token_idx = active.unbind(dim=1)
             offsets = counts.cumsum(dim=0) - counts
             positions = torch.arange(active.size(0), device=x.device) - torch.repeat_interleave(
@@ -258,6 +271,16 @@ def rfmoe_density(model: nn.Module) -> float:
     """Mean fire fraction across all RFMoE layers (global empirical density rho)."""
     densities = [m._last_density for m in iter_rfmoe(model)]
     return sum(densities) / len(densities) if densities else 0.0
+
+
+def rfmoe_padding_waste(model: nn.Module) -> float:
+    """Mean ``experts * max_count / active_pairs`` across RFMoE layers.
+
+    1.0 means every padded slot was occupied; larger is wasted compute from
+    padding every expert to the hottest expert's token count.
+    """
+    wastes = [m._last_padding_waste for m in iter_rfmoe(model) if m._last_padding_waste]
+    return sum(wastes) / len(wastes) if wastes else 0.0
 
 
 def staircase_target(n: int, s: float = 1.0, alpha: float = 0.1,

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import tempfile
 import time
 from dataclasses import asdict
 from functools import partial
@@ -29,6 +31,7 @@ from training.token_progress import (
     scheduled_value,
     wall_clock_shapes,
 )
+from utils import replace_with_symlink
 
 
 _MEMORY_STATE_NAMES = (".memory_m", ".memory_z", ".memory_initialized")
@@ -758,9 +761,7 @@ def save_checkpoint(
         for key, value in tree_flatten(model.parameters())
         if not key.endswith(_EXCLUDED_STATE_NAMES)
     }
-    mx.save_safetensors(str(path), parameters)
     optimizer_path = checkpoint_dir / f"{name}.optimizer.safetensors"
-    mx.save_safetensors(str(optimizer_path), dict(tree_flatten(optimizer.state)))
     metadata = {
         "trainer_state": trainer_state,
         "model_config": asdict(config),
@@ -769,8 +770,38 @@ def save_checkpoint(
         "stream_state": stream_state,
         "mlx_random_state": [value.tolist() for value in mx.random.state],
     }
-    path.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    # Serialize each artifact once and never write through an existing alias.
+    # Numbered checkpoints are immutable so resolved aliases remain coherent.
+    if name.startswith("step_") and path.exists():
+        raise FileExistsError(f"Numbered checkpoint already exists: {path}")
+    with tempfile.TemporaryDirectory(prefix=f".{name}.", dir=checkpoint_dir) as staging:
+        staged = Path(staging)
+        mx.save_safetensors(str(staged / path.name), parameters)
+        mx.save_safetensors(str(staged / optimizer_path.name), dict(tree_flatten(optimizer.state)))
+        (staged / f"{name}.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        os.replace(staged / optimizer_path.name, optimizer_path)
+        os.replace(staged / f"{name}.json", path.with_suffix(".json"))
+        os.replace(staged / path.name, path)
     return path
+
+
+def alias_checkpoint(output_dir: Path, source_name: str, alias_name: str) -> None:
+    """Point ``alias_name`` at an already-written numbered checkpoint.
+
+    Readers resolve the model symlink once, then load its numbered siblings.
+    Publish that commit pointer last: an interrupted update still loads the
+    previous complete checkpoint even if a sidecar alias has already changed.
+    """
+    checkpoint_dir = output_dir / "checkpoints"
+    suffixes = (".optimizer.safetensors", ".json", ".safetensors")
+    for suffix in suffixes:
+        if not (checkpoint_dir / f"{source_name}{suffix}").is_file():
+            raise FileNotFoundError(checkpoint_dir / f"{source_name}{suffix}")
+    for suffix in suffixes:
+        replace_with_symlink(
+            checkpoint_dir / f"{source_name}{suffix}",
+            checkpoint_dir / f"{alias_name}{suffix}",
+        )
 
 
 def migrate_two_group_optimizer_state(
@@ -815,6 +846,7 @@ def migrate_two_group_optimizer_state(
 
 
 def load_checkpoint(path: Path, model: MLXBitNet, optimizer: optim.Optimizer) -> dict:
+    path = path.resolve()
     parameters = dict(tree_flatten(model.parameters()))
     expected = {key for key in parameters if not key.endswith(_EXCLUDED_STATE_NAMES)}
     loaded = {
@@ -1012,6 +1044,8 @@ def main() -> None:
     args = build_parser().parse_args()
     saved = None
     if args.resume_from:
+        # Pin the whole resume operation to one immutable numbered checkpoint.
+        args.resume_from = str(Path(args.resume_from).resolve())
         saved = json.loads(Path(args.resume_from).with_suffix(".json").read_text(encoding="utf-8"))
         protected = {"output_dir", "resume_from", "compile", "path_kernel", "precision", "profile_phases"}
         saved_args = saved.get("training_args") or {}
@@ -1570,16 +1604,7 @@ def main() -> None:
                 vars(args),
                 stream_state,
             )
-            save_checkpoint(
-                output_dir,
-                model,
-                optimizer,
-                config,
-                trainer_state,
-                "last",
-                vars(args),
-                stream_state,
-            )
+            alias_checkpoint(output_dir, f"step_{step:07d}", "last")
             print(f"Saved checkpoint to {path}")
 
     final_path = save_checkpoint(

@@ -334,8 +334,8 @@ class MLXTernarySelfAttention(nn.Module):
         """One (or few) new positions with prior K/V; returns last-chunk output + cache.
 
         ``offset`` is the absolute position of the first new token (for RoPE).
-        Keys are past-or-self only, so a causal mask is unnecessary for the
-        extension query rows.
+        A single new query needs no mask; multiple new queries retain their
+        causal/window mask until attention has consumed the shared history.
         """
         batch_size, new_len, _ = x.shape
         q, k_new, v_new = self._project_qkv(x)
@@ -348,10 +348,20 @@ class MLXTernarySelfAttention(nn.Module):
         k = mx.concatenate([cache[0], k_new], axis=2)
         v = mx.concatenate([cache[1], v_new], axis=2)
         window = self.local_window
-        if window is not None and window > 0 and k.shape[2] > window:
-            k = k[:, :, -window:]
-            v = v[:, :, -window:]
-        context = _attend(q, k, v, None, None)
+        if window is not None and window > 0:
+            keep = window + new_len - 1
+            k, v = k[:, :, -keep:], v[:, :, -keep:]
+        bias = None
+        if new_len > 1:
+            q_pos = mx.arange(offset, total)[:, None]
+            k_pos = mx.arange(total - k.shape[2], total)[None, :]
+            keep_mask = q_pos >= k_pos if self.causal else mx.ones((new_len, k.shape[2]), dtype=mx.bool_)
+            if window is not None and window > 0:
+                keep_mask = keep_mask & (k_pos > q_pos - window)
+            bias = mx.where(keep_mask, mx.array(0.0, dtype=q.dtype), mx.array(-1e9, dtype=q.dtype))
+        context = _attend(q, k, v, bias, None)
+        if window is not None and window > 0:
+            k, v = k[:, :, -window:], v[:, :, -window:]
         context = context.transpose(0, 2, 1, 3).reshape(batch_size, new_len, self.dim)
         return self.o_proj(context), (k, v)
 
@@ -452,18 +462,31 @@ class MLXTernaryCrossAttention(nn.Module):
             else None
         )
 
-    def __call__(self, query: mx.array, key_value: mx.array, *, mask: mx.array | None = None) -> mx.array:
-        batch_size, query_len, _ = query.shape
-        kv_len = key_value.shape[1]
+    def _as_heads(self, tensor: mx.array) -> mx.array:
+        batch, length, _ = tensor.shape
+        return tensor.reshape(batch, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+    def project_kv(self, key_value: mx.array) -> tuple[mx.array, mx.array]:
+        """K/V of frozen latents, reusable across draft queries."""
         normed_kv = self.kv_norm(key_value)
-
-        def heads(t, length):
-            return t.reshape(batch_size, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-
-        q = heads(self.q_proj(self.query_norm(query)), query_len)
         prepared = self.k_proj.prepare_input(normed_kv)
-        k = heads(self.k_proj.forward_prepared(prepared), kv_len)
-        v = heads(self.v_proj.forward_prepared(prepared), kv_len)
+        return (
+            self._as_heads(self.k_proj.forward_prepared(prepared)),
+            self._as_heads(self.v_proj.forward_prepared(prepared)),
+        )
+
+    def __call__(
+        self,
+        query: mx.array,
+        key_value: mx.array,
+        *,
+        mask: mx.array | None = None,
+        projected_kv: tuple[mx.array, mx.array] | None = None,
+    ) -> mx.array:
+        batch_size, query_len, _ = query.shape
+        k, v = projected_kv if projected_kv is not None else self.project_kv(key_value)
+        q = self._as_heads(self.q_proj(self.query_norm(query)))
+        kv_len = k.shape[2]
 
         bias, valid = combine_attention_bias(
             mask, base_bias=None, batch_size=batch_size, q_len=query_len, k_len=kv_len, dtype=q.dtype
@@ -510,6 +533,10 @@ class MLXTernaryPatchGather(nn.Module):
             else None
         )
 
+    def project_values(self, key_value: mx.array) -> mx.array:
+        """Value projection of frozen latents, reusable across draft queries."""
+        return self.v_proj(self.kv_norm(key_value))
+
     def __call__(
         self,
         query: mx.array,
@@ -517,8 +544,10 @@ class MLXTernaryPatchGather(nn.Module):
         patch_ids: mx.array,
         *,
         valid: mx.array | None = None,
+        values: mx.array | None = None,
     ) -> mx.array:
-        values = self.v_proj(self.kv_norm(key_value))
+        if values is None:
+            values = self.project_values(key_value)
         # patch_ids is -1 on padded bytes; clamp to keep the gather in range and
         # zero those rows, matching what a fully masked attention row produced.
         safe = mx.maximum(patch_ids, 0)[..., None]

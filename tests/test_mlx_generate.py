@@ -496,6 +496,7 @@ def test_pin_inference_weights_reuses_dense_or_packed() -> None:
     y2 = linear(x)
     mx.eval(y1, y2)
     assert id(linear._pinned_dense) == first_id
+    assert linear._packed_weight(x) is None
 
 
 def test_num_loops_override_changes_cache_depth() -> None:
@@ -619,3 +620,47 @@ def test_lazy_compiled_inference_failure_falls_back_to_eager(monkeypatch) -> Non
 
     assert compile_calls == 1
     assert fallback._compiled_inference_step is None
+
+
+def test_compiled_inference_does_not_dummy_prefill(monkeypatch) -> None:
+    config = MLXBitNetConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=4,
+        intermediate_size=32,
+        num_prelude_layers=1,
+        num_recurrent_layers=1,
+        num_coda_layers=1,
+        num_loops=2,
+        block_size=2,
+        path_window_size=4,
+        infini_memory_dim=2,
+        use_engram=False,
+    )
+    model = MLXBitNet(config)
+    model.set_dtype(mx.bfloat16)
+    model.set_inference_block_width(2)
+    model.inference_num_loops = 2
+    model.path_decode_mode = "last"
+    model.pin_inference_weights(mx.bfloat16, prefer_packed=False)
+
+    prefill_lengths: list[int] = []
+    original_prefill = MLXBitNet._prefill
+
+    def tracked_prefill(self, tokens, cache):
+        prefill_lengths.append(int(tokens.shape[1]))
+        return original_prefill(self, tokens, cache)
+
+    monkeypatch.setattr(MLXBitNet, "_prefill", tracked_prefill)
+    assert model.enable_compiled_inference()
+    cache = model.new_inference_cache(num_loops=2)
+    # Width 2, prompt 3: one leftover token, so the first decode compiles at
+    # open_len=1. The old warmup prefills a dummy cache of that length.
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    model.prefill(prompt, cache)
+    mx.eval(*cache.arrays())
+    for token in (4, 5):
+        hidden = model.inference_step(mx.array([[token]], dtype=mx.int32), cache)
+        mx.eval(hidden, *cache.arrays())
+    assert prefill_lengths == [3]
+    assert model._compiled_by_open_len

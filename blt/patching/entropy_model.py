@@ -87,25 +87,19 @@ def boundaries_from_entropy(
 def cap_patch_lengths(starts: torch.Tensor, max_patch_length: int) -> torch.Tensor:
     """Force a boundary wherever a run would exceed ``max_patch_length``.
 
-    Vectorised over the batch by fixpoint rather than a per-row loop. Each pass
-    marks only positions sitting *exactly* ``max_patch_length`` past the last
-    boundary; marking every over-long position at once would turn the tail of a
-    long run into all-boundaries. Since each pass extends the covered prefix by
-    ``max_patch_length``, it settles in at most ``ceil(seq_len / max)`` passes.
+    One prefix scan over the original starts, then every positive multiple of
+    the cap inside each original interval. Same positions as the old fixpoint
+    that marked only the byte exactly ``max_patch_length`` past the last
+    boundary each pass.
     """
     if max_patch_length <= 0 or starts.shape[1] == 0:
         return starts
 
     seq_len = starts.shape[1]
     positions = torch.arange(seq_len, device=starts.device).unsqueeze(0)
-    starts = starts.clone()
-    for _ in range(seq_len // max_patch_length + 1):
-        last_start = torch.cummax(torch.where(starts, positions, -1), dim=1).values
-        forced = (positions - last_start) == max_patch_length
-        if not bool(forced.any()):
-            break
-        starts |= forced
-    return starts
+    last_start = torch.cummax(torch.where(starts, positions, -1), dim=1).values
+    distance = positions - last_start
+    return starts | ((distance > 0) & (distance % max_patch_length == 0))
 
 
 def patch_lengths_from_starts(starts: torch.Tensor) -> torch.Tensor:

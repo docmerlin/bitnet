@@ -25,9 +25,9 @@ from torch.optim.lr_scheduler import LambdaLR
 from config import TernaryConfig, migrate_quant_config
 from data.presets import parse_mixture
 from data.streams import PrefetchStream, build_batch_stream
-from layers.rfmoe import DensityController, iter_rfmoe, rfmoe_density, rfmoe_diversity_loss
+from layers.rfmoe import DensityController, iter_rfmoe, rfmoe_density, rfmoe_diversity_loss, rfmoe_padding_waste
 from model import BitNetDeep
-from training.checkpoint import TrainerState, load_checkpoint, restore_resume_args, save_checkpoint
+from training.checkpoint import TrainerState, alias_checkpoint, load_checkpoint, restore_resume_args, save_checkpoint
 from training.losses import compute_train_loss
 from training.runtime import (
     JsonlLogger,
@@ -605,6 +605,7 @@ def main() -> None:
                 rfmoe_metrics = (
                     {
                         "rfmoe_density": rfmoe_density(base_model),
+                        "rfmoe_padding_waste": rfmoe_padding_waste(base_model),
                         "rfmoe_lambda": density_controller.lam,
                         "rfmoe_zipf_s": rfmoe_s,
                         "rfmoe_alpha": rfmoe_alpha,
@@ -651,10 +652,7 @@ def main() -> None:
                     output_dir, base_model, optimizer, scheduler, scaler,
                     state, model_config, args, checkpoint_name=f"step_{state.step:07d}.pt",
                 )
-                save_checkpoint(
-                    output_dir, base_model, optimizer, scheduler, scaler,
-                    state, model_config, args, checkpoint_name="last.pt",
-                )
+                alias_checkpoint(output_dir, f"step_{state.step:07d}.pt", "last.pt")
                 print(f"Saved checkpoint to {checkpoint_path}")
 
         final_path = save_checkpoint(

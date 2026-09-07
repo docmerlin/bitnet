@@ -63,3 +63,60 @@ def test_band_mask_admits_exactly_window_keys_per_query() -> None:
     bias = windowed_block_attention_bias(8)
     assert bias.shape == (8, 16)
     assert (mx.sum((bias == 0.0).astype(mx.int32), axis=1) == 8).all().item()
+
+
+def test_whole_model_unpadded_dispatch_and_gradients(monkeypatch):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from blt.mlx_model import MLXTernaryBLTModel
+
+    config = TernaryBLTConfig(
+        local_dim=32, global_dim=32, decoder_dim=32, local_window=8,
+        n_layers_local_encoder=1, n_layers_global=1, n_layers_local_decoder=1,
+        n_heads_local_encoder=4, n_heads_global=4, n_heads_local_decoder=4,
+        n_heads_cross=4, patch_size=4,
+    )
+    model = MLXTernaryBLTModel(config)
+    model.validate_inputs = False
+    tokens = mx.random.randint(config.offset, config.offset + 256, (2, 32))
+    mask = mx.ones(tokens.shape, dtype=mx.bool_)
+    calls = []
+    original = MLXTernarySelfAttention._windowed_attend
+
+    def tracked(self, q, k, v):
+        calls.append(q.shape[2])
+        return original(self, q, k, v)
+
+    monkeypatch.setattr(MLXTernarySelfAttention, "_windowed_attend", tracked)
+    expected = model(tokens, attention_mask=mask).logits
+    actual = model(tokens, attention_mask=mask, unpadded=True).logits
+    mx.eval(expected, actual)
+    assert calls == [32, 32]  # Both local stacks, through the real model entrypoint.
+    assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-5).item()
+    def loss(m, trusted):
+        return mx.mean(m(tokens, attention_mask=mask, unpadded=trusted).logits ** 2)
+    _, dense_grads = nn.value_and_grad(model, lambda m: loss(m, False))(model)
+    _, chunk_grads = nn.value_and_grad(model, lambda m: loss(m, True))(model)
+    mx.eval(dense_grads, chunk_grads)
+    for (name, dense), (_, chunk) in zip(tree_flatten(dense_grads), tree_flatten(chunk_grads)):
+        assert mx.allclose(dense, chunk, atol=2e-5, rtol=2e-4).item(), name
+    calls.clear()
+    # Explicit suffix padding must stay dense.
+    padded = mx.arange(32)[None, :] < mx.array([[20], [32]])
+    out = model(tokens, attention_mask=padded)
+    mx.eval(out.logits)
+    assert not calls
+    assert mx.all(out.decoder_hidden[0, 20:] == 0).item()
+
+
+@pytest.mark.parametrize("window", [None, 4])
+@pytest.mark.parametrize("new_len", [1, 3, 6])
+def test_cached_multirow_extend_matches_dense(window, new_len):
+    layer = _attention(32, 4, window)
+    x = mx.random.normal((2, 12 + new_len, 32))
+    _, cache = layer.prefill(x[:, :8])
+    _, cache = layer.extend(x[:, 8:12], cache, offset=8)
+    actual, _ = layer.extend(x[:, 12:], cache, offset=12)
+    expected = _dense(layer, x)[:, 12:]
+    mx.eval(actual, expected)
+    assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-5).item()

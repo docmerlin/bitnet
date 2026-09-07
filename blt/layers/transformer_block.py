@@ -68,6 +68,63 @@ class TernarySelfAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
         return self.o_proj(context)
 
+    def _project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = x.shape
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        return q, k, v
+
+    def prefill(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Full-prefix attention; return output and (K, V) for later extend.
+
+        Generation only, no padding mask. Matches ``forward`` with mask=None.
+        """
+        batch_size, seq_len, _ = x.shape
+        q, k, v = self._project_qkv(x)
+        cos, sin = build_rope_cache(seq_len, self.head_dim, theta=self.rope_theta, device=x.device)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        base_bias = (
+            causal_window_attention_bias(seq_len, self.local_window, dtype=q.dtype, device=x.device)
+            if self.causal
+            else None
+        )
+        context = F.scaled_dot_product_attention(q, k, v, attn_mask=base_bias, dropout_p=0.0)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        return self.o_proj(context), (k, v)
+
+    def extend(
+        self, x: torch.Tensor, cache: tuple[torch.Tensor, torch.Tensor], *, offset: int
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """New positions against cached K/V. ``offset`` is the first new token's index."""
+        batch_size, new_len, _ = x.shape
+        q, k_new, v_new = self._project_qkv(x)
+        total = offset + new_len
+        cos, sin = build_rope_cache(total, self.head_dim, theta=self.rope_theta, device=x.device)
+        q = apply_rotary_emb(q, cos[offset:total], sin[offset:total])
+        k_new = apply_rotary_emb(k_new, cos[offset:total], sin[offset:total])
+        k = torch.cat([cache[0], k_new], dim=2)
+        v = torch.cat([cache[1], v_new], dim=2)
+        window = self.local_window
+        # The earliest appended query still needs its preceding window. Keep
+        # that history until all new rows have attended, then trim the cache.
+        if window is not None and window > 0:
+            keep = window + new_len - 1
+            k, v = k[:, :, -keep:], v[:, :, -keep:]
+        bias = None
+        if new_len > 1:
+            q_pos = torch.arange(offset, total, device=x.device)[:, None]
+            k_pos = torch.arange(total - k.size(2), total, device=x.device)[None, :]
+            bias = q_pos >= k_pos if self.causal else torch.ones_like(q_pos + k_pos, dtype=torch.bool)
+            if window is not None and window > 0:
+                bias = bias & (k_pos > q_pos - window)
+        context = F.scaled_dot_product_attention(q, k, v, attn_mask=bias, dropout_p=0.0)
+        if window is not None and window > 0:
+            k, v = k[:, :, -window:], v[:, :, -window:]
+        context = context.transpose(1, 2).contiguous().view(batch_size, new_len, self.dim)
+        return self.o_proj(context), (k, v)
+
 
 class TernaryMLP(nn.Module):
     """SwiGLU expand → mid (silu) → down; 4 HBitLinears / 3 stages.
@@ -136,3 +193,15 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.attn_norm(x), attention_mask=attention_mask)
         x = x + self.mlp(self.mlp_norm(x))
         return x
+
+    def prefill(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        attn_out, cache = self.attn.prefill(self.attn_norm(x))
+        x = x + attn_out
+        return x + self.mlp(self.mlp_norm(x)), cache
+
+    def extend(
+        self, x: torch.Tensor, cache: tuple[torch.Tensor, torch.Tensor], *, offset: int
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        attn_out, cache = self.attn.extend(self.attn_norm(x), cache, offset=offset)
+        x = x + attn_out
+        return x + self.mlp(self.mlp_norm(x)), cache

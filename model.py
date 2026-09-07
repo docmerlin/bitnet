@@ -145,6 +145,7 @@ class BitNetDeep(nn.Module):
     ):
         """Recompute from original banks, then restore post-forward runtime state."""
         with contextlib.ExitStack() as stack:
+            stack.enter_context(reuse_effective_weights())
             for layer, state in zip(layers, states):
                 if state is None:
                     continue
@@ -185,6 +186,120 @@ class BitNetDeep(nn.Module):
             safe = bool((segment_ids == segment_ids[:, :1]).all())
         return safe
 
+    def _checkpoint_kimi_layer(
+        self,
+        layer: HybridTransformerBlock,
+        stream: AttnResStream,
+        attention_mask: Optional[torch.Tensor],
+        segment_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
+        *,
+        update_memory: Optional[bool],
+        memory_safe: Optional[bool],
+    ) -> AttnResStream:
+        packed = stream.pack()
+        group_size = stream.group_size
+        attn_mix, mlp_mix = stream.attn_mix, stream.mlp_mix
+        layer_memory_state = layer.infini_attn.get_memory_state()
+
+        def run(
+            completed,
+            partial,
+            has_partial,
+            layers_in_block,
+            last_hidden,
+            layer=layer,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            input_ids=input_ids,
+            update_memory=update_memory,
+            memory_safe=memory_safe,
+            group_size=group_size,
+            attn_mix=attn_mix,
+            mlp_mix=mlp_mix,
+        ):
+            inner = AttnResStream.unpack(
+                completed,
+                partial,
+                has_partial,
+                layers_in_block,
+                last_hidden,
+                group_size=group_size,
+                attn_mix=attn_mix,
+                mlp_mix=mlp_mix,
+            )
+            out = layer(
+                inner,
+                attention_mask,
+                segment_ids=segment_ids,
+                input_ids=input_ids,
+                update_memory=update_memory,
+                memory_safe=memory_safe,
+            )
+            return out.pack()
+
+        packed_out = checkpoint(
+            run,
+            *packed,
+            use_reentrant=False,
+            context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: (
+                reuse_effective_weights(),
+                self._recompute_infini_states([layer], [layer_memory_state]),
+            ),
+        )
+        return AttnResStream.unpack(
+            *packed_out,
+            group_size=group_size,
+            attn_mix=layer.attn_res_mix or attn_mix,
+            mlp_mix=layer.mlp_res_mix or mlp_mix,
+        )
+
+    def _checkpoint_kimi_loop(
+        self,
+        recurrent: Sequence[HybridTransformerBlock],
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        segment_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
+        *,
+        update_memory: bool,
+        memory_safe: bool,
+    ) -> torch.Tensor:
+        """Loop-granularity checkpoint: stream is created inside the segment."""
+        layers_list = list(recurrent)
+        mem_states = self._snapshot_infini_states(layers_list)
+
+        def run_stack(
+            hidden_states: torch.Tensor,
+            layers_list=layers_list,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            input_ids=input_ids,
+            update_memory=update_memory,
+            memory_safe=memory_safe,
+        ) -> torch.Tensor:
+            stream = self._new_stream(hidden_states)
+            stream = self._run_stack(
+                layers_list,
+                stream,
+                attention_mask,
+                segment_ids,
+                input_ids,
+                update_memory=update_memory,
+                memory_safe=memory_safe,
+            )
+            return stream.hidden()
+
+        return checkpoint(
+            run_stack,
+            x,
+            use_reentrant=False,
+            context_fn=lambda layers_list=layers_list, mem_states=mem_states: (
+                reuse_effective_weights(),
+                self._recompute_infini_states(layers_list, mem_states),
+            ),
+        )
+
     def _run_layer(
         self,
         layer: HybridTransformerBlock,
@@ -202,10 +317,18 @@ class BitNetDeep(nn.Module):
             and self.training
             and self.checkpoint_granularity == "layer"
         )
-        if do_ckpt:
-            if self._kimi_mode:
-                # Stream carries Python lists — layer ckpt not supported; fall through.
-                do_ckpt = False
+        if do_ckpt and self._kimi_mode:
+            if not isinstance(state, AttnResStream):
+                raise TypeError("kimi layer checkpointing requires AttnResStream state")
+            return self._checkpoint_kimi_layer(
+                layer,
+                state,
+                attention_mask,
+                segment_ids,
+                input_ids,
+                update_memory=update_memory,
+                memory_safe=memory_safe,
+            )
         if do_ckpt:
             layer_memory_state = layer.infini_attn.get_memory_state()
             return checkpoint(
@@ -220,10 +343,8 @@ class BitNetDeep(nn.Module):
                 state,
                 use_reentrant=False,
                 context_fn=lambda layer=layer, layer_memory_state=layer_memory_state: (
-                    contextlib.nullcontext(),
-                    layer.infini_attn.use_memory_state(
-                        layer_memory_state, update_memory_buffers=True
-                    ),
+                    reuse_effective_weights(),
+                    self._recompute_infini_states([layer], [layer_memory_state]),
                 ),
             )
         return layer(
@@ -279,21 +400,30 @@ class BitNetDeep(nn.Module):
             and self.training
             and self.checkpoint_granularity == "loop"
             and len(recurrent) > 0
-            and not self._kimi_mode  # stream state is not pure Tensor for ckpt
         )
         if self._kimi_mode:
-            stream = self._new_stream(x)
-            for layer in recurrent:
-                stream = self._run_layer(
-                    layer,
-                    stream,
-                    attention_mask,
-                    segment_ids,
-                    input_ids,
-                    update_memory=update_memory,
-                    memory_safe=memory_safe,
-                )
-            return stream.hidden()
+            if not use_loop_ckpt:
+                stream = self._new_stream(x)
+                for layer in recurrent:
+                    stream = self._run_layer(
+                        layer,
+                        stream,
+                        attention_mask,
+                        segment_ids,
+                        input_ids,
+                        update_memory=update_memory,
+                        memory_safe=memory_safe,
+                    )
+                return stream.hidden()
+            return self._checkpoint_kimi_loop(
+                recurrent,
+                x,
+                attention_mask,
+                segment_ids,
+                input_ids,
+                update_memory=update_memory,
+                memory_safe=memory_safe,
+            )
 
         if not use_loop_ckpt:
             for layer in recurrent:
@@ -335,7 +465,7 @@ class BitNetDeep(nn.Module):
             x,
             use_reentrant=False,
             context_fn=lambda layers_list=layers_list, mem_states=mem_states: (
-                contextlib.nullcontext(),
+                reuse_effective_weights(),
                 self._recompute_infini_states(layers_list, mem_states),
             ),
         )

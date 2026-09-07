@@ -57,6 +57,7 @@ class HierarchicalTokenizer:
         self.reverse_merges: Dict[int, Pair] = {}
 
         self._build_second_stage_vocab()
+        self._patch_cache: Dict[int, Tuple[int, ...]] = {}
 
     def _iter_first_stage_patches(self) -> Iterable[List[int]]:
         """Yield byte patches for each first-stage BPE token.
@@ -134,6 +135,14 @@ class HierarchicalTokenizer:
 
         return patch
 
+    def _patch_for_first_stage_id(self, token_id: int) -> List[int]:
+        """Second-stage patch for one first-stage id; copy so callers cannot mutate the cache."""
+        cached = self._patch_cache.get(token_id)
+        if cached is None:
+            cached = tuple(self._apply_merges(self._bytes_to_patch(token_id)))
+            self._patch_cache[token_id] = cached
+        return list(cached)
+
     def encode_patches(self, text: str, add_special_tokens: bool = False) -> List[List[int]]:
         """Encode text to a list of hierarchical patches.
 
@@ -141,7 +150,7 @@ class HierarchicalTokenizer:
         learned second-stage BPE rules.
         """
         first_stage_ids = self.first_stage.encode_ordinary(text)
-        patches = [self._apply_merges(self._bytes_to_patch(token_id)) for token_id in first_stage_ids]
+        patches = [self._patch_for_first_stage_id(token_id) for token_id in first_stage_ids]
 
         if add_special_tokens:
             patches = [[self.bos_id], *patches, [self.eos_id]]

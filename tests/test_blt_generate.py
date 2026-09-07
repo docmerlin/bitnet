@@ -91,6 +91,21 @@ def test_generation_respects_the_byte_budget():
         assert torch.equal(tokens[:, : prompt.size(1)], prompt)
 
 
+@pytest.mark.parametrize("cross_attn_k", [1, 2])
+@pytest.mark.parametrize("speculation_window", [0, 4])
+def test_cached_generation_with_local_windows_and_custom_ngrams(cross_attn_k, speculation_window):
+    from dataclasses import replace
+
+    config = replace(_model().config, local_window=4, cross_attn_k=cross_attn_k,
+                     ngram_sizes=(2, 5, 11), ngram_vocab_size=32)
+    torch.manual_seed(8)
+    model = TernaryBLTModel(config).eval()
+    prompt = _prompt(model, length=3)
+    expected = _reference_greedy(model, prompt, 15, UniformPatcher(config.patch_size))
+    actual, _ = generate(model, prompt, max_new_bytes=15, speculation_window=speculation_window, eos_id=-1)
+    assert torch.equal(actual, expected)
+
+
 def test_speculation_trades_global_calls_for_decoder_calls():
     model = _model()
     prompt = _prompt(model)

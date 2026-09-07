@@ -18,13 +18,14 @@ from training.arch_upgrade import (
     is_ffn_mid_key,
 )
 from training.memory import reset_infini_memory
-from utils import atomic_torch_save, load_checkpoint_payload
+from utils import atomic_torch_save, load_checkpoint_payload, replace_with_hardlink
 
 # Re-export for callers / BLT that shared the predicate.
 __all__ = [
     "TrainerState",
     "filter_ffn_mid_keys",
     "is_ffn_mid_key",
+    "alias_checkpoint",
     "load_checkpoint",
     "restore_resume_args",
     "save_checkpoint",
@@ -85,6 +86,18 @@ def save_checkpoint(
     }
     atomic_torch_save(payload, checkpoint_path)
     return checkpoint_path
+
+
+def alias_checkpoint(output_dir: Path, source_name: str, alias_name: str) -> Path:
+    """Point ``alias_name`` at an already-written numbered checkpoint.
+
+    Does not serialize again. Never writes through the alias into the numbered
+    file.
+    """
+    checkpoint_dir = output_dir / "checkpoints"
+    dest = checkpoint_dir / alias_name
+    replace_with_hardlink(checkpoint_dir / source_name, dest)
+    return dest
 
 
 def load_checkpoint(
