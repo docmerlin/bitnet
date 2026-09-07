@@ -136,11 +136,13 @@ class MLXLocalEncoder(nn.Module):
         *,
         attention_mask: mx.array | None = None,
         unpadded: bool = False,
+        uniform_patch_size: int | None = None,
+        prefilled: tuple | None = None,
     ) -> tuple[mx.array, mx.array, mx.array]:
         byte_mask = None if attention_mask is None else attention_mask.astype(mx.bool_)
         # Pooling/patch ids keep ``attention_mask``; local self-attn may omit it
         # when the caller trusts the batch is unpadded (windowed/chunked path).
-        hidden = self.encode_bytes(
+        hidden = prefilled[0] if prefilled is not None else self.encode_bytes(
             byte_embeddings,
             attention_mask=None if unpadded else byte_mask,
         )
@@ -149,7 +151,8 @@ class MLXLocalEncoder(nn.Module):
         if byte_mask is not None:
             patch_ids = mx.where(byte_mask, patch_ids, -1)
         patch_states = pool_patch_representations(
-            hidden, patch_lengths, patch_ids=patch_ids, token_mask=byte_mask, pooling="mean"
+            hidden, patch_lengths, patch_ids=patch_ids, token_mask=byte_mask, pooling="mean",
+            uniform_patch_size=uniform_patch_size,
         )
         if self.patch_init_proj is not None:
             patch_states = self.patch_init_proj(patch_states)
@@ -299,10 +302,14 @@ class MLXLocalDecoder(nn.Module):
         byte_states: mx.array,
         patch_states: mx.array,
         patch_ids: mx.array,
+        *,
+        latent: mx.array | None = None,
+        cross_projected: list | None = None,
     ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
         """Full-prefix decoder for generation; returns last-pos-ready state + self-attn caches."""
         hidden = self.byte_state_proj(byte_states) if self.byte_state_proj is not None else byte_states
-        latent = self._prepare_latents(patch_states)
+        if latent is None:
+            latent = self._prepare_latents(patch_states)
         cross_valid = patch_ids >= 0
         cross_mask = None
         if self.cross_attn_k > 1:
@@ -312,11 +319,12 @@ class MLXLocalDecoder(nn.Module):
             cross_mask = mx.repeat(membership, self.cross_attn_k, axis=-1) & cross_valid[..., None]
 
         caches: list[tuple[mx.array, mx.array]] = []
-        for cross_attn, block in zip(self.cross_attn_layers, self.blocks):
+        for index, (cross_attn, block) in enumerate(zip(self.cross_attn_layers, self.blocks)):
+            projected = None if cross_projected is None else cross_projected[index]
             hidden = (
-                cross_attn(hidden, latent, mask=cross_mask)
+                cross_attn(hidden, latent, mask=cross_mask, projected_kv=projected)
                 if self.cross_attn_k > 1
-                else cross_attn(hidden, latent, patch_ids, valid=cross_valid)
+                else cross_attn(hidden, latent, patch_ids, valid=cross_valid, values=projected)
             )
             hidden, cache = block.prefill(hidden)
             caches.append(cache)
@@ -466,6 +474,8 @@ class MLXTernaryBLTModel(nn.Module):
         attention_mask: mx.array | None = None,
         patch_lengths: mx.array | None = None,
         unpadded: bool = False,
+        uniform_patch_size: int | None = None,
+        encoder_prefilled: tuple | None = None,
     ) -> MLXTernaryBLTOutput:
         if attention_mask is None:
             if self.config.pad_id >= 0:
@@ -482,6 +492,7 @@ class MLXTernaryBLTModel(nn.Module):
         valid_lengths = mx.sum(attention_mask.astype(mx.int32), axis=1)
 
         if patch_lengths is None:
+            uniform_patch_size = self.patch_size
             patch_lengths = build_uniform_patch_lengths(
                 input_ids.shape[0], input_ids.shape[1], self.patch_size
             )
@@ -497,6 +508,8 @@ class MLXTernaryBLTModel(nn.Module):
             patch_lengths,
             attention_mask=attention_mask,
             unpadded=unpadded,
+            uniform_patch_size=uniform_patch_size,
+            prefilled=encoder_prefilled,
         )
         global_mask = patch_presence_mask(patch_lengths)
         global_hidden = self.global_transformer(encoder_patches, attention_mask=global_mask)

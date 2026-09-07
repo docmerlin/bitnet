@@ -128,10 +128,14 @@ class LocalDecoder(nn.Module):
         byte_states: torch.Tensor,
         patch_states: torch.Tensor,
         patch_ids: torch.Tensor,
+        *,
+        latent: torch.Tensor | None = None,
+        cross_projected: list | None = None,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Full-prefix decoder for generation; returns last-pos-ready state + self-attn caches."""
         hidden = self.byte_state_proj(byte_states) if self.byte_state_proj is not None else byte_states
-        latent = self._prepare_latents(patch_states)
+        if latent is None:
+            latent = self._prepare_latents(patch_states)
         cross_valid = patch_ids >= 0
         cross_mask = None
         if self.cross_attn_k > 1:
@@ -141,11 +145,12 @@ class LocalDecoder(nn.Module):
             cross_mask = membership.repeat_interleave(self.cross_attn_k, dim=-1) & cross_valid.unsqueeze(-1)
 
         caches: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for cross_attn, block in zip(self.cross_attn_layers, self.blocks):
+        for index, (cross_attn, block) in enumerate(zip(self.cross_attn_layers, self.blocks)):
+            projected = None if cross_projected is None else cross_projected[index]
             hidden = (
-                cross_attn(hidden, latent, mask=cross_mask)
+                cross_attn(hidden, latent, mask=cross_mask, projected_kv=projected)
                 if self.cross_attn_k > 1
-                else cross_attn(hidden, latent, patch_ids, valid=cross_valid)
+                else cross_attn(hidden, latent, patch_ids, valid=cross_valid, values=projected)
             )
             hidden, cache = block.prefill(hidden)
             caches.append(cache)

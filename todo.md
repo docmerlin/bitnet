@@ -688,7 +688,8 @@ geo **197.5 → 210.0 B/s (1.06×)**; 1.04× if pair 1 is dropped as cold. Not 5
   At 629.00M physical parameters, the combined windowed/compiled path measured
   **1.52×** at 128 bytes (0.844 → 0.556 s/update; 151.7 → 230.4 B/s) and **1.40×**
   at 1024 bytes (1.079 → 0.769 s/update; 949.4 → 1331.3 B/s). Five interleaved
-  samples per mode after cold tracing and two warmup rounds, BF16, batch one,
+  samples per mode after cold tracing and two warmup rounds, BF16 storage with
+  FP32 projections (corrected in the September 7 follow-up), batch one,
   fixed synthetic corpus, all ingestion/gradient/optimizer synchronization included.
   Peak memory rose 8.924 → 9.648 GiB at 128 bytes but fell 10.944 → 10.645 GiB
   at 1024 bytes. Windowing alone was timing-neutral at this batch, saving 0.300 GiB
@@ -738,6 +739,72 @@ and `benchmarks/2026-09-06-blt-long.jsonl`. BLT samples continue training across
 losses are logged to check finiteness, not compared as a quality A/B. Validation and
 checkpoint pauses are outside these step timings; checkpoint serialization reduction
 is checked structurally and by regression tests, not timed at production scale.
+
+### September 7 performance follow-up
+
+- [x] Preserve MLX BLT weight/activation dtype through ternarization and pinned
+  inference weights. CE/KL/MTP loss calculations use FP32. The September 6 BLT
+  measurements labeled BF16 used BF16 parameter storage but FP32 projections.
+- [x] Expose `TrainingConfig.mud_eight_bit` and `mud_master_dtype`, also available
+  as `--mud-eight-bit --mud-master-dtype bfloat16` in `blt.mlx_train`. Keep FP32
+  MUD state as the default: compact state learns in the regression smoke test,
+  but long-run quality equivalence has not been established. Model exports carry
+  training settings; this does not add optimizer resume support.
+- [x] Use unpadded windowed local attention for MLX generation refresh and
+  verification, retaining explicit byte masks for pooling/global attention.
+- [x] Share encoder prefill with draft initialization and reuse verification
+  encoder K/V after truncating rejected bytes and encoding the correction.
+  Prepare decoder cross projections once, including PyTorch draft prefill.
+- [x] Cache MLX entropy patcher K/V, absolute positions, and completed boundaries
+  for each generation call. Score only appended/replaced suffixes; token prefix
+  comparison handles same-length replacements and speculative rollback.
+- [x] Pool trusted uniform patches with masked reshape/reduction, including
+  partial tails and suffix padding. Arbitrary patch layouts retain membership
+  pooling; supplied teacher patches never acquire an inferred uniform hint.
+- [x] Bound each PyTorch attention-bias cache to 64 MiB and 128 entries (128 MiB
+  combined), evicting by storage bytes and skipping oversized allocations.
+
+Validation: **758 tests passed**, covering FP32/BF16/FP16 projection dtype and STE,
+masked pooling outputs/gradients, incremental patching replacement/rollback,
+cross-projection reuse, greedy/speculative bytes, compact-state learning, and
+cache eviction. The benchmark uses **629,004,800 physical parameters** on M1 Max.
+Random weights/corpus measure execution and finiteness, not trained model quality.
+
+Reproduction: extract commit `3257f70` into a separate directory, then run
+`benchmark_blt_followup.py --baseline PATH`. Training uses `--mode legacy`,
+`--mode native`, or `--mode compact` with `--length 128` or `--length 1024`.
+Generation uses `--workload generation`, optionally `--entropy` and
+`--speculation-window 0`. Generation arms share one FP32 model, check identical
+committed bytes, and alternate order for three warmed pairs after two warmups.
+Training modes use independent processes with the same initialization and byte
+order; two runs per mode reverse process order, each with three warmed samples.
+All timed training steps include ingestion, gradient calculation, clipping, and
+optimizer application; all measured outputs/state are explicitly evaluated.
+Cold timings are separate. Validation/checkpoint pauses are outside these timings.
+Training comparisons include a change from promoted FP32 to native BF16 compute.
+Raw records live in `benchmarks/2026-09-07-*.jsonl`.
+
+Training medians (seconds/update, bytes/s, maximum warmed peak GiB):
+
+| Bytes | Previous FP32 projections | Native BF16, FP32 MUD | Native BF16, compact MUD |
+| --- | --- | --- | --- |
+| 128 | 0.5578 / 229.5 / 9.648 | 0.5435 / 235.5 / 9.648 | 0.5573 / 229.7 / 6.448 |
+| 1024 | 0.7429 / 1378.4 / 10.644 | 0.7218 / 1418.7 / 9.648 | 0.7358 / 1391.6 / 6.448 |
+
+Native BF16 is about 3% faster here. Compact MUD primarily saves memory:
+optimizer arrays shrink **4.651 → 1.782 GiB**, with throughput close to the
+previous implementation. Long-prefix speculative generation with uniform patches
+measures **0.8266 → 0.8044 s** per 16 bytes (~3% faster); with a 4-layer, dim-256
+entropy patcher it measures **0.6333 → 0.5731 s** (~10% faster). These runs use a
+speculation window of four. The synthetic entropy threshold is 100 nats, so
+boundaries come from the 32-byte cap; this isolates patcher execution cost and
+does not model a calibrated patcher's acceptance rate. Uniform and entropy
+patching produce different patch counts, so compare each only to its own baseline.
+At the same 1024-byte prefix with entropy patching and ordinary greedy decoding,
+16 bytes take **0.3506 → 0.2684 s** (45.6 → 59.6 B/s, ~31% more throughput).
+Short-prefix uniform speculative generation is close to neutral:
+**0.3429 → 0.3352 s** for 16 bytes (~2%). Generation memory peaks remain near
+5.4 GiB because FP32 parameters and pinned weights dominate these cases.
 
 Original audit verification: existing n-gram/windowed-attention tests passed (12 tests).
 In-memory candidate checks passed 20 final-embedding cases (maximum absolute error 0)

@@ -10,7 +10,9 @@ import os
 import random
 import shutil
 import tempfile
-from functools import lru_cache
+from functools import lru_cache, wraps
+from collections import OrderedDict, namedtuple
+from threading import RLock
 from pathlib import Path
 from typing import Tuple
 
@@ -22,6 +24,49 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x_even = x[..., 0::2]
     x_odd = x[..., 1::2]
     return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+
+def _tensor_byte_cache(max_bytes: int, maxsize: int = 128):
+    """Bound retained tensor storage; oversized results remain caller-owned."""
+    def decorate(function):
+        entries = OrderedDict()
+        lock = RLock()
+        retained = hits = misses = 0
+        info = namedtuple("TensorCacheInfo", "hits misses maxsize currsize max_bytes retained_bytes")
+
+        @wraps(function)
+        def cached(*args):
+            nonlocal retained, hits, misses
+            with lock:
+                if args in entries:
+                    hits += 1
+                    entries.move_to_end(args)
+                    return entries[args][0]
+                misses += 1
+                value = function(*args)
+                size = value.untyped_storage().nbytes()
+                if size <= max_bytes:
+                    while entries and (retained + size > max_bytes or len(entries) >= maxsize):
+                        _, (_, removed) = entries.popitem(last=False)
+                        retained -= removed
+                    entries[args] = (value, size)
+                    retained += size
+                return value
+
+        def clear():
+            nonlocal retained, hits, misses
+            with lock:
+                entries.clear()
+                retained = hits = misses = 0
+
+        def cache_info():
+            with lock:
+                return info(hits, misses, maxsize, len(entries), max_bytes, retained)
+
+        cached.cache_clear = clear
+        cached.cache_info = cache_info
+        return cached
+    return decorate
 
 
 @lru_cache(maxsize=128)
@@ -64,7 +109,7 @@ def build_rope_cache(
     return _build_rope_cache_cached(seq_len, dim, theta, scaling_factor, device_key)
 
 
-@lru_cache(maxsize=128)
+@_tensor_byte_cache(max_bytes=64 * 1024 * 1024)
 def _causal_block_bias_cached(
     seq_len: int, num_blocks: int, dtype: torch.dtype, device_key: str
 ) -> torch.Tensor:
@@ -79,7 +124,7 @@ def _causal_block_bias_cached(
     return bias.view(1, 1, seq_len, seq_len)
 
 
-@lru_cache(maxsize=128)
+@_tensor_byte_cache(max_bytes=64 * 1024 * 1024)
 def _causal_window_bias_cached(
     seq_len: int, window: int, dtype: torch.dtype, device_key: str
 ) -> torch.Tensor:

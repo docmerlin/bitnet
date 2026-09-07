@@ -248,9 +248,11 @@ def _ensure_draft_prefill(
     )
     stats.draft_encoder += 1
     decoder_patches = _decoder_patches(latents)
-    decoded, dec_caches = model.local_decoder.prefill(hidden, decoder_patches, patch_ids)
-    stats.decoder += 1
     latent, projected = model.local_decoder.prepare_cross_cache(decoder_patches)
+    decoded, dec_caches = model.local_decoder.prefill(
+        hidden, decoder_patches, patch_ids, latent=latent, cross_projected=projected
+    )
+    stats.decoder += 1
     draft_cache.encoder = enc_caches
     draft_cache.decoder = dec_caches
     draft_cache.length = length

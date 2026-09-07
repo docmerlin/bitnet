@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+from bisect import bisect_right
 from pathlib import Path
 
 import mlx.core as mx
@@ -140,21 +141,26 @@ class _MLXEntropyBlock(nn.Module):
         self.down_proj = nn.Linear(dim * 4, dim)
 
     def __call__(self, x: mx.array, causal_bias: mx.array) -> mx.array:
+        return self.forward_cached(x, causal_bias)[0]
+
+    def forward_cached(self, x: mx.array, causal_bias: mx.array, cache=None):
         batch, seq_len, dim = x.shape
         normed = self.attn_norm(x)
 
         def heads(t):
             return t.reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
+        k, v = heads(self.k_proj(normed)), heads(self.v_proj(normed))
+        if cache is not None:
+            k = mx.concatenate([cache[0], k], axis=2)
+            v = mx.concatenate([cache[1], v], axis=2)
         context = mx.fast.scaled_dot_product_attention(
-            heads(self.q_proj(normed)),
-            heads(self.k_proj(normed)),
-            heads(self.v_proj(normed)),
+            heads(self.q_proj(normed)), k, v,
             scale=1.0 / math.sqrt(self.head_dim),
             mask=causal_bias,
         )
         x = x + self.o_proj(context.transpose(0, 2, 1, 3).reshape(batch, seq_len, dim))
-        return x + self.down_proj(nn.gelu(self.up_proj(self.mlp_norm(x))))
+        return x + self.down_proj(nn.gelu(self.up_proj(self.mlp_norm(x)))), (k, v)
 
 
 class MLXByteEntropyModel(nn.Module):
@@ -205,6 +211,24 @@ class MLXByteEntropyModel(nn.Module):
             input_ids[:, 1:].reshape(-1),
             reduction="mean",
         )
+
+    def forward_cached(self, input_ids: mx.array, caches=None, *, offset: int = 0):
+        """Score an appended suffix using absolute positions and prefix K/V."""
+        end = offset + input_ids.shape[1]
+        if end > self.max_seq_len:
+            raise ValueError(f"sequence of {end} exceeds max_seq_len {self.max_seq_len}")
+        if caches is None and offset:
+            raise ValueError("nonzero offset requires prefix caches")
+        hidden = self.embedding(input_ids) + self.position(mx.arange(offset, end))[None]
+        bias = mx.where(
+            mx.arange(end)[None, :] > mx.arange(offset, end)[:, None],
+            mx.array(_MASK_FLOOR), mx.array(0.0),
+        )
+        updated = []
+        for index, block in enumerate(self.blocks):
+            hidden, cache = block.forward_cached(hidden, bias, None if caches is None else caches[index])
+            updated.append(cache)
+        return self.output_head(self.norm(hidden)), updated
 
     def entropy(self, input_ids: mx.array) -> mx.array:
         return next_byte_entropy(self(input_ids))
@@ -259,6 +283,56 @@ class MLXByteEntropyModel(nn.Module):
 
     def set_threshold(self, threshold: float) -> None:
         self._threshold = mx.array(float(threshold))
+
+
+class EntropyGenerationCache:
+    """Single-sequence patching cache, including speculative suffix rollback.
+
+    Token comparison catches replacement branches even when their lengths agree.
+    Only new predictions cross to the host; completed boundaries are retained.
+    The cache belongs to one generation call with fixed patcher weights/threshold.
+    """
+
+    def __init__(self, model: MLXByteEntropyModel, threshold: float | None = None):
+        self.model = model
+        self.threshold = model.default_threshold if threshold is None else threshold
+        self.tokens = []
+        self.boundaries = [0]
+        self.caches = None
+
+    def update(self, tokens: mx.array) -> None:
+        if tokens.shape[0] != 1:
+            raise ValueError("entropy generation cache expects batch size one")
+        row = tokens[0].tolist()
+        common = 0
+        for old, new in zip(self.tokens, row):
+            if old != new:
+                break
+            common += 1
+        if common == len(self.tokens) == len(row):
+            return
+        self.boundaries = self.boundaries[:bisect_right(self.boundaries, common)]
+        if self.caches is not None:
+            self.caches = [(k[:, :, :common], v[:, :, :common]) for k, v in self.caches]
+        if common < len(row):
+            logits, self.caches = self.model.forward_cached(
+                tokens[:, common:], self.caches, offset=common
+            )
+            for position, entropy in enumerate(next_byte_entropy(logits)[0].tolist(), common + 1):
+                cap = self.model.max_patch_length
+                if entropy > self.threshold or (cap > 0 and position - self.boundaries[-1] >= cap):
+                    self.boundaries.append(position)
+        self.tokens = row
+
+    def patch_lengths(self, tokens: mx.array) -> mx.array:
+        self.update(tokens)
+        length = len(self.tokens)
+        edges = self.boundaries if self.boundaries[-1] == length else [*self.boundaries, length]
+        return mx.array([[right - left for left, right in zip(edges, edges[1:])]], dtype=mx.int32)
+
+    def opens_new_patch(self, tokens: mx.array) -> bool:
+        self.update(tokens)
+        return self.boundaries[-1] == len(self.tokens)
 
 
 def load_entropy_model(path: str | Path, config: TernaryBLTConfig) -> MLXByteEntropyModel:

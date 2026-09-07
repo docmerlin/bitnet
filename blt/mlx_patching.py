@@ -146,6 +146,7 @@ def pool_patch_representations(
     patch_ids: mx.array | None = None,
     token_mask: mx.array | None = None,
     pooling: str = "mean",
+    uniform_patch_size: int | None = None,
 ) -> mx.array:
     """Pool byte states into one vector per patch.
 
@@ -158,6 +159,23 @@ def pool_patch_representations(
 
     batch_size, seq_len, _ = hidden_states.shape
     num_patches = patch_lengths.shape[1]
+    # Trusted fixed-width layout, including a short tail and suffix padding.
+    # Explicit arbitrary patch ids must use the membership path unless the
+    # caller also guarantees that they describe this same layout.
+    if uniform_patch_size is not None:
+        width = uniform_patch_size
+        if width <= 0 or num_patches != (seq_len + width - 1) // width:
+            raise ValueError("uniform patch hint does not match the sequence shape")
+        padding = num_patches * width - seq_len
+        valid = mx.ones((batch_size, seq_len), dtype=mx.bool_) if token_mask is None else token_mask
+        values = mx.where(valid[..., None], hidden_states, 0)
+        values = mx.pad(values, [(0, 0), (0, padding), (0, 0)])
+        pooled = values.reshape(batch_size, num_patches, width, -1).sum(axis=2)
+        if pooling == "mean":
+            counts = mx.pad(valid.astype(hidden_states.dtype), [(0, 0), (0, padding)])
+            counts = counts.reshape(batch_size, num_patches, width).sum(axis=2)[..., None]
+            pooled = pooled / mx.maximum(counts, 1)
+        return pooled
     if patch_ids is None:
         patch_ids = patch_ids_from_lengths(patch_lengths, seq_len)
 

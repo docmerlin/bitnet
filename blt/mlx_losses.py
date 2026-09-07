@@ -50,10 +50,10 @@ def truncated_kl(
     the whole vocabulary and only then gathered, so truncation never touches the
     student's normalising constant.
     """
-    student_log_probs = nn.log_softmax(student_logits / temperature, axis=-1)
+    student_log_probs = nn.log_softmax(student_logits.astype(mx.float32) / temperature, axis=-1)
     gathered = mx.take_along_axis(student_log_probs, teacher_topk_indices, axis=-1)
 
-    scaled = teacher_topk_logits / temperature
+    scaled = teacher_topk_logits.astype(mx.float32) / temperature
     teacher_log_probs = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
     teacher_probs = mx.exp(teacher_log_probs)
     return mx.sum(teacher_probs * (teacher_log_probs - gathered), axis=-1)
@@ -78,6 +78,8 @@ def blt_distillation_loss(
 
     loss = mx.array(0.0)
     metrics: dict[str, mx.array] = {}
+    # Projection precision must not reduce log-softmax or loss accumulation precision.
+    student_logits = student_logits.astype(mx.float32)
 
     if weights.hard_ce > 0.0:
         token_ce = nn.losses.cross_entropy(student_logits, labels, reduction="none")

@@ -82,6 +82,8 @@ class TrainingConfig:
     log_every: int = 10
     seed: int = 0
     mud_block_size: int = MUD_BLOCK_SIZE
+    mud_eight_bit: bool = False
+    mud_master_dtype: str = "float32"
     compile_step: bool = True
     # Patch-count bucket for compiled runs; see pad_patch_lengths_to_bucket.
     # Ignored when patches_per_sequence is set, and unsafe with the BitNet
@@ -196,6 +198,8 @@ class MLXBLTTrainer:
             fallback_learning_rate=config.fallback_learning_rate,
             weight_decay=config.weight_decay,
             block_size=config.mud_block_size,
+            mud_eight_bit=config.mud_eight_bit,
+            mud_master_dtype=config.mud_master_dtype,
         )
         # CMUD masters contain parameter values, so lazy initialization from
         # gradients would corrupt the very first eager update as well.
@@ -255,7 +259,7 @@ class MLXBLTTrainer:
         output = self.model(
             batch["tokens"],
             attention_mask=batch["mask"],
-            patch_lengths=batch["patch_lengths"],
+            patch_lengths=None if "uniform_patches" in batch else batch["patch_lengths"],
             unpadded=self._unpadded,
         )
         loss, metrics = blt_distillation_loss(
@@ -270,7 +274,7 @@ class MLXBLTTrainer:
         if self.model.config.mtp_depth > 0 and self.config.mtp_loss_coef > 0:
             mtp_logits = self.model.selected_mtp_logits(output.decoder_hidden, batch["mtp_index"])
             mtp_token_ce = nn.losses.cross_entropy(
-                mtp_logits,
+                mtp_logits.astype(mx.float32),
                 batch["mtp_labels"],
                 reduction="none",
             )
@@ -342,6 +346,8 @@ class MLXBLTTrainer:
         if self.has_teacher:
             batch["topk_indices"] = mx.array(raw["topk_indices"])
             batch["topk_logits"] = mx.array(raw["topk_logits"])
+        if "patch_lengths" not in raw and self.patcher is None:
+            batch["uniform_patches"] = mx.array(True)
         if self.model.config.mtp_depth > 0 and self.config.mtp_loss_coef > 0:
             mtp_labels, mtp_loss_mask = shifted_mtp_labels(labels, loss_mask, mtp_index)
             batch["mtp_labels"] = mtp_labels
@@ -461,6 +467,7 @@ class MLXBLTTrainer:
         )
         # TernaryBLTConfig is a slots dataclass, so it has no __dict__.
         (path / "config.json").write_text(json.dumps(asdict(self.model.config), indent=2, default=str))
+        (path / "training_config.json").write_text(json.dumps(asdict(self.config), indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -492,6 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mtp-loss-coef", type=float, default=0.3)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mud-eight-bit", action="store_true", help="Store MUD momentum in int8.")
+    parser.add_argument("--mud-master-dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument(
         "--mud-block-size",
         type=int,
@@ -567,6 +576,8 @@ def main(argv: list[str] | None = None) -> None:
         log_every=args.log_every,
         seed=args.seed,
         mud_block_size=args.mud_block_size,
+        mud_eight_bit=args.mud_eight_bit,
+        mud_master_dtype=args.mud_master_dtype,
         grad_accumulation_steps=args.grad_accumulation_steps,
         mtp_loss_coef=args.mtp_loss_coef,
     )

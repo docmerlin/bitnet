@@ -85,8 +85,12 @@ def _trainer(tmp_path, *, cross_attn_k=2, mtp_depth=0, **training_overrides):
     return MLXBLTTrainer(model, _cache(tmp_path, config), TrainingConfig(**settings))
 
 
-def test_training_reduces_loss(tmp_path):
-    trainer = _trainer(tmp_path)
+@pytest.mark.parametrize("compact", [False, True])
+def test_training_reduces_loss(tmp_path, compact):
+    trainer = _trainer(tmp_path, mud_eight_bit=compact, mud_master_dtype="bfloat16" if compact else "float32")
+    mud = trainer.optimizer.optimizers[0]
+    assert mud.eight_bit == compact
+    assert mud.master_dtype == ("bfloat16" if compact else "float32")
     history = trainer.train(log=lambda *_: None)
     first = np.mean([h["loss"] for h in history[:5]])
     last = np.mean([h["loss"] for h in history[-5:]])

@@ -145,7 +145,7 @@ class MLXHBitLinear(nn.Module):
         weight = self.weight
         scale = mx.maximum(mx.mean(mx.abs(mx.stop_gradient(weight)), axis=-1, keepdims=True), 1e-5)
         normalized = weight / scale
-        ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0))
+        ternary = mx.where(normalized > 0.5, 1.0, mx.where(normalized < -0.5, -1.0, 0.0)).astype(weight.dtype)
         # BitNet STE: sg(q) + (w - sg(w)). Not w + sg(q - w) — that subtracts
         # q-w and loses digits on the identity FFN mid (w ~ N, q ~ 1).
         return mx.stop_gradient(ternary * scale) + (weight - mx.stop_gradient(weight))

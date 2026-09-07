@@ -34,6 +34,13 @@ Notes:
 
 - Activations stay full precision. Absmax fake-quant / `activation_bits` were removed;
   native fp8-e4m3 is MLX BitNet only (`mlx_model.MLXHBitLinear`), not this stack.
+- MLX projections preserve the model's floating dtype, including BF16 after
+  `model.set_dtype(mx.bfloat16)`. CE/KL/MTP losses accumulate in FP32.
+- `python -m blt.mlx_train --mud-eight-bit --mud-master-dtype bfloat16` opts into
+  compact MUD momentum/master state. Defaults retain FP32 MUD state; compact
+  state passes learning smoke tests but has no long-run quality validation.
+  Saved MLX model exports include `training_config.json` describing these settings;
+  they do not include optimizer state for resuming training.
 - Run from repo root, or let scripts relocate there automatically.
 - BLT package lives under `blt/`, but runs as Python module from repo root via `python3 -m blt`.
 - `run_train.sh` and `run_local_train.sh` stay for old BitNet stack. Not BLT entrypoints.

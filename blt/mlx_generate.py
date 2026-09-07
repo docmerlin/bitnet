@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from blt.mlx_entropy_model import MLXByteEntropyModel
+from blt.mlx_entropy_model import MLXByteEntropyModel, EntropyGenerationCache
 from blt.mlx_model import MLXTernaryBLTModel
 from blt.mlx_patching import (
     build_uniform_patch_lengths,
@@ -67,6 +67,11 @@ class _Patching:
             raise TypeError(f"unsupported patcher for generation: {type(patcher).__name__}")
         self.patcher = patcher
         self.threshold = threshold
+        self.entropy_cache = EntropyGenerationCache(patcher, threshold) if isinstance(patcher, MLXByteEntropyModel) else None
+
+    @property
+    def uniform_patch_size(self) -> int | None:
+        return self.patcher.patch_size if isinstance(self.patcher, UniformPatcher) else None
 
     @property
     def positional(self) -> bool:
@@ -86,13 +91,13 @@ class _Patching:
                 tokens.shape[0], tokens.shape[1], self.patcher.patch_size
             )
         else:
-            lengths = self.patcher.predict_patch_lengths(tokens, threshold=self.threshold)
+            lengths = self.entropy_cache.patch_lengths(tokens)
         return normalize_patch_lengths(lengths, tokens.shape[1])
 
     def opens_new_patch(self, tokens: mx.array) -> bool:
         if isinstance(self.patcher, UniformPatcher):
             return tokens.shape[1] % self.patcher.patch_size == 0
-        return bool(self.patcher.opens_new_patch(tokens, threshold=self.threshold)[0].item())
+        return self.entropy_cache.opens_new_patch(tokens)
 
 
 def _ones_mask(tokens: mx.array) -> mx.array:
@@ -119,13 +124,20 @@ def _embed_last_byte(model: MLXTernaryBLTModel, tokens: mx.array) -> mx.array:
 
 
 def _run_global(
-    model: MLXTernaryBLTModel, tokens: mx.array, patching: _Patching, stats: GenerationStats
+    model: MLXTernaryBLTModel, tokens: mx.array, patching: _Patching, stats: GenerationStats,
+    draft_cache: _DraftCache | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Full encoder + global pass over the committed prefix."""
     patch_lengths = patching.patch_lengths(tokens)
+    embeds = model.embed_bytes(tokens, _ones_mask(tokens))
+    prefilled = model.local_encoder.encode_bytes_prefill(embeds)
     _, patch_states, patch_ids = model.local_encoder(
-        model.embed_bytes(tokens, _ones_mask(tokens)), patch_lengths, attention_mask=_ones_mask(tokens)
+        embeds, patch_lengths, attention_mask=_ones_mask(tokens), unpadded=True,
+        prefilled=prefilled, uniform_patch_size=patching.uniform_patch_size,
     )
+    if draft_cache is not None:
+        draft_cache.encoder_hidden, draft_cache.encoder = prefilled
+        draft_cache.length = tokens.shape[1]
     latents = model.global_transformer(
         patch_states, attention_mask=patch_presence_mask(patch_lengths)
     )
@@ -149,6 +161,7 @@ class _DraftCache:
     last_hidden: mx.array | None = None
     prepared_latents: mx.array | None = None
     cross_projected: list | None = None
+    encoder_hidden: mx.array | None = None
 
 
 def _decoder_patches(latents: mx.array) -> mx.array:
@@ -177,14 +190,19 @@ def _ensure_draft_prefill(
         and draft_cache.length == length
     ):
         return
-    attention_mask = _ones_mask(tokens)
-    embeds = model.embed_bytes(tokens, attention_mask)
-    hidden, enc_caches = model.local_encoder.encode_bytes_prefill(embeds)
-    stats.draft_encoder += 1
+    if draft_cache.encoder_hidden is not None and draft_cache.length == length:
+        hidden, enc_caches = draft_cache.encoder_hidden, draft_cache.encoder
+    else:
+        embeds = model.embed_bytes(tokens, _ones_mask(tokens))
+        hidden, enc_caches = model.local_encoder.encode_bytes_prefill(embeds)
+        stats.draft_encoder += 1
     decoder_patches = _decoder_patches(latents)
-    decoded, dec_caches = model.local_decoder.prefill(hidden, decoder_patches, patch_ids)
-    stats.decoder += 1
     latent, projected = model.local_decoder.prepare_cross_cache(decoder_patches)
+    decoded, dec_caches = model.local_decoder.prefill(
+        hidden, decoder_patches, patch_ids, latent=latent, cross_projected=projected
+    )
+    stats.decoder += 1
+    draft_cache.encoder_hidden = None
     draft_cache.encoder = enc_caches
     draft_cache.decoder = dec_caches
     draft_cache.length = length
@@ -258,12 +276,17 @@ def _verify(
     candidate: mx.array,
     patching: _Patching,
     stats: GenerationStats,
+    draft_cache: _DraftCache | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, int]:
     """Algorithm 2: accept drafted bytes up to the first mismatch."""
+    prefilled = model.local_encoder.encode_bytes_prefill(model.embed_bytes(candidate, _ones_mask(candidate)))
     output = model(
         candidate,
         patch_lengths=patching.patch_lengths(candidate),
         attention_mask=_ones_mask(candidate),
+        unpadded=True,
+        uniform_patch_size=patching.uniform_patch_size,
+        encoder_prefilled=prefilled,
     )
     stats.encoder += 1
     stats.global_model += 1
@@ -288,6 +311,16 @@ def _verify(
     tokens = mx.concatenate(
         [candidate[:, :cut], mx.array([[predicted_row[cut - 1]]], dtype=candidate.dtype)], axis=1
     )
+    if draft_cache is not None:
+        # Prefill retains full K/V, so any rejected suffix can be removed.
+        caches = [(k[:, :, :cut], v[:, :, :cut]) for k, v in prefilled[1]]
+        hidden, caches = model.local_encoder.encode_bytes_extend(
+            _embed_last_byte(model, tokens), caches, offset=cut
+        )
+        stats.draft_encoder += 1
+        draft_cache.encoder_hidden = mx.concatenate([prefilled[0][:, :cut], hidden], axis=1)
+        draft_cache.encoder = caches
+        draft_cache.length = tokens.shape[1]
 
     # Ask the patcher where the resumed byte lands rather than inferring it from
     # the candidate's segmentation: the candidate's last patch is cut off by the
@@ -373,10 +406,10 @@ def _generate_pinned(
     prompt_length: int,
     stats: GenerationStats,
 ) -> tuple[mx.array, GenerationStats]:
-    latents, patch_ids = _run_global(model, tokens, patching, stats)
+    draft_cache = _DraftCache()
+    latents, patch_ids = _run_global(model, tokens, patching, stats, draft_cache)
     next_id = int(patch_ids[0, -1].item()) + int(patching.opens_new_patch(tokens))
     # Self-attn K/V live across drafted bytes; drop after each global pass.
-    draft_cache = _DraftCache()
 
     while tokens.shape[1] - prompt_length < max_new_bytes:
         budget = max_new_bytes - (tokens.shape[1] - prompt_length)
@@ -417,17 +450,17 @@ def _generate_pinned(
                 stats=stats,
                 draft_cache=draft_cache,
             )
-            tokens, latents, patch_ids, next_id = _verify(model, tokens, candidate, patching, stats)
-            draft_cache = _DraftCache()  # verify rebuilt latents; caches are stale
+            draft_cache = _DraftCache()
+            tokens, latents, patch_ids, next_id = _verify(model, tokens, candidate, patching, stats, draft_cache)
 
         tokens, finished = _trim_at_eos(tokens, prompt_length, eos_id)
         if finished:
             break
 
         if speculation_window == 0 and tokens.shape[1] - prompt_length < max_new_bytes:
-            latents, patch_ids = _run_global(model, tokens, patching, stats)
-            next_id = int(patch_ids[0, -1].item()) + int(opened)
             draft_cache = _DraftCache()
+            latents, patch_ids = _run_global(model, tokens, patching, stats, draft_cache)
+            next_id = int(patch_ids[0, -1].item()) + int(opened)
 
     tokens = tokens[:, : prompt_length + max_new_bytes]
     stats.committed = tokens.shape[1] - prompt_length
