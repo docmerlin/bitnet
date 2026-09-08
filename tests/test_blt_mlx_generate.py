@@ -166,8 +166,12 @@ def test_uniform_patcher_override_changes_the_pace():
     config = _config()
     _, mlx_model = _pair(config)
     prompt = mx.array(_prompt())
-    _, fine = generate(mlx_model, prompt, max_new_bytes=16, patcher=UniformPatcher(2))
-    _, coarse = generate(mlx_model, prompt, max_new_bytes=16, patcher=UniformPatcher(8))
+    _, fine = generate(
+        mlx_model, prompt, max_new_bytes=16, patcher=UniformPatcher(2), speculation_window=0
+    )
+    _, coarse = generate(
+        mlx_model, prompt, max_new_bytes=16, patcher=UniformPatcher(8), speculation_window=0
+    )
     assert coarse.global_model < fine.global_model
 
 

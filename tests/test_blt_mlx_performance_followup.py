@@ -113,9 +113,11 @@ def test_bfloat16_model_and_windowed_speculation():
     model.set_dtype(mx.bfloat16)
     tokens = mx.array([[4, 5, 6, 7, 8, 9, 10, 11]])
     assert model(tokens, unpadded=True).logits.dtype == mx.bfloat16
-    baseline, _ = generate(model, tokens, max_new_bytes=12, eos_id=-1)
+    baseline, _ = generate(model, tokens, max_new_bytes=12, speculation_window=0, eos_id=-1)
     speculative, _ = generate(model, tokens, max_new_bytes=12, speculation_window=4, eos_id=-1)
+    default, _ = generate(model, tokens, max_new_bytes=12, eos_id=-1)
     assert np.array_equal(np.asarray(baseline), np.asarray(speculative))
+    assert np.array_equal(np.asarray(default), np.asarray(speculative))
 
 
 def test_low_precision_loss_uses_float32_reductions():

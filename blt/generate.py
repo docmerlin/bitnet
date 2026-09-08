@@ -1,6 +1,6 @@
 """Greedy byte-level generation for the ternary BLT student.
 
-Two strategies, selected by ``speculation_window``:
+Two strategies, selected by ``speculation_window`` (default ``4``, BLT-S):
 
 ``0``
     Standard BLT autoregressive decoding. The local decoder emits bytes against
@@ -15,7 +15,7 @@ Two strategies, selected by ``speculation_window``:
     mismatch, replacing that byte with the model's own prediction.
 
 Under greedy decoding both produce byte-identical output -- ``speculation_window``
-is purely a speed knob. It buys that speed by trading global-model forward passes
+is purely a speed knob. Pass ``0`` to restore the AR baseline. It buys that speed by trading global-model forward passes
 for local-decoder ones, so it only pays off when the patcher is fine-grained
 enough that the global model would otherwise run every couple of bytes. Check
 ``GenerationStats`` rather than assuming; past roughly ``1.14 * (k + 1)`` bytes
@@ -400,7 +400,7 @@ def generate(
     *,
     max_new_bytes: int,
     patcher: object | None = None,
-    speculation_window: int = 0,
+    speculation_window: int = 4,
     boundary_threshold: float | None = None,
     eos_id: int | None = None,
 ) -> tuple[torch.Tensor, GenerationStats]:

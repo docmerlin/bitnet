@@ -4,7 +4,8 @@ Port of :mod:`blt.generate`, including BLT-S self-speculation (Kallini et al.,
 *Fast Byte Latent Transformer*, arXiv:2605.08044, Algorithm 2). Same two
 strategies, same contract: under greedy decoding every ``speculation_window``
 produces byte-identical output, so the window is purely a speed knob that trades
-global-model passes for local-decoder ones.
+global-model passes for local-decoder ones. Default ``speculation_window=4``
+(BLT-S); pass ``0`` for the AR baseline.
 
 Every correctness trap the torch version hit is carried over rather than
 rediscovered:
@@ -347,7 +348,7 @@ def generate(
     *,
     max_new_bytes: int,
     patcher: object | None = None,
-    speculation_window: int = 0,
+    speculation_window: int = 4,
     boundary_threshold: float | None = None,
     eos_id: int | None = None,
 ) -> tuple[mx.array, GenerationStats]:
