@@ -1045,7 +1045,16 @@ def test_mlx_checkpoint_restores_parameters_optimizer_and_state(tmp_path) -> Non
         load_checkpoint(checkpoint, restored, restored_optimizer)
 
 
-def test_ternary_fused_linear_m1_matches_dense_effective() -> None:
+@pytest.mark.parametrize(
+    "in_dim,out_dim,dtype,tol",
+    [
+        (128, 96, mx.float32, 1e-3),
+        (4096, 96, mx.float32, 1e-3),
+        (8192, 37, mx.float32, 1e-3),
+        (1024, 64, mx.bfloat16, 5e-2),
+    ],
+)
+def test_ternary_fused_linear_m1_matches_dense_effective(in_dim: int, out_dim: int, dtype, tol: float) -> None:
     from mlx_ternary_kernel import (
         pack_ternary_weight,
         ternary_effective_weight,
@@ -1053,20 +1062,81 @@ def test_ternary_fused_linear_m1_matches_dense_effective() -> None:
     )
 
     mx.random.seed(0)
-    weight = mx.random.normal((96, 128)).astype(mx.float32)
-    x = mx.random.normal((1, 1, 128)).astype(mx.float32)
+    weight = mx.random.normal((out_dim, in_dim)).astype(mx.float32)
+    x = mx.random.normal((1, 1, in_dim)).astype(dtype)
     packed, scales, group_size = pack_ternary_weight(weight)
-    expected = x @ ternary_effective_weight(weight).T
+    expected = x.astype(mx.float32) @ ternary_effective_weight(weight).T
     actual = ternary_fused_linear_m1(
         x,
         packed,
         scales,
-        in_dim=128,
-        out_dim=96,
+        in_dim=in_dim,
+        out_dim=out_dim,
         group_size=group_size,
     )
     mx.eval(expected, actual)
-    assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-4).item()
+    assert actual.dtype == dtype
+    assert mx.allclose(actual.astype(mx.float32), expected, rtol=tol, atol=tol).item()
+
+
+@pytest.mark.parametrize("hadamard", [False, True])
+@pytest.mark.parametrize("in_dim,out_dim,dtype", [(32, 1024, mx.bfloat16), (1024, 3072, mx.bfloat16), (2048, 1024, mx.float32)])
+def test_ternary_fused_linear_m1_prepare_matches_hbitlinear_prep(in_dim: int, out_dim: int, dtype, hadamard: bool) -> None:
+    from mlx_ternary_kernel import pack_ternary_weight, ternary_effective_weight, ternary_fused_linear_m1
+
+    mx.random.seed(2)
+    weight = mx.random.normal((out_dim, in_dim)).astype(mx.float32)
+    # Wide dynamic range exercises fp8 saturation and subnormals.
+    x = (mx.random.normal((1, 1, in_dim)) * mx.exp(mx.random.uniform(-8, 6, (1, 1, in_dim)))).astype(dtype)
+    packed, scales, group_size = pack_ternary_weight(weight)
+    # fp32 Hadamard as ground truth: mx.hadamard_transform on bf16 rounds its
+    # intermediates, moving ~7% of elements by one fp8 step; the kernel does not.
+    prepared = mx.hadamard_transform(x.astype(mx.float32)).astype(dtype) if hadamard else x
+    prepared = mx.from_fp8(mx.to_fp8(prepared), dtype)
+    expected = prepared.astype(mx.float32) @ ternary_effective_weight(weight).T
+    actual = ternary_fused_linear_m1(
+        x, packed, scales, in_dim=in_dim, out_dim=out_dim, group_size=group_size, prepare=True, hadamard=hadamard
+    )
+    mx.eval(expected, actual)
+    rel = (mx.abs(actual.astype(mx.float32) - expected).max() / mx.abs(expected).max()).item()
+    # bf16 bound is the output rounding (2^-8); fp32 is exact up to summation order.
+    assert rel < (5e-3 if dtype == mx.bfloat16 else 1e-5), rel
+
+
+@pytest.mark.parametrize("epilogue", [None, "silu", "swiglu"])
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("dtype,tol", [(mx.float32, 1e-5), (mx.bfloat16, 5e-3)])
+def test_ternary_fused_linear_m1_norm_and_epilogues(norm: bool, epilogue, dtype, tol: float) -> None:
+    from mlx_ternary_kernel import pack_ternary_weight, ternary_effective_weight, ternary_fused_linear_m1
+
+    mx.random.seed(3)
+    in_dim, out_dim = 1024, 4096  # the 1B up projection
+    weight = mx.random.normal((out_dim, in_dim))
+    norm_weight = mx.random.uniform(0.5, 1.5, (in_dim,)).astype(dtype)
+    x = (mx.random.normal((1, 1, in_dim)) * 3).astype(dtype)
+    packed, scales, group_size = pack_ternary_weight(weight)
+
+    # fp32 reference with the same rounding points as the kernel (MLX's bf16 rms_norm
+    # rounds an intermediate and lands ~1.2e-2 off this; the kernel ~2.6e-3).
+    h = mx.fast.rms_norm(x.astype(mx.float32), norm_weight.astype(mx.float32), 1e-5).astype(dtype) if norm else x
+    h = mx.hadamard_transform(h.astype(mx.float32)).astype(dtype)
+    h = mx.from_fp8(mx.to_fp8(h), dtype).astype(mx.float32)
+    y = h @ ternary_effective_weight(weight).T
+    if epilogue == "silu":
+        y = nn.silu(y)
+    elif epilogue == "swiglu":
+        gate, value = mx.split(y, 2, axis=-1)
+        y = nn.silu(gate) * value
+
+    actual = ternary_fused_linear_m1(
+        x, packed, scales, in_dim=in_dim, out_dim=out_dim, group_size=group_size,
+        prepare=True, hadamard=True, norm_weight=norm_weight if norm else None, norm_eps=1e-5,
+        epilogue=epilogue,
+    )
+    mx.eval(y, actual)
+    assert actual.shape == y.shape and actual.dtype == dtype
+    rel = (mx.abs(actual.astype(mx.float32) - y).max() / mx.abs(y).max()).item()
+    assert rel < tol, rel
 
 
 def test_ternary_fused_ffn_m1_matches_dense_reference() -> None:
