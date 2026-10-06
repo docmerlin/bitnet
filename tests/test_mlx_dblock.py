@@ -267,18 +267,47 @@ def test_dblock_generate_is_autoregressive_one_block_per_eval(monkeypatch) -> No
     model = MLXBitNet(_dblock_config(dblock_blocks=4))
     mx.eval(model.parameters())
     calls = []
-    real = model.dblock_forward_from_z
+    real = model.dblock_decode
 
     def spy(z, sigma, tokens, *args, **kwargs):
         calls.append((tokens.shape[1], z.shape[1], kwargs["block_id"], float(sigma.item())))
         return real(z, sigma, tokens, *args, **kwargs)
 
-    monkeypatch.setattr(model, "dblock_forward_from_z", spy)
+    monkeypatch.setattr(model, "dblock_decode", spy)
     dblock_greedy_generate(model, [1, 2], max_new_tokens=2)
-    assert [c[2] for c in calls] == [0, 1, 2, 3, 0, 1, 2, 3]
-    assert [c[0] for c in calls] == [2] * 4 + [3] * 4
-    assert all(c[0] == c[1] for c in calls)
-    assert calls[0][3] == pytest.approx(80.0) and calls[3][3] == pytest.approx(0.002)
+    # Commit prompt position 0 per block, then per token: B cached queries
+    # (one new position each), then commit that token's position per block.
+    queries = [c for c in calls if c[0] == 1 and c[1] == 1]
+    assert [c[2] for c in calls[:4]] == [0, 1, 2, 3]
+    assert [c[2] for c in calls] == [0, 1, 2, 3] * 5
+    assert all(c[0] == c[1] == 1 for c in calls)
+    assert len(queries) == len(calls)
+    assert calls[4][3] == pytest.approx(80.0) and calls[7][3] == pytest.approx(0.002)
+
+
+@pytest.mark.parametrize("attn_res_mode", ["kimi", "sandwich"])
+def test_dblock_cached_decode_matches_full_prefix(attn_res_mode: str) -> None:
+    """Cached per-block decode == full-prefix denoiser forward with the same z."""
+    mx.random.seed(7)
+    model = MLXBitNet(_dblock_config(dblock_blocks=2, attn_res_mode=attn_res_mode))
+    mx.eval(model.parameters())
+    model.set_inference_block_width(4)  # train chunks = decode windows, as generate pins
+    tokens = mx.random.randint(0, 32, (1, 11))
+    length = tokens.shape[1]
+    for block_id, value in enumerate((3.0, 0.05)):
+        sigma = mx.array([value])
+        clean = model.dblock_clean_embeddings(tokens[:, 1:])
+        z = mx.concatenate([clean + value * mx.random.normal(clean.shape), mx.random.normal((1, 1, 16))], axis=1)
+        expected = model.dblock_forward_from_z(z, sigma, tokens, block_id=block_id)
+        cache = model.new_dblock_cache(block_id)
+        # prefill 3, extend 2, then one at a time: crosses the width-4 chunk edges.
+        pieces = [(0, 3), (3, 5)] + [(i, i + 1) for i in range(5, length - 1)]
+        for lo, hi in pieces:
+            got = model.dblock_decode(z[:, lo:hi], sigma, tokens[:, lo:hi], cache, block_id=block_id)
+            assert mx.allclose(got, expected[:, lo:hi], atol=1e-4).item(), (block_id, lo)
+        for _ in range(2):  # queries on clones leave the cache alone
+            got = model.dblock_decode(z[:, -1:], sigma, tokens[:, -1:], cache.clone(), block_id=block_id)
+            assert mx.allclose(got, expected[:, -1:], atol=1e-4).item(), block_id
 
 
 @pytest.mark.parametrize("infer", ["euler", "loops"])

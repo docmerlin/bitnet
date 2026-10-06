@@ -2293,6 +2293,7 @@ class MLXHybridBlock(nn.Module):
         cache: "MLXBlockInferenceCache",
         update_memory: bool,
         mode: str,
+        cond: mx.array | None = None,
     ) -> MLXAttnResStream:
         """Apply one block through AttnRes stream for prefill/extend/incremental."""
 
@@ -2320,6 +2321,7 @@ class MLXHybridBlock(nn.Module):
             False,
             attn_runner=None if self.skip_attn else attn_runner,
             engram_runner=engram_runner if self.engram is not None else None,
+            cond=cond,
         )
 
     def incremental(
@@ -2329,17 +2331,18 @@ class MLXHybridBlock(nn.Module):
         token_history: mx.array,
         cache: "MLXBlockInferenceCache",
         update_memory: bool,
+        cond: mx.array | None = None,
     ) -> mx.array:
         if self.attn_res_mode == "kimi":
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.incremental(x, input_ids, token_history, cache.engram)
         if not self.skip_attn:
-            attention = self.attn.incremental(self.attn_norm(x), cache.attention, update_memory)
+            attention = self.attn.incremental(self._attn_norm(x, cond), cache.attention, update_memory)
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x))
+        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x, cond))
 
     def extend(
         self,
@@ -2348,17 +2351,18 @@ class MLXHybridBlock(nn.Module):
         token_history: mx.array,
         cache: "MLXBlockInferenceCache",
         update_memory: bool,
+        cond: mx.array | None = None,
     ) -> mx.array:
         if self.attn_res_mode == "kimi":
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.extend(x, input_ids, token_history, cache.engram)
         if not self.skip_attn:
-            attention = self.attn.extend(self.attn_norm(x), cache.attention, update_memory)
+            attention = self.attn.extend(self._attn_norm(x, cond), cache.attention, update_memory)
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x))
+        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x, cond))
 
     def prefill(
         self,
@@ -2366,17 +2370,18 @@ class MLXHybridBlock(nn.Module):
         input_ids: mx.array,
         cache: "MLXBlockInferenceCache",
         update_memory: bool,
+        cond: mx.array | None = None,
     ) -> mx.array:
         if self.attn_res_mode == "kimi":
             raise RuntimeError("use MLXBitNet stream decode for kimi AttnRes")
         if self.engram is not None:
             x = x + self.engram.prefill(x, input_ids, cache.engram)
         if not self.skip_attn:
-            attention = self.attn.prefill(self.attn_norm(x), cache.attention, update_memory)
+            attention = self.attn.prefill(self._attn_norm(x, cond), cache.attention, update_memory)
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x))
+        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x, cond))
 
     def __call__(
         self,
@@ -3069,6 +3074,7 @@ class MLXBitNet(nn.Module):
         caches: list,
         update_flags: list[bool],
         mode: str,
+        cond: mx.array | None = None,
     ) -> mx.array:
         if not blocks:
             return seed
@@ -3076,15 +3082,15 @@ class MLXBitNet(nn.Module):
             x = seed
             for block, cache, upd in zip(blocks, caches, update_flags):
                 if mode == "incremental":
-                    x = block.incremental(x, tokens, token_history, cache, upd)
+                    x = block.incremental(x, tokens, token_history, cache, upd, cond)
                 elif mode == "extend":
-                    x = block.extend(x, tokens, token_history, cache, upd)
+                    x = block.extend(x, tokens, token_history, cache, upd, cond)
                 else:
-                    x = block.prefill(x, tokens, cache, upd)
+                    x = block.prefill(x, tokens, cache, upd, cond)
             return x
         stream = self._new_attn_stream(seed)
         for block, cache, upd in zip(blocks, caches, update_flags):
-            stream = block.step_kimi_stream(stream, tokens, token_history, cache, upd, mode)
+            stream = block.step_kimi_stream(stream, tokens, token_history, cache, upd, mode, cond)
         return stream.hidden()
 
     def hidden_states(
@@ -3212,6 +3218,58 @@ class MLXBitNet(nn.Module):
     def dblock_clean_embeddings(self, tokens: mx.array) -> mx.array:
         return _safe_normalize(self.embedding(tokens), axis=-1)
 
+    def _dblock_inputs(self, z: mx.array, sigma: mx.array, tokens: mx.array) -> tuple[mx.array, mx.array]:
+        if self.config.train_mode != "dblock" or self.sigma_embed is None:
+            raise RuntimeError("dblock decode requires train_mode='dblock'")
+        scale = self._broadcast_sigma(self.dblock_c_in(sigma), z)
+        noisy = self.dblock_noise_in(scale.astype(z.dtype) * z)
+        inputs = self.subln(self.embedding(tokens)) + noisy.astype(z.dtype)
+        return inputs, self.sigma_embed(sigma).astype(z.dtype)
+
+    def new_dblock_cache(self, block_id: int, batch_size: int = 1) -> MLXInferenceCache:
+        """Decode cache for one B>1 block slice (B=1 runs Hyperloop, not a flat slice)."""
+        if self.config.dblock_blocks == 1:
+            raise ValueError("cached dblock decode requires dblock_blocks > 1")
+        start, end = self.config.dblock_layer_ranges()[block_id]
+        return MLXInferenceCache(
+            layers=[block.new_inference_cache(batch_size) for block in self.blocks[start:end]],
+            token_history=mx.zeros((batch_size, 0), dtype=mx.int32),
+            num_loops=1,
+            weight_cache={},
+        )
+
+    def dblock_decode(
+        self,
+        z: mx.array,
+        sigma: mx.array,
+        tokens: mx.array,
+        cache: MLXInferenceCache,
+        *,
+        block_id: int,
+    ) -> mx.array:
+        """``dblock_forward_from_z`` for new positions only, advancing ``cache``.
+
+        Equals the full-prefix forward over every position the cache has seen
+        (same z per position) for this block slice; ``cache`` from ``new_dblock_cache``.
+        """
+        start, end = self.config.dblock_layer_ranges()[block_id]
+        inputs, cond = self._dblock_inputs(z, sigma, tokens)
+        length = tokens.shape[1]
+        mode = "prefill" if cache.position == 0 else "incremental" if length == 1 else "extend"
+        with self._inference_weight_context(cache):
+            x = self._run_decode_stack(
+                self.blocks[start:end],
+                inputs,
+                tokens,
+                cache.token_history,
+                cache.layers,
+                [True] * (end - start),
+                mode,
+                cond,
+            )
+        cache.position += length
+        return self.norm(x)
+
     def dblock_forward_from_z(
         self,
         z: mx.array,
@@ -3233,12 +3291,7 @@ class MLXBitNet(nn.Module):
         concat mask (PaTH/Infini have no such mask); past positions also carry
         their own noisy targets, so sampling re-noises the past at the same σ.
         """
-        if self.config.train_mode != "dblock" or self.sigma_embed is None:
-            raise RuntimeError("dblock_forward_from_z requires train_mode='dblock'")
-        scale = self._broadcast_sigma(self.dblock_c_in(sigma), z)
-        noisy = self.dblock_noise_in(scale.astype(z.dtype) * z)
-        inputs = self.subln(self.embedding(tokens)) + noisy.astype(z.dtype)
-        cond = self.sigma_embed(sigma).astype(z.dtype)
+        inputs, cond = self._dblock_inputs(z, sigma, tokens)
         loops = 1 if num_loops is None else int(num_loops)
         if loops < 1:
             raise ValueError("num_loops must be positive")

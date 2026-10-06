@@ -96,7 +96,12 @@ def dblock_greedy_generate(
     σ_min, conditioned on the clean prefix. Past positions are re-noised at the
     current σ, exactly as in training. ``dblock_infer='loops'`` is one σ_min
     eval that unrolls Huginn R instead.
-    ponytail: full-prefix forward per eval, no KV cache; add one if decode speed matters.
+
+    B>1 keeps one PaTH cache per eval: a past position's noise is drawn once,
+    when its target is committed, rather than fresh per token (same marginal
+    as training), so each eval only runs the new positions.
+    ponytail: B=1 still re-runs the full prefix per eval (K Hyperloop caches would
+    cost K× AR cache memory); cache it if B=1 decode speed matters.
     ``valid_vocab_size`` restricts selection to defined IDs in a padded vocabulary.
     """
     if model.config.train_mode != "dblock":
@@ -117,6 +122,8 @@ def dblock_greedy_generate(
     else:
         sigmas = schedule.sample_sigmas(model.config.dblock_sample_steps(euler_steps))
     hidden_size = model.config.hidden_size
+    if model.config.dblock_blocks > 1:
+        return _dblock_cached_generate(model, prompt, max_new_tokens, eos_token_id, sigmas, valid_vocab_size)
     out = list(prompt)
     for _ in range(max_new_tokens):
         context = mx.array([out], dtype=mx.int32)
@@ -143,6 +150,46 @@ def dblock_greedy_generate(
         out.append(token)
         if eos_token_id is not None and token == eos_token_id:
             break
+    return out
+
+
+def _dblock_cached_generate(
+    model: MLXBitNet,
+    prompt: list[int],
+    max_new_tokens: int,
+    eos_token_id: int | None,
+    sigmas: tuple[float, ...],
+    valid_vocab_size: int | None,
+) -> list[int]:
+    schedule = model.config.noise_schedule()
+    evals = [(sigma, mx.array([sigma], dtype=mx.float32), schedule.block_for_sigma(sigma)) for sigma in sigmas]
+    caches = [model.new_dblock_cache(block) for _, _, block in evals]
+
+    def commit(context: list[int], targets: list[int]) -> None:
+        # Positions with known next tokens: clean token i + noisy target i + 1.
+        tokens = mx.array([context], dtype=mx.int32)
+        clean = model.dblock_clean_embeddings(mx.array([targets], dtype=mx.int32)).astype(mx.float32)
+        for (value, sigma, block), cache in zip(evals, caches):
+            noisy = clean + value * mx.random.normal(clean.shape)
+            model.dblock_decode(noisy, sigma, tokens, cache, block_id=block)
+
+    out = list(prompt)
+    if len(out) > 1:
+        commit(out[:-1], out[1:])
+    hidden_size = model.config.hidden_size
+    for _ in range(max_new_tokens):
+        last = mx.array([out[-1:]], dtype=mx.int32)
+        z = sigmas[0] * mx.random.normal((1, 1, hidden_size))
+        for index, ((value, sigma, block), cache) in enumerate(zip(evals, caches)):
+            # Query on a clone: the query position is committed only once its token is known.
+            logits = model.logits_from(model.dblock_decode(z, sigma, last, cache.clone(), block_id=block))
+            if index + 1 < len(evals):
+                z = z + (sigmas[index + 1] - value) / value * (z - model.dblock_denoised(logits))
+        token = int(_generation_argmax(logits, valid_vocab_size)[0, -1].item())
+        out.append(token)
+        if eos_token_id is not None and token == eos_token_id:
+            break
+        commit(out[-2:-1], [token])
     return out
 
 

@@ -240,7 +240,10 @@ python3 mlx_generate.py runs/bitnet/checkpoints/final.safetensors \
 A `--train-mode dblock` checkpoint decodes greedily token by token. Each new token starts
 at σ_max noise and runs equi-probability σ evals down to σ_min (B>1: one per block, paper
 T=B; B=1: `--dblock-euler-steps`, paper 50, independent of `--num-loops`), conditioned on
-the clean prefix. No KV cache yet: each eval re-runs the prefix. `--dblock-infer loops`
+the clean prefix. B>1 keeps one PaTH cache per block: a past position's noise is drawn
+once, when its token is committed, so each token runs B one-position queries plus B
+one-position commits (1B, window 64: 47 ms/token flat vs 162/353 ms at a 64/256 prompt
+re-running the prefix). B=1 still re-runs the prefix per eval. `--dblock-infer loops`
 is a B=1 debug unroll of Huginn R.
 
 ### MLX quantization

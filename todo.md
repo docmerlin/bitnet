@@ -63,7 +63,7 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
   fixed-size Infini memory carries compressed information beyond local windows. BLT keeps RoPE.
 - **DiffusionBlocks** (MLX default, `--train-mode dblock`, B=4): block-wise next-token
   denoiser with clean-context conditioning, AR decode. See README / `training.md`.
-  Open: KV cache for dblock decode; quality A/B vs `--train-mode ar` at ≥500M.
+  B>1 decode is cached per block; B=1 still re-runs the prefix. Open: quality A/B vs `--train-mode ar` at ≥500M.
 
 ## Next actions
 
