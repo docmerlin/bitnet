@@ -304,3 +304,26 @@ def test_cross_attention_reuses_projected_kv():
     live_g = gather(query, kv, patch_ids)
     cached_g = gather(query, kv, patch_ids, values=values)
     assert np.allclose(np.asarray(live_g), np.asarray(cached_g), atol=1e-5)
+
+
+@pytest.mark.parametrize("length,span", [(8, 4), (10, 4), (15, 5)])
+def test_cross_attention_uniform_spans_matches_dense(length, span):
+    config = _config()
+    attn = MLXTernaryCrossAttention(64, 64, hidden_dim=64, num_heads=4, config=config)
+    rng = np.random.default_rng(length + span)
+    query = mx.array(rng.standard_normal((2, (length + span - 1) // span, 64)).astype(np.float32))
+    kv = mx.array(rng.standard_normal((2, length, 64)).astype(np.float32))
+    patches = query.shape[1]
+    lengths = np.full((2, patches), span, dtype=np.int32)
+    lengths[:, -1] = length - span * (patches - 1)
+    lengths = mx.array(lengths)
+    ids = mx.sum(
+        mx.arange(length, dtype=mx.int32).reshape(1, 1, length)
+        >= mx.cumsum(lengths, axis=-1)[..., None],
+        axis=1,
+    )
+    dense_mask = mx.arange(patches, dtype=mx.int32).reshape(1, patches, 1) == ids[:, None, :]
+    dense = attn(query, kv, mask=dense_mask)
+    spans = attn(query, kv, uniform_span_size=span, span_lengths=lengths)
+    mx.eval(dense, spans)
+    assert np.allclose(np.asarray(dense), np.asarray(spans), atol=3e-5, rtol=3e-5)

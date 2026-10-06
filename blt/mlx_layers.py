@@ -204,10 +204,9 @@ class MLXTernarySelfAttention(nn.Module):
     def _chunkable(self, seq_len: int, attention_mask: mx.array | None) -> bool:
         """Whether the windowed path can run block-by-block instead of dense.
 
-        Needs a causal window that tiles the sequence and leaves at least two
-        blocks -- below that the dense mask is already the smaller matrix. A
-        caller mask is folded per key, which the shared band mask cannot express,
-        so those fall back.
+        Needs a causal window shorter than the sequence -- below that the
+        dense mask is already the smaller matrix. A caller mask is folded per
+        key, which the shared band mask cannot express, so those fall back.
         """
         window = self.local_window
         return (
@@ -215,7 +214,6 @@ class MLXTernarySelfAttention(nn.Module):
             and attention_mask is None
             and window is not None
             and 0 < window < seq_len
-            and seq_len % window == 0
         )
 
     def _windowed_attend(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
@@ -235,7 +233,15 @@ class MLXTernarySelfAttention(nn.Module):
         """
         window = self.local_window
         batch, heads, seq_len, head_dim = q.shape
-        blocks = seq_len // window
+        # A generated prefix almost never tiles the window. Pad only the last
+        # block: causal masking hides these future keys from every real query,
+        # and the padded query outputs are discarded before the projection.
+        # This keeps attention O(sequence * window) between window boundaries.
+        padding = (-seq_len) % window
+        if padding:
+            pads = [(0, 0), (0, 0), (0, padding), (0, 0)]
+            q, k, v = (mx.pad(t, pads) for t in (q, k, v))
+        blocks = (seq_len + padding) // window
         scale = 1.0 / math.sqrt(head_dim)
 
         def blocked(t):
@@ -267,7 +273,7 @@ class MLXTernarySelfAttention(nn.Module):
         )
         tail_context = tail_context.reshape(batch, blocks - 1, heads, window, head_dim)
         context = mx.concatenate([head_context[:, :, None], tail_context.transpose(0, 2, 1, 3, 4)], axis=2)
-        return context.reshape(batch, heads, seq_len, head_dim)
+        return context.reshape(batch, heads, seq_len + padding, head_dim)[:, :, :seq_len]
 
     def _project_qkv(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         batch_size, seq_len, _ = x.shape
@@ -475,6 +481,60 @@ class MLXTernaryCrossAttention(nn.Module):
             self._as_heads(self.v_proj.forward_prepared(prepared)),
         )
 
+    def forward_uniform_spans(
+        self,
+        query: mx.array,
+        key_value: mx.array,
+        patch_lengths: mx.array,
+        span_size: int,
+    ) -> mx.array:
+        """Cross-attend each patch query to its contiguous byte span.
+
+        The generic path below forms a ``[batch, patches, bytes]`` mask and
+        invokes attention over the whole byte sequence. Uniform patches let us
+        reshape the sequence into ``[batch, patches, span, hidden]`` instead;
+        attention then computes exactly the allowed patch/byte pairs. The final
+        span may be shorter, and per-row suffix padding is masked by
+        ``patch_lengths``.
+
+        This preserves the BLT operation (learned within-patch pooling) while
+        avoiding dense masked score computation. Ragged entropy patches retain
+        the generic path because their spans cannot be represented by one view.
+        """
+        if span_size <= 0:
+            raise ValueError("span_size must be positive")
+        batch_size, query_len, _ = query.shape
+        seq_len = key_value.shape[1]
+        expected_patches = (seq_len + span_size - 1) // span_size
+        if query_len != expected_patches or patch_lengths.shape != (batch_size, query_len):
+            raise ValueError("uniform span layout does not match query and key shapes")
+
+        padded_len = expected_patches * span_size
+        padding = padded_len - seq_len
+        if padding:
+            key_value = mx.pad(key_value, [(0, 0), (0, padding), (0, 0)])
+
+        q = self._as_heads(self.q_proj(self.query_norm(query)))
+        k, v = self.project_kv(key_value)
+        # [B, H, P*W, D] -> [B*P, H, W, D].
+        k = k.reshape(batch_size, self.num_heads, query_len, span_size, self.head_dim)
+        v = v.reshape(batch_size, self.num_heads, query_len, span_size, self.head_dim)
+        k = k.transpose(0, 2, 1, 3, 4).reshape(batch_size * query_len, self.num_heads, span_size, self.head_dim)
+        v = v.transpose(0, 2, 1, 3, 4).reshape(batch_size * query_len, self.num_heads, span_size, self.head_dim)
+        q = q.transpose(0, 2, 1, 3).reshape(
+            batch_size * query_len, self.num_heads, 1, self.head_dim
+        )
+
+        positions = mx.arange(span_size, dtype=patch_lengths.dtype).reshape(1, 1, 1, span_size)
+        valid = positions < patch_lengths[..., None, None]
+        floor = mx.array(_MASK_FLOOR, dtype=q.dtype)
+        bias = mx.where(valid, mx.array(0.0, dtype=q.dtype), floor)
+        context = _attend(q, k, v, bias.reshape(batch_size * query_len, 1, 1, span_size), None)
+        context = context.reshape(batch_size, query_len, self.num_heads, self.head_dim)
+        context = context.reshape(batch_size, query_len, self.hidden_dim)
+        residual = self.residual_proj(query) if self.residual_proj is not None else query
+        return residual + self.out_proj(context)
+
     def __call__(
         self,
         query: mx.array,
@@ -482,7 +542,13 @@ class MLXTernaryCrossAttention(nn.Module):
         *,
         mask: mx.array | None = None,
         projected_kv: tuple[mx.array, mx.array] | None = None,
+        uniform_span_size: int | None = None,
+        span_lengths: mx.array | None = None,
     ) -> mx.array:
+        if uniform_span_size is not None:
+            if mask is not None or projected_kv is not None or span_lengths is None:
+                raise ValueError("uniform span attention requires span lengths and no dense mask/cache")
+            return self.forward_uniform_spans(query, key_value, span_lengths, uniform_span_size)
         batch_size, query_len, _ = query.shape
         k, v = projected_kv if projected_kv is not None else self.project_kv(key_value)
         q = self._as_heads(self.q_proj(self.query_norm(query)))

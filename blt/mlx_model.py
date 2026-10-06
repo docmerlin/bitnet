@@ -160,7 +160,15 @@ class MLXLocalEncoder(nn.Module):
         patch_mask = patch_membership_mask(patch_ids, patch_states.shape[1], patches_as_queries=True)
         if byte_mask is not None:
             patch_mask = patch_mask & byte_mask[:, None, :]
-        patch_states = self.patch_cross_attn(patch_states, hidden, mask=patch_mask)
+        if uniform_patch_size is not None and (byte_mask is None or unpadded):
+            patch_states = self.patch_cross_attn(
+                patch_states,
+                hidden,
+                uniform_span_size=uniform_patch_size,
+                span_lengths=patch_lengths,
+            )
+        else:
+            patch_states = self.patch_cross_attn(patch_states, hidden, mask=patch_mask)
         return hidden, patch_states, patch_ids
 
 

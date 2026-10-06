@@ -30,7 +30,10 @@ def _dense(layer, x):
         layer._chunkable = chunkable
 
 
-@pytest.mark.parametrize("seq,window,heads,dim", [(1024, 256, 4, 256), (512, 128, 4, 256), (256, 64, 8, 64)])
+@pytest.mark.parametrize("seq,window,heads,dim", [
+    (1024, 256, 4, 256), (512, 128, 4, 256), (256, 64, 8, 64),
+    (257, 256, 4, 256), (511, 128, 4, 256), (129, 48, 8, 64),
+])
 def test_chunked_matches_dense(seq, window, heads, dim) -> None:
     layer = _attention(dim, heads, window)
     x = mx.random.normal((3, seq, dim))
@@ -50,9 +53,9 @@ def test_first_block_cannot_see_the_zero_padded_previous_block() -> None:
     assert float(mx.max(mx.abs(chunked[:, :32] - dense[:, :32]))) < 2e-5
 
 
-def test_falls_back_when_the_window_does_not_tile_or_a_mask_is_given() -> None:
+def test_partial_window_dispatch_and_mask_fallback() -> None:
     layer = _attention(64, 4, 48)
-    assert not layer._chunkable(128, None)          # 128 % 48 != 0
+    assert layer._chunkable(128, None)
     full = _attention(64, 4, 128)
     assert not full._chunkable(128, None)           # window >= seq, dense is smaller
     windowed = _attention(64, 4, 32)
@@ -65,7 +68,8 @@ def test_band_mask_admits_exactly_window_keys_per_query() -> None:
     assert (mx.sum((bias == 0.0).astype(mx.int32), axis=1) == 8).all().item()
 
 
-def test_whole_model_unpadded_dispatch_and_gradients(monkeypatch):
+@pytest.mark.parametrize("length", [32, 35])
+def test_whole_model_unpadded_dispatch_and_gradients(monkeypatch, length):
     import mlx.nn as nn
     from mlx.utils import tree_flatten
     from blt.mlx_model import MLXTernaryBLTModel
@@ -78,7 +82,7 @@ def test_whole_model_unpadded_dispatch_and_gradients(monkeypatch):
     )
     model = MLXTernaryBLTModel(config)
     model.validate_inputs = False
-    tokens = mx.random.randint(config.offset, config.offset + 256, (2, 32))
+    tokens = mx.random.randint(config.offset, config.offset + 256, (2, length))
     mask = mx.ones(tokens.shape, dtype=mx.bool_)
     calls = []
     original = MLXTernarySelfAttention._windowed_attend
@@ -91,7 +95,7 @@ def test_whole_model_unpadded_dispatch_and_gradients(monkeypatch):
     expected = model(tokens, attention_mask=mask).logits
     actual = model(tokens, attention_mask=mask, unpadded=True).logits
     mx.eval(expected, actual)
-    assert calls == [32, 32]  # Both local stacks, through the real model entrypoint.
+    assert calls == [length, length]  # Both local stacks, through the real model entrypoint.
     assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-5).item()
     def loss(m, trusted):
         return mx.mean(m(tokens, attention_mask=mask, unpadded=trusted).logits ** 2)
@@ -102,11 +106,30 @@ def test_whole_model_unpadded_dispatch_and_gradients(monkeypatch):
         assert mx.allclose(dense, chunk, atol=2e-5, rtol=2e-4).item(), name
     calls.clear()
     # Explicit suffix padding must stay dense.
-    padded = mx.arange(32)[None, :] < mx.array([[20], [32]])
+    padded = mx.arange(length)[None, :] < mx.array([[20], [length]])
     out = model(tokens, attention_mask=padded)
     mx.eval(out.logits)
     assert not calls
     assert mx.all(out.decoder_hidden[0, 20:] == 0).item()
+
+
+@pytest.mark.parametrize("dtype,tolerance", [(mx.float32, 2e-5), (mx.float16, 2e-3), (mx.bfloat16, 2e-2)])
+@pytest.mark.parametrize("length", [33, 63, 65])
+def test_partial_window_prefill_cache_and_input_gradients(dtype, tolerance, length):
+    layer = _attention(64, 4, 32)
+    layer.set_dtype(dtype)
+    x = mx.random.normal((2, length, 64)).astype(dtype)
+    actual, cache = layer.prefill(x)
+    expected = _dense(layer, x)
+    mx.eval(actual, expected, cache)
+    assert cache[0].shape[2] == cache[1].shape[2] == length
+    assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+    # Padding must not contribute to either real-query outputs or gradients.
+    loss = lambda output: mx.sum(output.astype(mx.float32) ** 2)
+    actual_grad = mx.grad(lambda value: loss(layer(value)))(x)
+    expected_grad = mx.grad(lambda value: loss(_dense(layer, value)))(x)
+    mx.eval(actual_grad, expected_grad)
+    assert mx.allclose(actual_grad, expected_grad, atol=tolerance, rtol=tolerance).item()
 
 
 @pytest.mark.parametrize("window", [None, 4])
