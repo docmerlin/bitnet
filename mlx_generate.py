@@ -88,68 +88,60 @@ def dblock_greedy_generate(
     euler_steps: int | None = None,
     valid_vocab_size: int | None = None,
 ) -> list[int]:
-    """Denoise the full window (same as train), then take suffix argmax.
+    """AR DiffusionBlocks decode (paper App. E.4): greedy, one token at a time.
 
-    Not token-by-token AR decode. Prompt positions are noised like every other
-    token; the returned prefix is still the caller's prompt.
-
-    B=1 Euler uses ``euler_steps`` or ``config.dblock_euler_steps`` (paper 50),
-    not ``num_loops``. ``dblock_infer='loops'`` still unrolls Huginn R.
+    Each new token starts as σ_max noise and is denoised by
+    ``dblock_sample_steps`` evaluations (B>1: one per block, paper T=B;
+    B=1: K evals of the Huginn stack) on equi-probability σ from σ_max to
+    σ_min, conditioned on the clean prefix. Past positions are re-noised at the
+    current σ, exactly as in training. ``dblock_infer='loops'`` is one σ_min
+    eval that unrolls Huginn R instead.
+    ponytail: full-prefix forward per eval, no KV cache; add one if decode speed matters.
     ``valid_vocab_size`` restricts selection to defined IDs in a padded vocabulary.
     """
     if model.config.train_mode != "dblock":
         raise ValueError("dblock_greedy_generate requires train_mode='dblock'")
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
-    infer_loops = int(getattr(model, "inference_num_loops", None) or model.config.num_loops)
-    if infer_loops < 1:
-        raise ValueError("inference_num_loops must be positive")
+    if not prompt:
+        raise ValueError("prompt must contain at least one token")
     schedule = model.config.noise_schedule()
-    prompt_len = len(prompt)
-    tokens = mx.array([list(prompt) + [0] * max_new_tokens], dtype=mx.int32)
-    clean = model.dblock_clean_embeddings(tokens)
-    noise = mx.random.normal(clean.shape).astype(clean.dtype)
-    sigma_max = mx.array(schedule.sigma_max, dtype=clean.dtype)
-    z = clean + sigma_max * noise
+    loops = None
     if model.config.dblock_infer == "loops":
         if model.config.dblock_blocks != 1:
             raise ValueError("dblock_infer='loops' requires dblock_blocks=1")
-        hidden = model.dblock_forward_from_z(
-            z,
-            mx.array(schedule.sigma_min),
-            tokens,
-            None,
-            block_id=0,
-            num_loops=infer_loops,
-        )
+        loops = int(getattr(model, "inference_num_loops", None) or model.config.num_loops)
+        if loops < 1:
+            raise ValueError("inference_num_loops must be positive")
+        sigmas = (schedule.sigma_min,)
     else:
-        steps = model.config.dblock_sample_steps(euler_steps)
-        sigmas = schedule.euler_sigmas(steps)
-        for index in range(steps):
-            block_id = 0 if model.config.dblock_blocks == 1 else index
-            z = model.dblock_euler_step(
-                z,
-                mx.array(sigmas[index]),
-                mx.array(sigmas[index + 1]),
-                tokens,
-                None,
-                block_id=block_id,
-            )
-            mx.eval(z)
-        hidden = model.dblock_forward_from_z(
-            z,
-            mx.array(sigmas[-1]),
-            tokens,
-            None,
-            block_id=0 if model.config.dblock_blocks == 1 else steps - 1,
-        )
-    predicted = _generation_argmax(model.logits_from(hidden), valid_vocab_size)
-    mx.eval(predicted)
-    suffix = predicted[0, prompt_len:].tolist()
+        sigmas = schedule.sample_sigmas(model.config.dblock_sample_steps(euler_steps))
+    hidden_size = model.config.hidden_size
     out = list(prompt)
-    for token in suffix:
-        out.append(int(token))
-        if eos_token_id is not None and int(token) == eos_token_id:
+    for _ in range(max_new_tokens):
+        context = mx.array([out], dtype=mx.int32)
+        # Position i carries the noisy embedding of token i + 1.
+        past = model.dblock_clean_embeddings(context[:, 1:]).astype(mx.float32)
+        z = sigmas[0] * mx.random.normal((1, 1, hidden_size))
+        for index, sigma in enumerate(sigmas):
+            noisy_past = past + sigma * mx.random.normal(past.shape)
+            hidden = model.dblock_forward_from_z(
+                mx.concatenate([noisy_past, z], axis=1),
+                mx.array([sigma], dtype=mx.float32),
+                context,
+                None,
+                block_id=schedule.block_for_sigma(sigma),
+                num_loops=loops,
+            )
+            logits = model.logits_from(hidden[:, -1:])
+            if index + 1 < len(sigmas):
+                # VE Euler (paper Eq. 5): z ← z + (σ' − σ)/σ · (z − D).
+                denoised = model.dblock_denoised(logits)
+                z = z + (sigmas[index + 1] - sigma) / sigma * (z - denoised)
+            mx.eval(z, logits)
+        token = int(_generation_argmax(logits, valid_vocab_size)[0, -1].item())
+        out.append(token)
+        if eos_token_id is not None and token == eos_token_id:
             break
     return out
 
@@ -403,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dblock-euler-steps",
         type=int,
         default=None,
-        help="B=1 dblock Euler evaluations (default: checkpoint dblock_euler_steps, paper 50). "
+        help="B=1 dblock denoiser evaluations per token (default: checkpoint dblock_euler_steps, paper 50). "
         "Independent of --num-loops.",
     )
     parser.add_argument(

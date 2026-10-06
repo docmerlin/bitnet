@@ -6,6 +6,7 @@ import math
 
 import mlx.core as mx
 import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_unflatten
 
 from training.token_progress import momentum_warmup
 
@@ -450,6 +451,15 @@ class CMUD(optim.MultiOptimizer):
         # indexes into it and raises. Any model without an embedding-shaped
         # parameter -- a bare nn.Linear in a test, say -- hits that.
         return [part if part else {} for part in super()._split_dictionary(gradients)]
+
+    def apply_gradients(self, gradients: dict, parameters: dict):
+        # mlx tree_merge raises when both groups hold {} at one list slot, which
+        # DiffusionBlocks' idle-block gradients (``blocks[i] = {}``) produce.
+        # Leaves are disjoint across groups, so a flat merge is exact.
+        flat = []
+        for optimizer, part in zip(self.optimizers, self._split_dictionary(gradients)):
+            flat.extend(tree_flatten(optimizer.apply_gradients(part, parameters)))
+        return tree_unflatten(flat)
 
     @staticmethod
     def _is_embedding_parameter(path: str, parameter: mx.array) -> bool:

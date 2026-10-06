@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import statistics
 import tempfile
 import time
 from dataclasses import asdict
@@ -145,14 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-mode",
         choices=("ar", "dblock"),
-        default="ar",
-        help="ar: next-token CE (default). dblock: DiffusionBlocks embedding-space denoiser.",
+        default="dblock",
+        help="dblock (default): DiffusionBlocks block-wise next-token denoiser "
+        "(arXiv:2506.14202). ar: end-to-end next-token CE.",
     )
     parser.add_argument(
         "--dblock-blocks",
         type=int,
-        default=1,
-        help="DiffusionBlocks B. 1 = Huginn unique stack. 4 = equal unique-layer slices.",
+        default=None,
+        help="DiffusionBlocks B (default min(4, unique layers); paper LM uses 4): equal unique-layer slices, "
+        "one trained per step. 1 = Huginn whole stack, single pass.",
     )
     parser.add_argument(
         "--dblock-layers-per-block",
@@ -427,6 +430,8 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.dblock_layers_per_block < 1:
             raise ValueError("dblock-layers-per-block must be positive")
         args.dblock_blocks = blocks_for_layer_width(unique_layers, args.dblock_layers_per_block)
+    if args.dblock_blocks is None:
+        args.dblock_blocks = min(4, max(unique_layers, 1))
     if args.train_mode == "dblock":
         args.mtp_depth = 0
         if args.dblock_blocks < 1:
@@ -641,16 +646,20 @@ def create_dblock_gradient_step(
     ):
         logits = model.dblock_logits(
             inputs,
+            targets,
             segment_ids,
             sigma,
             eps,
             block_id=block_id,
             checkpoint_activations=gradient_checkpointing,
         )
-        # Reconstruct the noised tokens (inputs), not AR-shifted targets.
-        valid = mx.ones(inputs.shape, dtype=mx.bool_)
+        # Denoise the next token given clean context (paper App. E.4);
+        # per-sequence σ, so w(σ) weights each row (paper Eq. 6).
+        valid = segment_ids == label_segment_ids
         train_logits = softcap_logits(logits, logit_softcap)
-        loss = loss_weight * _masked_ce(train_logits, inputs, valid)
+        token_ce = nn.losses.cross_entropy(train_logits, mx.where(valid, targets, 0), reduction="none")
+        weighted = token_ce.astype(mx.float32) * valid * loss_weight[:, None]
+        loss = mx.sum(weighted) / mx.maximum(mx.sum(valid), 1)
         if z_loss_coef > 0:
             log_z = mx.logsumexp(train_logits.astype(mx.float32), axis=-1)
             loss = loss + z_loss_coef * mx.sum(mx.square(log_z) * valid) / mx.maximum(mx.sum(valid), 1)
@@ -724,6 +733,22 @@ def create_apply_step(
         return apply_step
 
     return _make_apply(mud_only=False), _make_apply(mud_only=True), state
+
+
+def dblock_block_gradients(gradients: dict, layer_range: tuple[int, int]) -> dict:
+    """Drop gradients for layers outside the active block (paper: update only θ_b).
+
+    Zero gradients are not enough: momentum and weight decay would still move
+    the other blocks. Empty subtrees make the optimizer skip them entirely,
+    like PyTorch's ``grad=None``. Shared embed/head/σ-embed stay.
+    """
+    start, end = layer_range
+    pruned = dict(gradients)
+    pruned["blocks"] = [
+        grads if start <= index < end else {}
+        for index, grads in enumerate(gradients["blocks"])
+    ]
+    return pruned
 
 
 def accumulate_gradients(accumulated, gradients):
@@ -1001,42 +1026,37 @@ def evaluate(model: MLXBitNet, batches) -> dict[str, float]:
     return metrics
 
 
-def evaluate_dblock(
-    model: MLXBitNet,
-    batches,
-    sigmas: tuple[float, ...] = (0.1, 1.0, 10.0),
-) -> dict[str, float]:
-    """Denoise-CE at a fixed σ grid. Not AR perplexity."""
+def evaluate_dblock(model: MLXBitNet, batches) -> dict[str, float]:
+    """Unweighted next-token denoise-CE, each block at its own interval's
+    geometric-mid σ. Not AR perplexity (paper §5.4: not ELBO-derived)."""
     if not batches:
         return {}
     model.eval()
-    losses = []
-    per_sigma = {sigma: [] for sigma in sigmas}
+    schedule = model.config.noise_schedule()
     hidden = model.config.hidden_size
-    block_ids = range(model.config.dblock_blocks)
-    for inputs, _targets, segments, _label_segments in batches:
-        valid = mx.ones(inputs.shape, dtype=mx.bool_)
-        for block_id in block_ids:
-            for sigma in sigmas:
-                eps = mx.random.normal((*inputs.shape, hidden))
-                logits = model.dblock_logits(
-                    inputs,
-                    segments,
-                    mx.array(sigma),
-                    eps,
-                    block_id=block_id,
-                )
-                # Average the grid equally; report unweighted CE (not EDM w(σ)).
-                loss = _masked_ce(logits, inputs, valid)
-                mx.eval(loss)
-                value = float(loss.item())
-                losses.append(value)
-                per_sigma[sigma].append(value)
+    per_block = []
+    for block_id in range(model.config.dblock_blocks):
+        lo, hi = schedule.interval(block_id)
+        sigma = math.sqrt(lo * hi)
+        losses = []
+        for inputs, targets, segments, label_segments in batches:
+            logits = model.dblock_logits(
+                inputs,
+                targets,
+                segments,
+                mx.full((inputs.shape[0],), sigma),
+                mx.random.normal((*inputs.shape, hidden)),
+                block_id=block_id,
+            )
+            loss = _masked_ce(logits, targets, segments == label_segments)
+            mx.eval(loss)
+            losses.append(float(loss.item()))
+        per_block.append(sum(losses) / len(losses))
     model.train()
-    mean_loss = sum(losses) / len(losses)
+    mean_loss = sum(per_block) / len(per_block)
     metrics = {"val_loss": mean_loss, "val_denoise_ce": mean_loss}
-    for sigma, values in per_sigma.items():
-        metrics[f"val_denoise_ce_sigma_{sigma:g}"] = sum(values) / len(values)
+    for block_id, value in enumerate(per_block):
+        metrics[f"val_denoise_ce_block_{block_id}"] = value
     return metrics
 
 
@@ -1395,12 +1415,10 @@ def main() -> None:
         losses = []
         hard_densities = []
         dblock_block_id = None
-        dblock_sigma = None
-        dblock_weight = None
+        dblock_sigmas = []
         if config.train_mode == "dblock":
+            # One block per optimizer step; only its layers (plus shared embed/head/σ) update.
             dblock_block_id = dblock_rng.randrange(config.dblock_blocks)
-            dblock_sigma = dblock_schedule.sample(dblock_block_id, dblock_rng)
-            dblock_weight = dblock_schedule.weight(dblock_sigma)
             key = (
                 active_loops,
                 active_blocks,
@@ -1424,12 +1442,17 @@ def main() -> None:
                 mx.array(rf_alpha),
             ]
             if config.train_mode == "dblock":
+                sigmas = [
+                    dblock_schedule.sample(dblock_block_id, dblock_rng)
+                    for _ in range(batch[0].shape[0])
+                ]
+                dblock_sigmas.extend(sigmas)
                 eps = mx.random.normal((*batch[0].shape, config.hidden_size))
                 gradient_args.extend(
                     [
-                        mx.array(dblock_sigma),
+                        mx.array(sigmas, dtype=mx.float32),
                         eps,
-                        mx.array(dblock_weight),
+                        mx.array([dblock_schedule.weight(sigma) for sigma in sigmas], dtype=mx.float32),
                     ]
                 )
             elif config.mtp_depth > 0 and args.mtp_loss_coef > 0:
@@ -1493,6 +1516,10 @@ def main() -> None:
             lambda gradient: gradient / args.grad_accumulation_steps,
             accumulated_gradients,
         )
+        if config.train_mode == "dblock" and config.dblock_blocks > 1:
+            accumulated_gradients = dblock_block_gradients(
+                accumulated_gradients, config.dblock_layer_ranges()[dblock_block_id]
+            )
         multiplier = lr_multiplier(
             step - 1, total_steps, warmup_steps, cooldown_steps, args.min_lr_ratio, args.lr_schedule
         )
@@ -1548,10 +1575,7 @@ def main() -> None:
                 profile_steps = 0
             if config.train_mode == "dblock":
                 metrics["dblock_block_id"] = dblock_block_id
-                metrics["dblock_sigma"] = dblock_sigma
-                metrics["dblock_weight"] = dblock_weight
-                if dblock_weight:
-                    metrics["denoise_ce"] = metrics["loss"] / dblock_weight
+                metrics["dblock_sigma_median"] = statistics.median(dblock_sigmas)
             if config.use_rfmoe:
                 metrics["rfmoe_density"] = sum(hard_densities) / len(hard_densities)
                 metrics["rfmoe_lambda"] = trainer_state["density_lambda"]

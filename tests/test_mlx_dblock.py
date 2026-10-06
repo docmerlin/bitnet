@@ -7,7 +7,7 @@ from mlx.utils import tree_flatten
 import pytest
 
 from mlx_model import MLXBitNet, MLXBitNetConfig
-from mlx_train import _masked_ce, create_dblock_gradient_step
+from mlx_train import _masked_ce, create_dblock_gradient_step, dblock_block_gradients
 
 
 def _ar_config(**overrides) -> MLXBitNetConfig:
@@ -78,51 +78,57 @@ def test_dblock_logits_are_finite() -> None:
     sigma = mx.array(1.0)
     eps = mx.random.normal((2, 4, 16))
     mx.eval(model.parameters())
-    logits = model.dblock_logits(tokens, segments, sigma, eps)
+    logits = model.dblock_logits(tokens, tokens, segments, sigma, eps)
     mx.eval(logits)
     assert logits.shape == (2, 4, 32)
     assert bool(mx.all(mx.isfinite(logits)).item())
 
 
-@pytest.mark.parametrize("sigma_out", [0.0, 1.0, 2.0])
-def test_euler_perfect_denoiser_reduces_noise(monkeypatch, sigma_out) -> None:
+def test_denoised_is_expected_clean_embedding() -> None:
     model = MLXBitNet(_dblock_config())
-    clean = mx.eye(model.config.hidden_size)[:1][None]
-    monkeypatch.setattr(model, "dblock_forward_from_z", lambda *args, **kwargs: clean)
-    noise = mx.ones_like(clean)
-    actual = model.dblock_euler_step(clean + 2.0 * noise, mx.array(2.0), mx.array(sigma_out))
-    assert mx.allclose(actual, clean + sigma_out * noise).item()
+    logits = mx.full((1, 1, 32), -1e9).at[..., 5].add(1e9)
+    expected = model.dblock_clean_embeddings(mx.array([[5]])).astype(mx.float32)
+    assert mx.allclose(model.dblock_denoised(logits), expected, atol=1e-5).item()
 
 
-def test_dblock_ce_ignores_shifted_targets() -> None:
+def test_dblock_logits_never_see_clean_target_or_future() -> None:
+    """Position i: clean context ≤ i, noisy target i only. Paper App. E.4 causality."""
+    mx.random.seed(7)
+    model = MLXBitNet(_dblock_config())
+    mx.eval(model.parameters())
+    tokens = mx.array([[1, 2, 3, 4]])
+    targets = mx.array([[2, 3, 4, 5]])
+    segments = mx.zeros(tokens.shape, dtype=mx.int32)
+    sigma = mx.array([0.5])
+    eps = mx.random.normal((1, 4, 16))
+    base = model.dblock_logits(tokens, targets, segments, sigma, eps)
+    # Change everything after position 1 (future context and future noisy targets).
+    later = model.dblock_logits(
+        mx.array([[1, 2, 9, 9]]), mx.array([[2, 3, 9, 9]]), segments, sigma, eps
+    )
+    mx.eval(base, later)
+    assert mx.allclose(base[:, :2], later[:, :2], atol=1e-5).item()
+
+
+def test_dblock_loss_is_weighted_next_token_ce() -> None:
     mx.random.seed(7)
     model = MLXBitNet(_dblock_config())
     mx.eval(model.parameters())
     step = create_dblock_gradient_step(model, compile_step=False, block_id=0)
-    tokens = mx.random.randint(0, 32, (1, 4))
-    other = (tokens + 3) % 32
+    tokens = mx.random.randint(0, 32, (2, 4))
+    targets = (tokens + 3) % 32
     segments = mx.zeros(tokens.shape, dtype=mx.int32)
-    sigma = mx.array(0.8)
-    eps = mx.random.normal((1, 4, 16))
-    args = (
-        tokens,
-        other,
-        segments,
-        segments,
-        mx.array(0.0),
-        mx.array(1.0),
-        mx.array(0.1),
-        sigma,
-        eps,
-        mx.array(1.0),
-    )
-    loss_other, _ = step(*args)
-    loss_same, _ = step(tokens, tokens, *args[2:])
-    logits = model.dblock_logits(tokens, segments, sigma, eps)
-    expected = _masked_ce(logits, tokens, mx.ones(tokens.shape, dtype=mx.bool_))
-    mx.eval(loss_other, loss_same, expected)
-    assert mx.allclose(loss_other, loss_same, rtol=1e-5, atol=1e-5).item()
-    assert mx.allclose(loss_same, expected, rtol=1e-5, atol=1e-5).item()
+    sigma = mx.array([0.8, 0.3])
+    eps = mx.random.normal((2, 4, 16))
+    weight = mx.array([2.0, 0.5])
+    rest = (segments, segments, mx.array(0.0), mx.array(1.0), mx.array(0.1), sigma, eps)
+    loss, _ = step(tokens, targets, *rest, weight)
+    logits = model.dblock_logits(tokens, targets, segments, sigma, eps)
+    valid = mx.ones(tokens.shape, dtype=mx.bool_)
+    per_row = [_masked_ce(logits[i : i + 1], targets[i : i + 1], valid[i : i + 1]) for i in range(2)]
+    expected = (2.0 * per_row[0] + 0.5 * per_row[1]) / 2
+    mx.eval(loss, expected)
+    assert mx.allclose(loss, expected, rtol=1e-4, atol=1e-4).item()
 
 
 def test_dblock_train_step_is_finite() -> None:
@@ -133,7 +139,7 @@ def test_dblock_train_step_is_finite() -> None:
     tokens = mx.random.randint(0, 32, (1, 4))
     targets = mx.random.randint(0, 32, (1, 4))
     segments = mx.zeros(tokens.shape, dtype=mx.int32)
-    sigma = mx.array(0.8)
+    sigma = mx.array([0.8])
     eps = mx.random.normal((1, 4, 16))
     loss, grads = step(
         tokens,
@@ -145,7 +151,7 @@ def test_dblock_train_step_is_finite() -> None:
         mx.array(0.1),
         sigma,
         eps,
-        mx.array(1.0),
+        mx.array([1.0]),
     )
     mx.eval(loss, grads)
     assert mx.isfinite(loss).item()
@@ -171,9 +177,9 @@ def test_stage2_slice_grads_skip_idle_blocks() -> None:
         mx.array(0.0),
         mx.array(1.0),
         mx.array(0.1),
-        mx.array(1.2),
+        mx.array([1.2]),
         mx.random.normal((1, 4, 16)),
-        mx.array(1.0),
+        mx.array([1.0]),
     )
     mx.eval(loss, grads)
     flat = dict(tree_flatten(grads))
@@ -190,6 +196,29 @@ def test_stage2_slice_grads_skip_idle_blocks() -> None:
         assert _block_grad(idle) == 0.0
     # Shared readout still trains.
     assert float(mx.sum(mx.abs(flat["embedding.weight"])).item()) > 0.0
+    # Idle blocks are dropped, not zeroed: optimizer momentum/decay must skip them.
+    pruned = dblock_block_gradients(grads, config.dblock_layer_ranges()[active])
+    assert [bool(entry) for entry in pruned["blocks"]] == [False, True, False, False]
+
+
+def test_pruned_gradients_leave_idle_blocks_untouched() -> None:
+    from mlx_optim import CMUD
+
+    mx.random.seed(4)
+    config = _dblock_config(dblock_blocks=2)
+    model = MLXBitNet(config)
+    mx.eval(model.parameters())
+    optimizer = CMUD(mud_learning_rate=0.02, fallback_learning_rate=1e-3, weight_decay=0.1)
+    ones = lambda tree: {k: ones(v) if isinstance(v, (dict, list)) else mx.ones_like(v) for k, v in tree.items()} if isinstance(tree, dict) else [ones(v) for v in tree]
+    grads = ones(model.trainable_parameters())
+    optimizer.update(model, grads)  # warm momentum everywhere
+    mx.eval(model.parameters(), optimizer.state)
+    idle_before = dict(tree_flatten(model.blocks[0].parameters()))
+    for _ in range(2):
+        optimizer.update(model, dblock_block_gradients(grads, config.dblock_layer_ranges()[1]))
+        mx.eval(model.parameters(), optimizer.state)
+    idle_after = dict(tree_flatten(model.blocks[0].parameters()))
+    assert all(mx.array_equal(idle_before[k], idle_after[k]).item() for k in idle_before)
 
 
 def test_old_checkpoint_defaults_euler_steps_to_50() -> None:
@@ -229,6 +258,27 @@ def test_dblock_greedy_generate_returns_prompt_plus_suffix() -> None:
     assert out[:2] == prompt
     assert len(out) == 5
     assert all(0 <= token < 32 for token in out)
+
+
+def test_dblock_generate_is_autoregressive_one_block_per_eval(monkeypatch) -> None:
+    """B blocks → B evals per token, σ_max→σ_min, growing clean context."""
+    from mlx_generate import dblock_greedy_generate
+
+    model = MLXBitNet(_dblock_config(dblock_blocks=4))
+    mx.eval(model.parameters())
+    calls = []
+    real = model.dblock_forward_from_z
+
+    def spy(z, sigma, tokens, *args, **kwargs):
+        calls.append((tokens.shape[1], z.shape[1], kwargs["block_id"], float(sigma.item())))
+        return real(z, sigma, tokens, *args, **kwargs)
+
+    monkeypatch.setattr(model, "dblock_forward_from_z", spy)
+    dblock_greedy_generate(model, [1, 2], max_new_tokens=2)
+    assert [c[2] for c in calls] == [0, 1, 2, 3, 0, 1, 2, 3]
+    assert [c[0] for c in calls] == [2] * 4 + [3] * 4
+    assert all(c[0] == c[1] for c in calls)
+    assert calls[0][3] == pytest.approx(80.0) and calls[3][3] == pytest.approx(0.002)
 
 
 @pytest.mark.parametrize("infer", ["euler", "loops"])

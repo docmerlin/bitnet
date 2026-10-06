@@ -87,3 +87,12 @@ def test_euler_sigmas_are_decreasing_and_bracketed() -> None:
     assert sigmas[0] == pytest.approx(schedule.sigma_max, rel=1e-5)
     assert sigmas[-1] == pytest.approx(schedule.sigma_min, rel=1e-5)
     assert all(a > b for a, b in zip(sigmas, sigmas[1:]))
+
+
+def test_sample_sigmas_map_one_eval_per_block() -> None:
+    schedule = NoiseSchedule(num_blocks=4)
+    sigmas = schedule.sample_sigmas(4)
+    assert sigmas[0] == pytest.approx(schedule.sigma_max, rel=1e-5)
+    assert sigmas[-1] == pytest.approx(schedule.sigma_min, rel=1e-5)
+    assert [schedule.block_for_sigma(sigma) for sigma in sigmas] == [0, 1, 2, 3]
+    assert schedule.sample_sigmas(1) == (schedule.sigma_min,)

@@ -2312,6 +2312,13 @@ class MLXBitNet(nn.Module):
             if config.train_mode == "dblock"
             else None
         )
+        # Noisy next-token embedding enters through its own projection so it is
+        # not confused with the clean context embedding it is added to.
+        self.dblock_noise_in = (
+            nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            if config.train_mode == "dblock"
+            else None
+        )
         self.mtp_transforms = [
             nn.Sequential(
                 mlx_make_norm(config.hidden_size, config),
@@ -3034,7 +3041,7 @@ class MLXBitNet(nn.Module):
         self,
         z: mx.array,
         sigma: mx.array,
-        tokens: mx.array | None = None,
+        tokens: mx.array,
         segment_ids: mx.array | None = None,
         *,
         block_id: int | None = None,
@@ -3042,16 +3049,25 @@ class MLXBitNet(nn.Module):
         reset_memory: bool = True,
         num_loops: int | None = None,
     ) -> mx.array:
-        """Denoiser body: EDM-scaled ``z`` through one unique slice (or the Huginn stack)."""
+        """Denoiser body ``D(z_i, σ | clean x_≤i)`` through one block (paper App. B/E.4).
+
+        Position ``i`` carries clean context token ``tokens[i]`` plus noisy
+        ``z[i]`` of the *next* token. Causal attention then sees clean tokens
+        ``≤ i`` and never the clean target, which only appears at ``i + 1``.
+        ponytail: additive single stream instead of the paper's 2T clean|noisy
+        concat mask (PaTH/Infini have no such mask); past positions also carry
+        their own noisy targets, so sampling re-noises the past at the same σ.
+        """
         if self.config.train_mode != "dblock" or self.sigma_embed is None:
             raise RuntimeError("dblock_forward_from_z requires train_mode='dblock'")
         scale = self._broadcast_sigma(self.dblock_c_in(sigma), z)
-        scaled = scale.astype(z.dtype) * z
+        noisy = self.dblock_noise_in(scale.astype(z.dtype) * z)
+        inputs = self.subln(self.embedding(tokens)) + noisy.astype(z.dtype)
         cond = self.sigma_embed(sigma).astype(z.dtype)
         loops = 1 if num_loops is None else int(num_loops)
         if loops < 1:
             raise ValueError("num_loops must be positive")
-        # Engram is off in dblock; drive the stack from noisy embeddings only.
+        # Engram is off in dblock; drive the stack from embeddings only.
         if self.config.dblock_blocks == 1 and block_id in (None, 0):
             return self.hidden_states(
                 None,
@@ -3059,7 +3075,7 @@ class MLXBitNet(nn.Module):
                 num_loops=loops,
                 reset_memory=reset_memory,
                 checkpoint_activations=checkpoint_activations,
-                inputs_embeds=scaled,
+                inputs_embeds=inputs,
                 apply_input_norm=False,
                 cond=cond,
             )
@@ -3074,7 +3090,7 @@ class MLXBitNet(nn.Module):
             num_loops=1,
             reset_memory=reset_memory,
             checkpoint_activations=checkpoint_activations,
-            inputs_embeds=scaled,
+            inputs_embeds=inputs,
             apply_input_norm=False,
             cond=cond,
             flatten_loops=True,
@@ -3085,6 +3101,7 @@ class MLXBitNet(nn.Module):
     def dblock_logits(
         self,
         tokens: mx.array,
+        targets: mx.array,
         segment_ids: mx.array | None,
         sigma: mx.array,
         eps: mx.array,
@@ -3092,7 +3109,8 @@ class MLXBitNet(nn.Module):
         block_id: int | None = None,
         checkpoint_activations: bool | str = False,
     ) -> mx.array:
-        y = self.dblock_clean_embeddings(tokens)
+        """Logits for clean ``targets`` from ``targets + σ·eps``, given clean ``tokens``."""
+        y = self.dblock_clean_embeddings(targets)
         z = y + self._broadcast_sigma(sigma, y) * eps.astype(y.dtype)
         hidden = self.dblock_forward_from_z(
             z,
@@ -3104,32 +3122,10 @@ class MLXBitNet(nn.Module):
         )
         return self.logits_from(hidden)
 
-    def dblock_euler_step(
-        self,
-        z: mx.array,
-        sigma_in: mx.array,
-        sigma_out: mx.array,
-        tokens: mx.array | None = None,
-        segment_ids: mx.array | None = None,
-        *,
-        block_id: int | None = None,
-        num_loops: int | None = None,
-    ) -> mx.array:
-        """One VE Euler step (paper Eq. 5). ``D`` is L2-normalized block hidden."""
-        hidden = self.dblock_forward_from_z(
-            z,
-            sigma_in,
-            tokens,
-            segment_ids,
-            block_id=block_id,
-            reset_memory=True,
-            num_loops=num_loops,
-        )
-        predicted = _safe_normalize(hidden, axis=-1)
-        sigma_in_b = self._broadcast_sigma(sigma_in, z)
-        sigma_out_b = self._broadcast_sigma(sigma_out, z)
-        delta = (sigma_in_b - sigma_out_b) / mx.maximum(sigma_in_b, 1e-8)
-        return z - delta * (z - predicted.astype(z.dtype))
+    def dblock_denoised(self, logits: mx.array) -> mx.array:
+        """Euler ``D``: expected clean embedding ``softmax(logits) @ Ê`` (official sampler)."""
+        probs = mx.softmax(logits.astype(mx.float32), axis=-1)
+        return probs @ _safe_normalize(self.embedding.weight.astype(mx.float32), axis=-1)
 
     def __call__(
         self,

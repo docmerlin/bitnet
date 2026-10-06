@@ -61,8 +61,9 @@ Implemented (see `layers/rfmoe.py`, `train.py`, `config.py`, `model.py`):
   transitions plus forget gates use paper-exact logits. Local UT attention is capped by
   `--path-window-size` (64 default), so attention storage/work stays linear in total context;
   fixed-size Infini memory carries compressed information beyond local windows. BLT keeps RoPE.
-- **DiffusionBlocks** (MLX, opt-in `--train-mode dblock`): embedding-space VE, Huginn B=1
-  / 50 Euler, EDM-weighted denoise-CE. Not AR decode. See README / `training.md`.
+- **DiffusionBlocks** (MLX default, `--train-mode dblock`, B=4): block-wise next-token
+  denoiser with clean-context conditioning, AR decode. See README / `training.md`.
+  Open: KV cache for dblock decode; quality A/B vs `--train-mode ar` at ≥500M.
 
 ## Next actions
 

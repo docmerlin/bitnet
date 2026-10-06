@@ -157,6 +157,26 @@ class NoiseSchedule:
         total = abs(self.q_max - self.q_min)
         return mass / total if total else 0.0
 
+    def block_for_sigma(self, sigma: float) -> int:
+        """Block whose non-overlapped interval holds ``sigma`` (clamped at the ends)."""
+        edges = self.sigma_edges
+        for block_id in range(self.num_blocks):
+            if float(sigma) >= edges[block_id + 1]:
+                return block_id
+        return self.num_blocks - 1
+
+    def sample_sigmas(self, evals: int) -> tuple[float, ...]:
+        """``evals`` equi-probability σ from σ_max down to σ_min, ends included.
+
+        Official sampler: ``evals - 1`` Euler steps then one final denoise at
+        σ_min, so B blocks cost exactly B block evaluations.
+        """
+        if evals < 1:
+            raise ValueError("evals must be positive")
+        if evals == 1:
+            return (float(self.sigma_min),)
+        return self.euler_sigmas(evals - 1)
+
     def euler_sigmas(self, steps: int) -> tuple[float, ...]:
         """Decreasing σ sequence of length ``steps + 1`` from σ_max to σ_min.
 

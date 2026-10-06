@@ -258,11 +258,11 @@ python3 mlx_benchmark.py --backend torch --steps 100 --warmup-steps 5 \
 
 Implemented:
 
-- `mlx_model.py`: ternary STE from step 0, native fp8 e4m3 activation STE on `MLXHBitLinear`, native Hadamard, custom Metal PaTH solve, packed-document mask, Engram, Infini memory, grouped sparse RFMoE via conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda, MTP heads, dense square mid (cold-start mid master = identity), opt-in DiffusionBlocks (`train_mode='dblock'`: Fourier σ embed + AdaRMS).
+- `mlx_model.py`: ternary STE from step 0, native fp8 e4m3 activation STE on `MLXHBitLinear`, native Hadamard, custom Metal PaTH solve, packed-document mask, Engram, Infini memory, grouped sparse RFMoE via conditional Metal kernels, four-stream Hyperloop HC, prelude/recurrent/coda, MTP heads, dense square mid (cold-start mid master = identity), DiffusionBlocks (`train_mode='dblock'`, trainer default: Fourier σ embed + AdaRMS + `dblock_noise_in`).
 - `dblocks/`: VE/EDM equi-probability schedule (`NoiseSchedule`) and DiT-style AdaRMS / `log σ` Fourier embedding. B=1 is the Huginn unique stack; B>1 slices unique layers equally (not prelude|recurrent|coda).
 - `mlx_rfmoe_kernel.py`: conditional grouped expert projections + sparse custom input/weight VJPs. Default hybrid: one host compaction, compact `gather_mm` forwards, compact route-wise backward kernels.
-- `mlx_train.py`: stream HF mixtures via existing tokenizer/packer, compiled BF16 grads + optimizer updates, activation ckpt, grad accum, CE/z/MTP/RF aux losses, loop/block/RF/data/LR curricula, val, JSONL metrics, resumable safetensor model/optimizer ckpts. Resume restore MLX RNG, mixture RNG, HF iterator positions, shuffle buffers, partial packed sequences. `--train-mode dblock` swaps the step for EDM-weighted denoise-CE on the noised tokens (not AR-shifted targets); val is denoise-CE on a fixed σ grid. `--precision` is `bfloat16` or `float32` (no float16). Startup prints `activations=fp8-e4m3`. Retired mix/bit keys still load and are dropped.
-- `mlx_generate.py`: vanilla + MTP speculative greedy on AR checkpoints. MTP proposals use final hidden position only; verification accept only target-model argmax matches → generated tokens = vanilla greedy. dblock checkpoints denoise the full window with VE Euler (B=1: `--dblock-euler-steps`, default 50, independent of `--num-loops`) then take suffix argmax.
+- `mlx_train.py`: stream HF mixtures via existing tokenizer/packer, compiled BF16 grads + optimizer updates, activation ckpt, grad accum, CE/z/MTP/RF aux losses, loop/block/RF/data/LR curricula, val, JSONL metrics, resumable safetensor model/optimizer ckpts. Resume restore MLX RNG, mixture RNG, HF iterator positions, shuffle buffers, partial packed sequences. Default `--train-mode dblock` (B=4) trains one random block per step on EDM-weighted next-token denoise-CE, per-sequence σ, idle-block grads dropped; val is per-block denoise-CE at each block's mid σ. `--train-mode ar` = end-to-end CE. `--precision` is `bfloat16` or `float32` (no float16). Startup prints `activations=fp8-e4m3`. Retired mix/bit keys still load and are dropped.
+- `mlx_generate.py`: vanilla + MTP speculative greedy on AR checkpoints. MTP proposals use final hidden position only; verification accept only target-model argmax matches → generated tokens = vanilla greedy. dblock checkpoints decode token by token: B denoiser evals per token (B=1: `--dblock-euler-steps`, default 50, independent of `--num-loops`), past re-noised at each σ, no KV cache.
 - `mlx_optim.py`: 64-row blockwise C-MUD for non-embedding mats + blockwise-int8 C-Lion for embeddings/norms/biases/gates; cautious mask, Metal triangular whitening, independent LRs, optional int8 CMUD matrix momentum, resumable optimizer state.
 - MLX default: four 4-sequence microbatches per optimizer update; activation ckpt off. Sampled MTP default depth 4; `--mtp-depth 0` disable. Smaller microbatches + `--gradient-checkpointing` on memory-tight machines. Override whitening `--mud-block-size`; converted/legacy ckpts keep original full-matrix C-MUD.
 - Five 4-sequence val batches keep previous default sample count; avoid 4x val expansion from larger microbatches. Val batches materialize once — repeated eval no rescan held-out offset.
@@ -349,33 +349,33 @@ Incremental MLX inference retain effective weights across prefill, token steps, 
 
 100-update real-data A/B identical seed, stream, curriculum, five val batches every 20 updates: 256-row blocks vs full-matrix whitening. Blockwise C-MUD: val loss 2.7053 vs 2.7601, sustained 1,306 vs 1,118 tok/s at max depth, complete 1,078 vs 1,181s. Single seed support faster default; not statistical convergence study.
 
-### DiffusionBlocks (opt-in)
+### DiffusionBlocks (default)
 
-`--train-mode dblock` (default remains `ar`) trains the unique stack as an
-embedding-space VE denoiser (Shing, Koyama, Akiba, ICLR 2026, arXiv:2506.14202).
-Not token-level LLaDA / BLT-D block diffusion.
+`mlx_train.py` defaults to `--train-mode dblock` (arXiv:2506.14202, AR variant §5.4 /
+App. E.4). `--train-mode ar` is end-to-end next-token CE. Not token-level LLaDA /
+BLT-D block diffusion.
 
-- **B=1** (`--dblock-blocks 1`): Huginn unique stack. Train samples σ from the
-  full truncated log-normal. Infer: K VE Euler evals of that stack
-  (`--dblock-euler-steps`, paper default 50). Independent of `--num-loops` (Huginn R).
-- **B>1**: unique layers sliced equal-width (remainder on the last block), not
-  prelude|recurrent|coda. Train picks a random block + σ on that block's overlapped
-  interval. Infer: one Euler step per block (`T=B`). `--dblock-layers-per-block N`
-  sets `B = ceil(L / N)`.
-- **Loss:** EDM weight `w(σ) = (σ² + σ_data²) / (σ · σ_data)²` times CE that
-  reconstructs the **noised tokens**, not AR-shifted targets. Logs `denoise_ce`
-  (unweighted) plus `dblock_block_id` / `dblock_sigma`.
-- **Val:** mean denoise-CE on σ ∈ {0.1, 1.0, 10.0}, not AR PPL.
-- **Constraints:** Engram forced off (clean ids leak the target). MTP rejected.
-  AdaRMS zero-init (identity residual norm until cond learns). Noisy embeds skip
-  SubLN (would rescale σ).
-- **Generate:** noise the full window at σ_max, Euler down to σ_min, suffix argmax.
-  Prompt prefix is returned unchanged. `--dblock-infer loops` is B=1 debug unroll.
+- **B>1** (default 4): unique layers sliced equal-width (remainder on the last block),
+  not prelude|recurrent|coda. Each step picks a random block; σ per sequence from that
+  block's overlapped (γ=0.1) equi-probability interval. Only that slice + shared
+  embed/head/σ-embed/noise_in update (idle grads dropped → no momentum/decay drift).
+- **B=1** (`--dblock-blocks 1`): Huginn stack, single pass; infer K evals
+  (`--dblock-euler-steps`, paper 50), independent of `--num-loops`.
+- **Denoiser:** input at position i = `subln(E[x_i]) + noise_in(c_in·(ê_{i+1} + σε))`.
+  Causal mask ⇒ clean context ≤ i, clean target never visible. Single-stream stand-in
+  for the paper's clean|noisy concat mask (PaTH/Infini lack it).
+- **Loss:** `w(σ)·CE(x_{i+1})`, `w(σ) = (σ² + σ_data²)/(σ·σ_data)²`, masked across
+  packed-document boundaries. Logged `loss` is weighted; logs `dblock_block_id` /
+  `dblock_sigma_median`.
+- **Val:** unweighted denoise-CE per block at its interval's geometric-mid σ.
+- **Generate:** per token, z ~ σ_max·N(0, I); evals on `sample_sigmas` (σ_max→σ_min,
+  block by σ); Euler with `D = softmax(logits) @ Ê`; argmax of the last eval.
+- **Constraints:** Engram forced off. MTP zeroed by CLI. AdaRMS zero-init.
 
 ```bash
-python3 mlx_train.py --train-mode dblock --dblock-blocks 1 --mtp-depth 0
+python3 mlx_train.py                      # DiffusionBlocks B=4
 python3 mlx_generate.py runs/mlx_bitnet/checkpoints/final.safetensors \
-  --prompt "The quick brown fox" --dblock-euler-steps 50
+  --prompt "The quick brown fox"
 ```
 
 Use `mlx_train.py` for native MLX experiments; do not expect identical step-by-step loss vs `train.py` (backend kernels + RFMoE execution order differ).

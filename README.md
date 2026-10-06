@@ -13,8 +13,9 @@ more than the old runs, and there is no migration path — resume from a checkpo
 only within the commit that wrote it. Known *loadable* retired keys (dropped, not
 migrated): activation-quant mix/bit fields (`activation_bits`, `activation_dtype`,
 `use_4bit_activations`, `quantize_activations`, mix arrays) and Mamba/QK-Clip
-fields. Most recent structural breaks: DiffusionBlocks adds `sigma_embed` / AdaRMS
-when `--train-mode dblock`; the output head is untied by default
+fields. Most recent structural breaks: DiffusionBlocks is the MLX default and adds
+`sigma_embed` / AdaRMS / `dblock_noise_in` (dblock checkpoints from before the
+clean-context rewrite do not load); the output head is untied by default
 (`--no-tie-word-embeddings`), which adds `lm_head.weight` and splits the optimizer
 into three groups.
 
@@ -41,8 +42,9 @@ Key properties:
 - activations: MLX BitNet uses native fp8 e4m3 (`mx.to_fp8` / `mx.from_fp8` + STE);
   PyTorch BitNet and BLT stay in the compute dtype. Absmax fake-quant and
   `--final-activation-bits` are gone
-- opt-in MLX **DiffusionBlocks** (`--train-mode dblock`): embedding-space VE denoiser
-  (Huginn B=1, 50 Euler by default). AR next-token CE remains the default
+- MLX trains with **DiffusionBlocks** by default (`--train-mode dblock`, B=4): block-wise
+  next-token denoiser, one block of layers trained per step. `--train-mode ar` is
+  end-to-end next-token CE
 - compact DeepSeek Engram conditional memory (default injects e.g. layers 1 and 15 when in range):
   hashed bigram/trigram lookup; table size auto-scales to **~5% of body params**
   (`--engram-param-fraction`, or force `--engram-vocab-size`; `--no-engram` disables)
@@ -105,9 +107,9 @@ BLT code isolated from `train.py` path so BLT experiments don't entangle origina
 - `data/`: dataset presets, mixture parsing, packing
 - `training/`: losses, schedules, checkpoints, runtime helpers
 - `mlx_model.py` / `mlx_train.py`: native MLX model and curriculum trainer
-  (AR default; `--train-mode dblock` for DiffusionBlocks)
-- `mlx_generate.py`: AR (+ MTP speculative) generate; dblock checkpoints use
-  full-window VE Euler, not token-by-token decode
+  (DiffusionBlocks default; `--train-mode ar` for end-to-end next-token CE)
+- `mlx_generate.py`: AR (+ MTP speculative) generate; dblock checkpoints decode token
+  by token, B denoiser evals per token
 - `mlx_convert.py`: warm-convert PyTorch C-MUD checkpoints to MLX
 - `mlx_path_kernel.py`: trainable custom Metal solve for PaTH-FoX
 - `mlx_rfmoe_kernel.py`: differentiable conditional Metal expert projections
@@ -235,10 +237,11 @@ python3 mlx_generate.py runs/bitnet/checkpoints/final.safetensors \
   --prompt "The quick brown fox" --max-new-tokens 64
 ```
 
-A `--train-mode dblock` checkpoint does **not** AR-decode. `mlx_generate.py` noises the
-full window, runs VE Euler (B=1: `--dblock-euler-steps`, paper 50, independent of
-`--num-loops`; B>1: one step per block), then takes suffix argmax. Prompt tokens are
-returned unchanged. `--dblock-infer loops` is a B=1 debug unroll of Huginn R.
+A `--train-mode dblock` checkpoint decodes greedily token by token. Each new token starts
+at σ_max noise and runs equi-probability σ evals down to σ_min (B>1: one per block, paper
+T=B; B=1: `--dblock-euler-steps`, paper 50, independent of `--num-loops`), conditioned on
+the clean prefix. No KV cache yet: each eval re-runs the prefix. `--dblock-infer loops`
+is a B=1 debug unroll of Huginn R.
 
 ### MLX quantization
 
@@ -255,23 +258,32 @@ ramp, and `--final-activation-bits` / `activation_bits` are gone.
 Packed 2-bit *training* matmul (`--recurrent-quantized-matmul`) still requires
 sequence length ≥ 128.
 
-### DiffusionBlocks (opt-in MLX)
+### DiffusionBlocks (MLX default)
 
-`--train-mode dblock` trains the unique stack as an embedding-space VE denoiser
-(Shing, Koyama, Akiba, ICLR 2026, [arXiv:2506.14202](https://arxiv.org/abs/2506.14202)).
-Default remains AR next-token CE.
+`mlx_train.py` trains with DiffusionBlocks (Shing, Koyama, Akiba, ICLR 2026,
+[arXiv:2506.14202](https://arxiv.org/abs/2506.14202)), autoregressive variant (§5.4, App. E.4).
+`--train-mode ar` restores end-to-end next-token CE.
 
-- `B=1` (`--dblock-blocks 1`): Huginn unique stack. Infer uses
-  `--dblock-euler-steps` (default 50), **not** `--num-loops`.
-- `B>1`: equal unique-layer slices; infer is one Euler step per block.
-  `--dblock-layers-per-block N` sets `B = ceil(unique_layers / N)`.
-- Train loss is EDM-weighted CE on the **noised tokens** (not AR-shifted targets).
-  Val reports denoise-CE on a fixed σ grid, not AR perplexity.
-- Engram is forced off (clean token ids would leak the diffusion target). MTP is
-  AR-only (`mtp_depth` is zeroed). AdaRMS is zero-init; noisy embeds skip SubLN.
+- **Blocks:** unique layers split into `B` equal slices (`--dblock-blocks`, default 4 = paper
+  LM setting). Each optimizer step samples one block; only its layers plus the shared
+  embedding / head / σ-embed update. Idle-block gradients are dropped, not zeroed, so
+  momentum and weight decay leave them alone. Activation memory is one slice.
+  `B=1` is the Huginn variant: whole stack, single pass, no BPTT over loops.
+- **Noise:** EDM VE, `log σ ~ N(-1.2, 1.2²)` on `[0.002, 80]`, equi-probability block edges,
+  overlap γ=0.1. σ is sampled per sequence inside the chosen block.
+- **Denoiser:** position *i* gets clean token *i* plus `noise_in(c_in · z)`, where `z` is
+  the L2-normalized embedding of token *i+1* plus σ noise. Causal attention sees only clean
+  context ≤ *i*; the clean target first shows up at *i+1*. AdaRMS conditions on σ.
+  This is a single-stream stand-in for the paper's clean|noisy concatenation mask, which
+  PaTH/Infini don't support. Past positions also carry their own noisy targets, so
+  sampling re-noises them at the current σ to match training.
+- **Loss:** `w(σ) · CE(next token)`, with `w(σ) = (σ² + σ_data²)/(σ·σ_data)²`.
+- **Constraints:** Engram forced off; MTP is AR-only (the CLI zeroes it).
 
 ```bash
-python3 mlx_train.py --train-mode dblock --dblock-blocks 1 --mtp-depth 0
+python3 mlx_train.py                       # DiffusionBlocks, B=4
+python3 mlx_train.py --dblock-blocks 1     # Huginn single-pass
+python3 mlx_train.py --train-mode ar       # end-to-end AR
 ```
 
 ### MLX activation checkpointing
@@ -658,8 +670,9 @@ python3 -m py_compile path/to/file.py
   parameters, preferably the full 1B configuration. Smaller shapes are smoke tests only.
 - BitNet and BLT paths intentionally separate; features added to one not auto-mirrored in other.
   Native fp8-e4m3 activations are MLX BitNet only; BLT activations stay full precision.
-- `--train-mode dblock` eval is denoise-CE, not AR perplexity; generate is full-window
-  Euler, not token-by-token decode.
+- `--train-mode dblock` eval is per-block next-token denoise-CE, not AR perplexity
+  (paper §5.4: not ELBO-derived). Logged train `loss` is EDM-weighted, so it spikes on
+  rare low-σ samples; compare runs on `val_denoise_ce`.
 
 ## Notes
 
