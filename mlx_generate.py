@@ -124,6 +124,7 @@ def dblock_greedy_generate(
     hidden_size = model.config.hidden_size
     if model.config.dblock_blocks > 1:
         return _dblock_cached_generate(model, prompt, max_new_tokens, eos_token_id, sigmas, valid_vocab_size)
+    table = model.dblock_denoise_table()
     out = list(prompt)
     for _ in range(max_new_tokens):
         context = mx.array([out], dtype=mx.int32)
@@ -143,7 +144,7 @@ def dblock_greedy_generate(
             logits = model.logits_from(hidden[:, -1:])
             if index + 1 < len(sigmas):
                 # VE Euler (paper Eq. 5): z ← z + (σ' − σ)/σ · (z − D).
-                denoised = model.dblock_denoised(logits)
+                denoised = model.dblock_denoised(logits, table)
                 z = z + (sigmas[index + 1] - sigma) / sigma * (z - denoised)
             mx.eval(z, logits)
         token = int(_generation_argmax(logits, valid_vocab_size)[0, -1].item())
@@ -164,14 +165,18 @@ def _dblock_cached_generate(
     schedule = model.config.noise_schedule()
     evals = [(sigma, mx.array([sigma], dtype=mx.float32), schedule.block_for_sigma(sigma)) for sigma in sigmas]
     caches = [model.new_dblock_cache(block) for _, _, block in evals]
+    conds = [model.dblock_decode_cond(sigma, block) for _, sigma, block in evals]
+    table = model.dblock_denoise_table()
 
     def commit(context: list[int], targets: list[int]) -> None:
         # Positions with known next tokens: clean token i + noisy target i + 1.
         tokens = mx.array([context], dtype=mx.int32)
         clean = model.dblock_clean_embeddings(mx.array([targets], dtype=mx.int32)).astype(mx.float32)
-        for (value, sigma, block), cache in zip(evals, caches):
+        for (value, sigma, block), cache, cond in zip(evals, caches, conds):
             noisy = clean + value * mx.random.normal(clean.shape)
-            model.dblock_decode(noisy, sigma, tokens, cache, block_id=block)
+            model.dblock_decode(noisy, sigma, tokens, cache, block_id=block, cond=cond)
+            # Start the GPU on each block while Python builds the next (~12 ms of graph per token).
+            mx.async_eval(cache.arrays())
 
     out = list(prompt)
     if len(out) > 1:
@@ -180,11 +185,13 @@ def _dblock_cached_generate(
     for _ in range(max_new_tokens):
         last = mx.array([out[-1:]], dtype=mx.int32)
         z = sigmas[0] * mx.random.normal((1, 1, hidden_size))
-        for index, ((value, sigma, block), cache) in enumerate(zip(evals, caches)):
+        for index, ((value, sigma, block), cache, cond) in enumerate(zip(evals, caches, conds)):
             # Query on a clone: the query position is committed only once its token is known.
-            logits = model.logits_from(model.dblock_decode(z, sigma, last, cache.clone(), block_id=block))
+            hidden = model.dblock_decode(z, sigma, last, cache.clone(), block_id=block, cond=cond)
+            logits = model.logits_from(hidden)
             if index + 1 < len(evals):
-                z = z + (sigmas[index + 1] - value) / value * (z - model.dblock_denoised(logits))
+                z = z + (sigmas[index + 1] - value) / value * (z - model.dblock_denoised(logits, table))
+                mx.async_eval(z)
         token = int(_generation_argmax(logits, valid_vocab_size)[0, -1].item())
         out.append(token)
         if eos_token_id is not None and token == eos_token_id:

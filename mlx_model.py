@@ -544,7 +544,9 @@ class MLXHBitLinear(nn.Module):
         self,
         x: mx.array,
         *,
-        norm: nn.RMSNorm | None = None,
+        norm_weight: mx.array | None = None,
+        norm_eps: float = 0.0,
+        norm_bias: mx.array | None = None,
         epilogue: str | None = None,
     ) -> mx.array | None:
         """Single-token projection as one kernel: [RMSNorm] + Hadamard + fp8 + GEMV
@@ -564,8 +566,9 @@ class MLXHBitLinear(nn.Module):
             group_size=int(group_size),
             prepare=True,
             hadamard=self.uses_hadamard,
-            norm_weight=None if norm is None else norm.weight,
-            norm_eps=0.0 if norm is None else norm.eps,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            norm_bias=norm_bias,
             epilogue=epilogue,
         )
 
@@ -2136,11 +2139,32 @@ class MLXHybridBlock(nn.Module):
             else None
         )
 
-    def _attn_norm(self, x: mx.array, cond: mx.array | None) -> mx.array:
+    def _attn_norm(self, x: mx.array, cond: "mx.array | FoldedAda | None") -> mx.array:
+        if isinstance(cond, FoldedAda):
+            return mx.fast.rms_norm(x, cond.attn_weight, self.attn_norm.eps) + cond.attn_shift
         return apply_ada(self.attn_norm(x), self.ada_attn, cond)
 
-    def _mlp_norm(self, x: mx.array, cond: mx.array | None) -> mx.array:
+    def _mlp_norm(self, x: mx.array, cond: "mx.array | FoldedAda | None") -> mx.array:
+        if isinstance(cond, FoldedAda):
+            return mx.fast.rms_norm(x, cond.mlp_weight, self.mlp_norm.eps) + cond.mlp_shift
         return apply_ada(self.mlp_norm(x), self.ada_mlp, cond)
+
+    def fold_ada(self, cond: mx.array) -> "mx.array | FoldedAda":
+        """Decode at one fixed σ: AdaRMS ``norm(x)·(1+s)+t`` becomes an RMSNorm with
+        weight ``g·(1+s)`` plus shift ``t``, computed once instead of per call.
+        Returns ``cond`` unchanged unless both norms are AdaRMS-conditioned RMSNorms."""
+        norms = (self.attn_norm, self.mlp_norm)
+        if self.ada_attn is None or self.ada_mlp is None or not all(isinstance(n, nn.RMSNorm) for n in norms):
+            return cond
+        if cond.size != cond.shape[-1]:
+            raise ValueError("fold_ada takes one σ's cond")
+
+        def fold(norm: nn.RMSNorm, ada: MLXAdaRMS) -> tuple[mx.array, mx.array]:
+            dtype = norm.weight.dtype
+            scale, shift = mx.split(ada.proj(cond.astype(dtype)).reshape(-1).astype(mx.float32), 2)
+            return (norm.weight.astype(mx.float32) * (1.0 + scale)).astype(dtype), shift.astype(dtype)
+
+        return FoldedAda(*fold(self.attn_norm, self.ada_attn), *fold(self.mlp_norm, self.ada_mlp))
 
     def _dense_mlp(self, x: mx.array) -> mx.array:
         # Keep per-linear FP8 preparation; the fused FFN kernel omits it.
@@ -2151,14 +2175,20 @@ class MLXHybridBlock(nn.Module):
     def _norm_mlp(self, x: mx.array, cond: mx.array | None = None, checkpoint_activations: bool = False) -> mx.array:
         """mlp(mlp_norm(x)). A decode token runs three kernels: RMSNorm + up + swiglu,
         mid + silu, down."""
+        folded = isinstance(cond, FoldedAda)
         if (
-            cond is None
+            (folded or (cond is None and self.ada_mlp is None))
             and self.moe is None
-            and self.ada_mlp is None
             and isinstance(self.mlp_norm, nn.RMSNorm)
             and all(layer.can_fuse_decode(x) for layer in (self.up, self.mid, self.down))
         ):
-            hidden_act = self.up.fused_decode(x, norm=self.mlp_norm, epilogue="swiglu")
+            hidden_act = self.up.fused_decode(
+                x,
+                norm_weight=cond.mlp_weight if folded else self.mlp_norm.weight,
+                norm_eps=self.mlp_norm.eps,
+                norm_bias=cond.mlp_shift if folded else None,
+                epilogue="swiglu",
+            )
             hidden_act = self.mid.fused_decode(hidden_act, epilogue="silu")
             return self.down.fused_decode(hidden_act)
         return self._mlp(self._mlp_norm(x, cond), checkpoint_activations)
@@ -2413,6 +2443,16 @@ class MLXHybridBlock(nn.Module):
             checkpoint_activations,
             cond=cond,
         )
+
+
+@dataclass
+class FoldedAda:
+    """One block's AdaRMS at a fixed σ, folded into its two RMSNorms (``fold_ada``)."""
+
+    attn_weight: mx.array
+    attn_shift: mx.array
+    mlp_weight: mx.array
+    mlp_shift: mx.array
 
 
 @dataclass
@@ -3078,9 +3118,11 @@ class MLXBitNet(nn.Module):
     ) -> mx.array:
         if not blocks:
             return seed
+        # ``cond`` is one array for every block, or one entry per block (fold_ada).
+        conds = cond if isinstance(cond, list) else [cond] * len(blocks)
         if not self._kimi_mode:
             x = seed
-            for block, cache, upd in zip(blocks, caches, update_flags):
+            for block, cache, upd, cond in zip(blocks, caches, update_flags, conds):
                 if mode == "incremental":
                     x = block.incremental(x, tokens, token_history, cache, upd, cond)
                 elif mode == "extend":
@@ -3089,7 +3131,7 @@ class MLXBitNet(nn.Module):
                     x = block.prefill(x, tokens, cache, upd, cond)
             return x
         stream = self._new_attn_stream(seed)
-        for block, cache, upd in zip(blocks, caches, update_flags):
+        for block, cache, upd, cond in zip(blocks, caches, update_flags, conds):
             stream = block.step_kimi_stream(stream, tokens, token_history, cache, upd, mode, cond)
         return stream.hidden()
 
@@ -3238,6 +3280,12 @@ class MLXBitNet(nn.Module):
             weight_cache={},
         )
 
+    def dblock_decode_cond(self, sigma: mx.array, block_id: int) -> list:
+        """Per-layer AdaRMS of one block slice at a fixed σ, folded for decode."""
+        start, end = self.config.dblock_layer_ranges()[block_id]
+        cond = self.sigma_embed(sigma)
+        return [block.fold_ada(cond) for block in self.blocks[start:end]]
+
     def dblock_decode(
         self,
         z: mx.array,
@@ -3246,14 +3294,17 @@ class MLXBitNet(nn.Module):
         cache: MLXInferenceCache,
         *,
         block_id: int,
+        cond: list | None = None,
     ) -> mx.array:
         """``dblock_forward_from_z`` for new positions only, advancing ``cache``.
 
         Equals the full-prefix forward over every position the cache has seen
         (same z per position) for this block slice; ``cache`` from ``new_dblock_cache``.
+        ``cond``: ``dblock_decode_cond(sigma, block_id)``, reused across calls at this σ.
         """
         start, end = self.config.dblock_layer_ranges()[block_id]
-        inputs, cond = self._dblock_inputs(z, sigma, tokens)
+        inputs, raw_cond = self._dblock_inputs(z, sigma, tokens)
+        cond = raw_cond if cond is None else cond
         length = tokens.shape[1]
         mode = "prefill" if cache.position == 0 else "incremental" if length == 1 else "extend"
         with self._inference_weight_context(cache):
@@ -3350,10 +3401,15 @@ class MLXBitNet(nn.Module):
         )
         return self.logits_from(hidden)
 
-    def dblock_denoised(self, logits: mx.array) -> mx.array:
+    def dblock_denoise_table(self) -> mx.array:
+        """``Êᵀ`` (D, V): L2-normalized fp32 embedding rows, stored transposed (the
+        1×V @ V×D GEMV runs ~1.6× faster on contiguous V rows). Build once per generation."""
+        return mx.contiguous(_safe_normalize(self.embedding.weight.astype(mx.float32), axis=-1).T)
+
+    def dblock_denoised(self, logits: mx.array, table: mx.array | None = None) -> mx.array:
         """Euler ``D``: expected clean embedding ``softmax(logits) @ Ê`` (official sampler)."""
         probs = mx.softmax(logits.astype(mx.float32), axis=-1)
-        return probs @ _safe_normalize(self.embedding.weight.astype(mx.float32), axis=-1)
+        return probs @ (self.dblock_denoise_table() if table is None else table).T
 
     def __call__(
         self,

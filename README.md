@@ -242,8 +242,9 @@ at σ_max noise and runs equi-probability σ evals down to σ_min (B>1: one per 
 T=B; B=1: `--dblock-euler-steps`, paper 50, independent of `--num-loops`), conditioned on
 the clean prefix. B>1 keeps one PaTH cache per block: a past position's noise is drawn
 once, when its token is committed, so each token runs B one-position queries plus B
-one-position commits (1B, window 64: 47 ms/token flat vs 162/353 ms at a 64/256 prompt
-re-running the prefix). B=1 still re-runs the prefix per eval. `--dblock-infer loops`
+one-position commits. Per-σ AdaRMS is folded into the RMSNorm weights (plus a shift the
+fused MLP kernel adds), and each block's graph goes to the GPU while the next is built.
+1B, window 64: ~29 ms/token flat vs 162/353 ms at a 64/256 prompt re-running the prefix. B=1 still re-runs the prefix per eval. `--dblock-infer loops`
 is a B=1 debug unroll of Huginn R.
 
 ### MLX quantization

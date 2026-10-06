@@ -285,29 +285,55 @@ def test_dblock_generate_is_autoregressive_one_block_per_eval(monkeypatch) -> No
     assert calls[4][3] == pytest.approx(80.0) and calls[7][3] == pytest.approx(0.002)
 
 
+@pytest.mark.parametrize("folded", [False, True])
 @pytest.mark.parametrize("attn_res_mode", ["kimi", "sandwich"])
-def test_dblock_cached_decode_matches_full_prefix(attn_res_mode: str) -> None:
-    """Cached per-block decode == full-prefix denoiser forward with the same z."""
+def test_dblock_cached_decode_matches_full_prefix(attn_res_mode: str, folded: bool, monkeypatch) -> None:
+    """Cached per-block decode == full-prefix denoiser forward with the same z.
+
+    folded: AdaRMS folded per σ (``dblock_decode_cond``) and packed pins, so the
+    MLP runs the fused norm+bias kernels as in generate."""
+    import mlx_model
+
+    biased = []
+    original = mlx_model.ternary_fused_linear_m1
+    monkeypatch.setattr(
+        mlx_model,
+        "ternary_fused_linear_m1",
+        lambda *a, **k: biased.append(k.get("norm_bias") is not None) or original(*a, **k),
+    )
     mx.random.seed(7)
-    model = MLXBitNet(_dblock_config(dblock_blocks=2, attn_res_mode=attn_res_mode))
+    config = _dblock_config(
+        dblock_blocks=2, attn_res_mode=attn_res_mode, hidden_size=64, num_attention_heads=2, intermediate_size=128
+    )
+    model = MLXBitNet(config)
+    for block in model.blocks:  # non-zero AdaRMS (zero-init is the identity)
+        for ada in (block.ada_attn, block.ada_mlp):
+            ada.proj.weight = mx.random.normal(ada.proj.weight.shape) * 0.1
+            ada.proj.bias = mx.random.normal(ada.proj.bias.shape) * 0.1
     mx.eval(model.parameters())
     model.set_inference_block_width(4)  # train chunks = decode windows, as generate pins
+    if folded:
+        model.recurrent_quantized_matmul = True
+        model.pin_inference_weights(mx.float32, prefer_packed=True)
     tokens = mx.random.randint(0, 32, (1, 11))
     length = tokens.shape[1]
     for block_id, value in enumerate((3.0, 0.05)):
         sigma = mx.array([value])
+        cond = model.dblock_decode_cond(sigma, block_id) if folded else None
         clean = model.dblock_clean_embeddings(tokens[:, 1:])
-        z = mx.concatenate([clean + value * mx.random.normal(clean.shape), mx.random.normal((1, 1, 16))], axis=1)
+        noise = mx.random.normal(clean.shape)
+        z = mx.concatenate([clean + value * noise, mx.random.normal((1, 1, config.hidden_size))], axis=1)
         expected = model.dblock_forward_from_z(z, sigma, tokens, block_id=block_id)
         cache = model.new_dblock_cache(block_id)
         # prefill 3, extend 2, then one at a time: crosses the width-4 chunk edges.
         pieces = [(0, 3), (3, 5)] + [(i, i + 1) for i in range(5, length - 1)]
         for lo, hi in pieces:
-            got = model.dblock_decode(z[:, lo:hi], sigma, tokens[:, lo:hi], cache, block_id=block_id)
+            got = model.dblock_decode(z[:, lo:hi], sigma, tokens[:, lo:hi], cache, block_id=block_id, cond=cond)
             assert mx.allclose(got, expected[:, lo:hi], atol=1e-4).item(), (block_id, lo)
         for _ in range(2):  # queries on clones leave the cache alone
-            got = model.dblock_decode(z[:, -1:], sigma, tokens[:, -1:], cache.clone(), block_id=block_id)
+            got = model.dblock_decode(z[:, -1:], sigma, tokens[:, -1:], cache.clone(), block_id=block_id, cond=cond)
             assert mx.allclose(got, expected[:, -1:], atol=1e-4).item(), block_id
+    assert any(biased) == folded  # folded decode runs the fused norm+shift MLP kernel
 
 
 @pytest.mark.parametrize("infer", ["euler", "loops"])

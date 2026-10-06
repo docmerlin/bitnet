@@ -1108,21 +1108,23 @@ def test_ternary_fused_linear_m1_prepare_matches_hbitlinear_prep(in_dim: int, ou
 
 
 @pytest.mark.parametrize("epilogue", [None, "silu", "swiglu"])
-@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("norm", [False, True, "bias"])  # bias: folded AdaRMS shift
 @pytest.mark.parametrize("dtype,tol", [(mx.float32, 1e-5), (mx.bfloat16, 5e-3)])
-def test_ternary_fused_linear_m1_norm_and_epilogues(norm: bool, epilogue, dtype, tol: float) -> None:
+def test_ternary_fused_linear_m1_norm_and_epilogues(norm, epilogue, dtype, tol: float) -> None:
     from mlx_ternary_kernel import pack_ternary_weight, ternary_effective_weight, ternary_fused_linear_m1
 
     mx.random.seed(3)
     in_dim, out_dim = 1024, 4096  # the 1B up projection
     weight = mx.random.normal((out_dim, in_dim))
     norm_weight = mx.random.uniform(0.5, 1.5, (in_dim,)).astype(dtype)
+    norm_bias = (mx.random.normal((in_dim,)) * 0.5).astype(dtype) if norm == "bias" else None
     x = (mx.random.normal((1, 1, in_dim)) * 3).astype(dtype)
     packed, scales, group_size = pack_ternary_weight(weight)
 
     # fp32 reference with the same rounding points as the kernel (MLX's bf16 rms_norm
     # rounds an intermediate and lands ~1.2e-2 off this; the kernel ~2.6e-3).
-    h = mx.fast.rms_norm(x.astype(mx.float32), norm_weight.astype(mx.float32), 1e-5).astype(dtype) if norm else x
+    h = mx.fast.rms_norm(x.astype(mx.float32), norm_weight.astype(mx.float32), 1e-5) if norm else x
+    h = (h + norm_bias.astype(mx.float32) if norm_bias is not None else h).astype(dtype)
     h = mx.hadamard_transform(h.astype(mx.float32)).astype(dtype)
     h = mx.from_fp8(mx.to_fp8(h), dtype).astype(mx.float32)
     y = h @ ternary_effective_weight(weight).T
@@ -1135,7 +1137,7 @@ def test_ternary_fused_linear_m1_norm_and_epilogues(norm: bool, epilogue, dtype,
     actual = ternary_fused_linear_m1(
         x, packed, scales, in_dim=in_dim, out_dim=out_dim, group_size=group_size,
         prepare=True, hadamard=True, norm_weight=norm_weight if norm else None, norm_eps=1e-5,
-        epilogue=epilogue,
+        norm_bias=norm_bias, epilogue=epilogue,
     )
     mx.eval(y, actual)
     assert actual.shape == y.shape and actual.dtype == dtype

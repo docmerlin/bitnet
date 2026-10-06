@@ -152,7 +152,7 @@ inline float fp8_e4m3_roundtrip(float f) {
 
 _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
     name="ternary_fused_linear_m1",
-    input_names=["x", "packed", "scales", "norm_weight", "norm_eps"],
+    input_names=["x", "packed", "scales", "norm_weight", "norm_bias", "norm_eps"],
     output_names=["y"],
     header=_M1_HEADER,
     source=r"""
@@ -213,7 +213,11 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
                 float inv = rsqrt(total / float(IN_DIM) + norm_eps[0]);
                 for (uint k = 0; k < EPT; ++k) {
                     uint i = tid * EPT + k;
-                    v[k] = i < IN_DIM ? float(XT(v[k] * inv * float(norm_weight[i]))) : 0.0f;
+                    float y = i < IN_DIM ? v[k] * inv * float(norm_weight[i]) : 0.0f;
+                    if (NORM_BIAS && i < IN_DIM) {
+                        y += float(norm_bias[i]);  // folded AdaRMS shift
+                    }
+                    v[k] = float(XT(y));
                 }
             }
             if (HADAMARD) {
@@ -332,15 +336,16 @@ def _compiled_m1(
     prepare: bool,
     hadamard: bool,
     norm: bool,
+    norm_bias: bool,
     epilogue: int,
 ):
     outputs = out_dim // 2 if epilogue == 2 else out_dim
     units_per_tg = (_M1_ROWS // 2 if epilogue == 2 else _M1_ROWS) * _M1_SIMDGROUPS
     threadgroups = (outputs + units_per_tg - 1) // units_per_tg
 
-    def dispatch(x, packed, scales, norm_weight, norm_eps):
+    def dispatch(x, packed, scales, norm_weight, bias_weight, norm_eps):
         return _TERNARY_FUSED_M1(
-            inputs=[x, packed, scales, norm_weight, norm_eps],
+            inputs=[x, packed, scales, norm_weight, bias_weight, norm_eps],
             template=[
                 ("T", dtype),
                 ("XT", x_dtype),
@@ -352,6 +357,7 @@ def _compiled_m1(
                 ("PREP", prepare),
                 ("HADAMARD", hadamard),
                 ("NORM", norm),
+                ("NORM_BIAS", norm_bias),
                 ("EPILOGUE", epilogue),
             ],
             grid=(threadgroups * 32 * _M1_SIMDGROUPS, 1, 1),
@@ -376,6 +382,7 @@ def ternary_fused_linear_m1(
     hadamard: bool = False,
     norm_weight: mx.array | None = None,
     norm_eps: float = 0.0,
+    norm_bias: mx.array | None = None,
     epilogue: str | None = None,
 ) -> mx.array:
     """Fused decode linear for a single token (M=1): ternary GEMV.
@@ -386,7 +393,8 @@ def ternary_fused_linear_m1(
     ``prepare=True`` takes raw activations and applies MLXHBitLinear's input prep in
     the kernel: Hadamard (if ``hadamard``, in_dim a power of two) then the fp8-e4m3
     round trip. Inference only: the kernel has no VJP, so no STE is needed.
-    ``norm_weight`` adds an RMSNorm (weight, ``norm_eps``) before that prep.
+    ``norm_weight`` adds an RMSNorm (weight, ``norm_eps``) before that prep;
+    ``norm_bias`` is added to its output before rounding (folded AdaRMS shift).
     ``epilogue``: ``"silu"`` applies silu to the output; ``"swiglu"`` returns
     ``silu(y[:P]) * y[P:]`` with ``P = out_dim // 2``.
     """
@@ -404,12 +412,24 @@ def ternary_fused_linear_m1(
         raise ValueError("hadamard requires prepare=True and a power-of-two in_dim")
     if norm_weight is not None and not prepare:
         raise ValueError("norm_weight requires prepare=True")
+    if norm_bias is not None and norm_weight is None:
+        raise ValueError("norm_bias requires norm_weight")
     if epilogue == "swiglu" and out_dim % 2:
         raise ValueError("swiglu epilogue requires an even out_dim")
     norm = norm_weight is not None
-    kernel = _compiled_m1(in_dim, out_dim, group_size, x.dtype, dtype, prepare, hadamard, norm, _EPILOGUES[epilogue])
+    bias = norm_bias is not None
+    kernel = _compiled_m1(
+        in_dim, out_dim, group_size, x.dtype, dtype, prepare, hadamard, norm, bias, _EPILOGUES[epilogue]
+    )
     # Unused inputs still need an array in their slot.
-    y = kernel(flat, packed, scales, norm_weight if norm else scales, _scalar(norm_eps))
+    y = kernel(
+        flat,
+        packed,
+        scales,
+        norm_weight if norm else scales,
+        norm_bias if bias else scales,
+        _scalar(norm_eps),
+    )
     outputs = out_dim // 2 if epilogue == "swiglu" else out_dim
     # Restore leading singleton dims of x (e.g. (1,1,H) -> (1,1,out))
     return y.reshape(*orig_shape[:-1], outputs)
