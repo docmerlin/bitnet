@@ -15,48 +15,61 @@ import mlx.core as mx
 # step, which callers (and tests) may patch mx.compile to control.
 _compile_dispatch = mx.compile
 
-_DEPTH_MIX_THREADS = 256
-
 # Kimi AttnRes depth mix for one token: h = softmax_j(w . RMSNorm(v_j)) . v over the
 # N completed blocks plus the partial block. RMSNorm folds into the logit:
 # w . (v * r * g) == r * (v . (g * w)) with r = rsqrt(mean(v^2) + eps).
+# Decode is latency-bound: one thread per hidden element loads its slice of every
+# block at once (no serial load chains) and keeps it in registers for the mix.
 _DEPTH_MIX = mx.fast.metal_kernel(
     name="depth_attn_mix_m1",
     input_names=["completed", "partial", "norm_weight", "proj_weight", "eps"],
     output_names=["y"],
     source=r"""
+        constexpr uint EPT = (D + THREADS - 1) / THREADS;
+        constexpr uint SIMDGROUPS = THREADS / 32;
         uint t = thread_position_in_threadgroup.x;
         uint lane = thread_index_in_simdgroup;
         uint sg = simdgroup_index_in_threadgroup;
-        threadgroup float red[2 * (THREADS / 32)];
+        threadgroup float red[SIMDGROUPS][2 * (N + 1)];
         threadgroup float logits[N + 1];
 
+        float v[N + 1][EPT];
+        float ss[N + 1];
+        float dot[N + 1];
         for (uint j = 0; j <= N; ++j) {
-            float ss = 0.0f;
-            float dot = 0.0f;
-            for (uint d = t; d < D; d += THREADS) {
-                float v = j < N ? float(completed[j * D + d]) : float(partial[d]);
-                ss += v * v;
-                dot += v * float(norm_weight[d]) * float(proj_weight[d]);
-            }
-            ss = simd_sum(ss);
-            dot = simd_sum(dot);
-            if (lane == 0) {
-                red[2 * sg] = ss;
-                red[2 * sg + 1] = dot;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (t == 0) {
-                float total_ss = 0.0f;
-                float total_dot = 0.0f;
-                for (uint s = 0; s < THREADS / 32; ++s) {
-                    total_ss += red[2 * s];
-                    total_dot += red[2 * s + 1];
-                }
-                logits[j] = rsqrt(total_ss / float(D) + eps[0]) * total_dot;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ss[j] = 0.0f;
+            dot[j] = 0.0f;
         }
+        for (uint e = 0; e < EPT; ++e) {
+            uint d = t + e * THREADS;
+            bool in = d < D;
+            float gw = in ? float(norm_weight[d]) * float(proj_weight[d]) : 0.0f;
+            for (uint j = 0; j <= N; ++j) {
+                float x = !in ? 0.0f : (j < N ? float(completed[j * D + d]) : float(partial[d]));
+                v[j][e] = x;
+                ss[j] += x * x;
+                dot[j] += x * gw;
+            }
+        }
+        for (uint j = 0; j <= N; ++j) {
+            float a = simd_sum(ss[j]);
+            float c = simd_sum(dot[j]);
+            if (lane == 0) {
+                red[sg][2 * j] = a;
+                red[sg][2 * j + 1] = c;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t <= N) {
+            float a = 0.0f;
+            float c = 0.0f;
+            for (uint s = 0; s < SIMDGROUPS; ++s) {
+                a += red[s][2 * t];
+                c += red[s][2 * t + 1];
+            }
+            logits[t] = rsqrt(a / float(D) + eps[0]) * c;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float m = logits[0];
         for (uint j = 1; j <= N; ++j) {
@@ -68,13 +81,15 @@ _DEPTH_MIX = mx.fast.metal_kernel(
             p[j] = exp(logits[j] - m);
             z += p[j];
         }
-        for (uint d = t; d < D; d += THREADS) {
-            float acc = 0.0f;
-            for (uint j = 0; j <= N; ++j) {
-                float v = j < N ? float(completed[j * D + d]) : float(partial[d]);
-                acc += p[j] * v;
+        for (uint e = 0; e < EPT; ++e) {
+            uint d = t + e * THREADS;
+            if (d < D) {
+                float acc = 0.0f;
+                for (uint j = 0; j <= N; ++j) {
+                    acc += p[j] * v[j][e];
+                }
+                y[d] = T(acc / z);
             }
-            y[d] = T(acc / z);
         }
     """,
 )
@@ -82,12 +97,13 @@ _DEPTH_MIX = mx.fast.metal_kernel(
 
 @lru_cache(maxsize=None)
 def _compiled_depth_mix(n: int, d: int, dtype):
+    threads = min(1024, (d + 31) // 32 * 32)
     def dispatch(completed, partial, norm_weight, proj_weight, eps):
         return _DEPTH_MIX(
             inputs=[completed, partial, norm_weight, proj_weight, eps],
-            template=[("T", dtype), ("N", n), ("D", d), ("THREADS", _DEPTH_MIX_THREADS)],
-            grid=(_DEPTH_MIX_THREADS, 1, 1),
-            threadgroup=(_DEPTH_MIX_THREADS, 1, 1),
+            template=[("T", dtype), ("N", n), ("D", d), ("THREADS", threads)],
+            grid=(threads, 1, 1),
+            threadgroup=(threads, 1, 1),
             output_shapes=[(d,)],
             output_dtypes=[dtype],
         )[0]

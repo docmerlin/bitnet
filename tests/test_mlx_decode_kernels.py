@@ -4,17 +4,18 @@ import pytest
 from mlx_model import MLXBitNetConfig, MLXDepthAttnMix
 
 
+@pytest.mark.parametrize("dim", [1024, 2048])  # 2048: two elements per thread
 @pytest.mark.parametrize("n_completed", [1, 3, 8])
 @pytest.mark.parametrize("dtype,tol", [(mx.float32, 1e-5), (mx.bfloat16, 5e-3)])
-def test_depth_attn_mix_m1_matches_reference(n_completed: int, dtype, tol: float) -> None:
+def test_depth_attn_mix_m1_matches_reference(dim: int, n_completed: int, dtype, tol: float) -> None:
     mx.random.seed(0)
-    mix = MLXDepthAttnMix(1024, config=MLXBitNetConfig())
+    mix = MLXDepthAttnMix(dim, config=MLXBitNetConfig())
     # Non-trivial norm/proj weights so the softmax is not uniform.
-    mix.norm.weight = mx.random.uniform(0.5, 1.5, (1024,))
-    mix.proj.weight = mx.random.normal((1, 1024)) * 0.2
+    mix.norm.weight = mx.random.uniform(0.5, 1.5, (dim,))
+    mix.proj.weight = mx.random.normal((1, dim)) * 0.2
     mix.set_dtype(dtype)
-    completed = [(mx.random.normal((1, 1, 1024)) * (j + 1)).astype(dtype) for j in range(n_completed)]
-    partial = mx.random.normal((1, 1, 1024)).astype(dtype)
+    completed = [(mx.random.normal((1, 1, dim)) * (j + 1)).astype(dtype) for j in range(n_completed)]
+    partial = mx.random.normal((1, 1, dim)).astype(dtype)
     stacked = mx.concatenate([c.reshape(1, -1) for c in completed], axis=0)
 
     actual = mix(completed, partial, stacked)
