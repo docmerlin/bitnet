@@ -64,16 +64,21 @@ def test_path_decode_step_m1_matches_op_by_op(feature_map: str, hidden: int, hea
         mx.eval(actual, expected, *fused_cache.arrays(), *reference_cache.arrays())
         rel = (mx.abs(actual - expected).max() / mx.abs(expected).max()).item()
         assert rel < tol, (step, rel)
+        # The kernel builds the token's cache entries from the raw projections in
+        # fp32; the op chain rounds intermediates (e.g. path_beta's output, which
+        # seeds T) to the activation dtype.
+        cache_tol = 1e-5 if dtype == mx.float32 else 2e-2
         if reference_cache.t_inverse is not None:
-            assert mx.allclose(fused_cache.t_inverse, reference_cache.t_inverse, rtol=1e-4, atol=1e-5).item(), step
-        # The kernel appends to the open-chunk caches itself: plain copies, so exact.
+            assert mx.allclose(
+                fused_cache.t_inverse, reference_cache.t_inverse, rtol=max(cache_tol, 1e-4), atol=cache_tol
+            ).item(), step
         assert fused_cache.open_len == reference_cache.open_len, step
-        for name in ("q", "k", "v", "w", "beta", "log_forget"):
+        for name in ("q", "k", "v", "w", "beta", "log_forget", "path_projected"):
             got, want = getattr(fused_cache, name), getattr(reference_cache, name)
             assert (got is None) == (want is None), (step, name)
             if want is not None:
                 assert got.shape == want.shape and got.dtype == want.dtype, (step, name)
-                assert mx.array_equal(got, want).item(), (step, name)
+                assert mx.allclose(got, want, rtol=cache_tol, atol=cache_tol).item(), (step, name)
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -132,3 +137,32 @@ def test_fused_decode_matches_dense_decode(compiled: bool, monkeypatch) -> None:
     assert {(True, "swiglu"), (False, "silu"), (False, None)} <= variants, variants
     if compiled:
         assert fused._compiled_inference_step is not None, "compiled step fell back to eager"
+
+
+@pytest.mark.parametrize("hidden,heads", [(128, 2), (128, 4)])
+def test_path_decode_step_m1_long_chunk(hidden: int, heads: int) -> None:
+    """Window 80 > the 64-row suffix tile (head_dim 64) and > one simdgroup of rows."""
+    from mlx.utils import tree_flatten
+
+    from mlx_model import MLXPaTHAttention
+
+    config = MLXBitNetConfig(hidden_size=hidden, num_attention_heads=heads, path_window_size=80, use_engram=False)
+    mx.random.seed(1)
+    fused = MLXPaTHAttention(config)
+    fused.memory_gate = mx.random.normal((heads,))
+    reference = MLXPaTHAttention(config)
+    reference.load_weights(list(tree_flatten(fused.parameters())))
+    reference.fused_decode = False
+    fused_cache, reference_cache = fused.new_inference_cache(1), reference.new_inference_cache(1)
+    for step in range(85):  # fills one chunk past both tile edges, then starts the next
+        x = mx.random.normal((1, 1, hidden))
+        actual = fused.incremental(x, fused_cache, True)
+        expected = reference.incremental(x, reference_cache, True)
+        mx.eval(actual, expected)
+        # The attention state agrees to ~1e-7; the output goes through `out`, whose
+        # fp8 input rounding turns that into an occasional one-step flip (~3e-4).
+        rel = (mx.abs(actual - expected).max() / mx.abs(expected).max()).item()
+        assert rel < 1e-3, (step, rel)
+        if reference_cache.t_inverse is not None:
+            t_rel = mx.abs(fused_cache.t_inverse - reference_cache.t_inverse).max() / mx.abs(reference_cache.t_inverse).max()
+            assert t_rel.item() < 1e-5, (step, t_rel.item())

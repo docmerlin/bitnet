@@ -14,7 +14,12 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import checkpoint as activation_checkpoint
 
-from mlx_decode_kernels import PATH_DECODE_MAX_WIDTH, depth_attn_mix_m1, path_decode_step_m1
+from mlx_decode_kernels import (
+    PATH_DECODE_MAX_WIDTH,
+    depth_attn_mix_m1,
+    pack_path_head_weights,
+    path_decode_step_m1,
+)
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
 from mlx_ternary_kernel import (
@@ -1318,6 +1323,31 @@ class MLXPaTHAttention(nn.Module):
         # Keep the source pins to detect a later re-pin of either layer.
         self._merged_projection = (a, b, merged)
 
+    def _head_weight_sources(self) -> tuple[mx.array, ...]:
+        return (
+            self.path_beta.weight,
+            self.path_beta.bias,
+            self.path_forget.weight,
+            self.path_forget.bias,
+            self.memory_gate,
+            self.q_norm.weight,
+            self.k_norm.weight,
+        )
+
+    def pin_decode_head_weights(self) -> None:
+        """Pack the small per-head decode weights once, outside any compile trace."""
+        sources = self._head_weight_sources()
+        packed = pack_path_head_weights(*sources)
+        mx.eval(*packed)
+        self._decode_head_pack = (sources, packed)
+
+    def _decode_head_weights(self) -> tuple[mx.array, mx.array]:
+        pinned = getattr(self, "_decode_head_pack", None)
+        sources = self._head_weight_sources()
+        if pinned is not None and all(a is b for a, b in zip(pinned[0], sources)):
+            return pinned[1]
+        return pack_path_head_weights(*sources)  # unpinned (or weights changed since)
+
     def _qkv_and_path_down(self, x: mx.array) -> tuple[mx.array, mx.array]:
         merged = getattr(self, "_merged_projection", None)
         if (
@@ -1348,7 +1378,7 @@ class MLXPaTHAttention(nn.Module):
             and _path_decode_mode.get() != "recompute"
             and not self.cache_path_products
             and self.memory_dim == self.head_dim
-            and self.head_dim % 32 == 0
+            and self.head_dim in (32, 64, 128, 256)
             and chunk_width <= PATH_DECODE_MAX_WIDTH
             # Continuing a chunk needs its running T (absent only after a mode switch).
             and (cache.q is None or cache.open_len == 0 or cache.t_inverse is not None)
@@ -1362,37 +1392,13 @@ class MLXPaTHAttention(nn.Module):
     ) -> mx.array:
         batch, _, hidden = x.shape
         qkv, path_low = self._qkv_and_path_down(x)
-        qkv = qkv.reshape(batch, 1, 3, self.config.num_attention_heads, self.head_dim)
-        q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
-        k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
-        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
-
         projected = self.path_up(path_low)
-        convolved = projected * self.path_conv_weight[:, 2]
-        if cache.path_projected is not None and cache.path_projected.shape[1] > 0:
-            history = cache.path_projected
-            hist_len = history.shape[1]
-            if hist_len >= 1:
-                convolved = convolved + history[:, hist_len - 1 : hist_len] * self.path_conv_weight[:, 1]
-            if hist_len >= 2:
-                convolved = convolved + history[:, hist_len - 2 : hist_len - 1] * self.path_conv_weight[:, 0]
-            combined = mx.concatenate((history, projected), axis=1)
-            clen = combined.shape[1]
-            cache.path_projected = combined if clen <= 2 else combined[:, clen - 2 : clen]
-        else:
-            cache.path_projected = projected
-        w = nn.silu(convolved.astype(mx.float32)).reshape(
-            batch, 1, self.config.num_attention_heads, self.head_dim
-        )
-        w = _safe_normalize(w)
-        beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
-        forget_logits = self.path_forget(x).astype(mx.float32)
-        log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
-
         chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
         starting = cache.q is None or cache.open_len == 0
         if self._can_fuse_decode(cache, chunk_width):
-            # One kernel appends the token to the open chunk and attends with it.
+            # One kernel builds the token's q/k/v/w/beta/forget from the raw
+            # projections, appends them to the open chunk and attends with it.
+            history = cache.path_projected
             (
                 local,
                 cache.t_inverse,
@@ -1402,20 +1408,49 @@ class MLXPaTHAttention(nn.Module):
                 cache.w,
                 cache.beta,
                 cache.log_forget,
+                cache.path_projected,
             ) = path_decode_step_m1(
-                (q, k, v, w, beta, log_forget),
+                qkv,
+                projected,
+                None if history is None or history.shape[1] == 0 else history,
+                x,
                 None if starting else (cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget),
                 None if starting else cache.t_inverse,
-                cache.memory_m,
-                cache.memory_z,
-                cache.memory_initialized,
-                self.memory_gate,
+                (cache.memory_m, cache.memory_z, cache.memory_initialized),
+                (self.path_conv_weight, *self._decode_head_weights()),
+                heads=self.config.num_attention_heads,
+                norm_eps=self.q_norm.eps,
                 chunk_width=chunk_width,
                 favor=self.config.infini_feature_map == "favor",
             )
             cache.open_len = 1 if starting else cache.open_len + 1
             cache.wk = None
         else:
+            qkv = qkv.reshape(batch, 1, 3, self.config.num_attention_heads, self.head_dim)
+            q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
+            k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
+            v = qkv[:, :, 2].transpose(0, 2, 1, 3)
+
+            convolved = projected * self.path_conv_weight[:, 2]
+            if cache.path_projected is not None and cache.path_projected.shape[1] > 0:
+                history = cache.path_projected
+                hist_len = history.shape[1]
+                if hist_len >= 1:
+                    convolved = convolved + history[:, hist_len - 1 : hist_len] * self.path_conv_weight[:, 1]
+                if hist_len >= 2:
+                    convolved = convolved + history[:, hist_len - 2 : hist_len - 1] * self.path_conv_weight[:, 0]
+                combined = mx.concatenate((history, projected), axis=1)
+                clen = combined.shape[1]
+                cache.path_projected = combined if clen <= 2 else combined[:, clen - 2 : clen]
+            else:
+                cache.path_projected = projected
+            w = nn.silu(convolved.astype(mx.float32)).reshape(
+                batch, 1, self.config.num_attention_heads, self.head_dim
+            )
+            w = _safe_normalize(w)
+            beta = 2.0 * mx.sigmoid(self.path_beta(x).astype(mx.float32))
+            forget_logits = self.path_forget(x).astype(mx.float32)
+            log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
             if starting:
                 cache.q, cache.k, cache.v = q, k, v
                 cache.w, cache.beta, cache.log_forget = w, beta, log_forget
@@ -2511,6 +2546,7 @@ class MLXBitNet(nn.Module):
             for _, module in self.named_modules():
                 if isinstance(module, MLXPaTHAttention):
                     module.pin_merged_projection()
+                    module.pin_decode_head_weights()
         finally:
             _recurrent_quantized_matmul.reset(token)
 
