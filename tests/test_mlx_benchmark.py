@@ -1081,7 +1081,10 @@ def test_ternary_fused_linear_m1_matches_dense_effective(in_dim: int, out_dim: i
 
 
 @pytest.mark.parametrize("hadamard", [False, True])
-@pytest.mark.parametrize("in_dim,out_dim,dtype", [(32, 1024, mx.bfloat16), (1024, 3072, mx.bfloat16), (2048, 1024, mx.float32)])
+@pytest.mark.parametrize(
+    "in_dim,out_dim,dtype",
+    [(32, 1024, mx.bfloat16), (1024, 3072, mx.bfloat16), (2048, 1024, mx.float32), (4096, 512, mx.float32)],
+)
 def test_ternary_fused_linear_m1_prepare_matches_hbitlinear_prep(in_dim: int, out_dim: int, dtype, hadamard: bool) -> None:
     from mlx_ternary_kernel import pack_ternary_weight, ternary_effective_weight, ternary_fused_linear_m1
 

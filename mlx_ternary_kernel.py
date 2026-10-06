@@ -177,18 +177,29 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
         }
 
         // Every threadgroup redoes the prep of x: a few thousand flops, far cheaper
-        // than the separate dispatches it replaces.
+        // than the separate dispatches it replaces. Decode is latency-bound, so the
+        // prep avoids barrier-separated passes: each thread holds EPT consecutive
+        // elements in registers; butterfly stages inside a thread run in registers,
+        // stages inside a simdgroup by simd_shuffle_xor, and the remaining stages
+        // across simdgroups combine at once after one barrier (Walsh signs).
+        // The RMSNorm prologue adds one barrier for its reduction.
+        constexpr uint EPT = (IN_DIM + THREADS - 1) / THREADS;
+        constexpr uint SPAN = 32 * EPT;  // elements per simdgroup
+        constexpr uint XGROUPS = IN_DIM > SPAN ? IN_DIM / SPAN : 1;  // simdgroups spanned
         threadgroup float xs[PREP ? IN_DIM : 1];
         threadgroup float red[SIMDGROUPS];
         if (PREP) {
-            for (uint i = tid; i < IN_DIM; i += THREADS) {
-                xs[i] = float(x[i]);
+            float v[EPT];
+            for (uint k = 0; k < EPT; ++k) {
+                uint i = tid * EPT + k;
+                v[k] = i < IN_DIM ? float(x[i]) : 0.0f;
             }
             if (NORM) {
-                // RMSNorm prologue, as mx.fast.rms_norm: fp32 math, output in XT.
+                // RMSNorm prologue, as mx.fast.rms_norm: fp32 math, output rounded to XT
+                // (the dtype boundary the op-by-op path has before the Hadamard).
                 float ss = 0.0f;
-                for (uint i = tid; i < IN_DIM; i += THREADS) {
-                    ss += xs[i] * xs[i];
+                for (uint k = 0; k < EPT; ++k) {
+                    ss += v[k] * v[k];
                 }
                 ss = simd_sum(ss);
                 if (lane == 0) {
@@ -200,29 +211,60 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
                     total += red[j];
                 }
                 float inv = rsqrt(total / float(IN_DIM) + norm_eps[0]);
-                for (uint i = tid; i < IN_DIM; i += THREADS) {
-                    xs[i] = float(XT(xs[i] * inv * float(norm_weight[i])));
+                for (uint k = 0; k < EPT; ++k) {
+                    uint i = tid * EPT + k;
+                    v[k] = i < IN_DIM ? float(XT(v[k] * inv * float(norm_weight[i]))) : 0.0f;
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             if (HADAMARD) {
-                // Sylvester-order FWHT, as mx.hadamard_transform (scale 1/sqrt(n)).
-                for (uint h = 1; h < IN_DIM; h <<= 1) {
-                    for (uint b = tid; b < IN_DIM / 2; b += THREADS) {
-                        uint k = b & (h - 1);
-                        uint i = ((b - k) << 1) + k;
-                        float a = xs[i];
-                        float c = xs[i + h];
-                        xs[i] = a + c;
-                        xs[i + h] = a - c;
+                // Sylvester-order FWHT, as mx.hadamard_transform (scale 1/sqrt(n));
+                // stages commute, so the order below is free.
+                for (uint h = 1; h < EPT; h <<= 1) {
+                    for (uint k = 0; k < EPT; ++k) {
+                        if ((k & h) == 0) {
+                            float a = v[k];
+                            float c = v[k + h];
+                            v[k] = a + c;
+                            v[k + h] = a - c;
+                        }
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                for (uint m = 1; m < 32 && m * EPT < IN_DIM; m <<= 1) {
+                    bool upper = (lane & m) != 0;
+                    for (uint k = 0; k < EPT; ++k) {
+                        float other = simd_shuffle_xor(v[k], ushort(m));
+                        v[k] = upper ? other - v[k] : v[k] + other;
+                    }
+                }
+                if (XGROUPS > 1) {
+                    for (uint k = 0; k < EPT; ++k) {
+                        xs[tid * EPT + k] = v[k];
+                    }
                 }
             }
-            for (uint i = tid; i < IN_DIM; i += THREADS) {
-                float v = HADAMARD ? xs[i] * rsqrt(float(IN_DIM)) : xs[i];
-                // Round to the activation dtype first, like hadamard_transform's output.
-                xs[i] = fp8_e4m3_roundtrip(float(XT(v)));
+            if (HADAMARD && XGROUPS > 1) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Cross-simdgroup stages: y_i = sum_g (-1)^popcount(g & group(i)) x_{i'}
+                // with i' = i at group g. Threads past IN_DIM (small inputs) only sync.
+                uint group = sg;
+                for (uint k = 0; k < EPT; ++k) {
+                    uint offset = (tid * EPT + k) % SPAN;
+                    float acc = 0.0f;
+                    for (uint g = 0; g < XGROUPS; ++g) {
+                        float term = xs[g * SPAN + offset];
+                        acc += (popcount(g & group) & 1) ? -term : term;
+                    }
+                    v[k] = acc;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);  // xs is overwritten below
+            }
+            float scale = HADAMARD ? rsqrt(float(IN_DIM)) : 1.0f;
+            for (uint k = 0; k < EPT; ++k) {
+                uint i = tid * EPT + k;
+                if (i < IN_DIM) {
+                    // Round to the activation dtype first, like hadamard_transform's output.
+                    xs[i] = fp8_e4m3_roundtrip(float(XT(v[k] * scale)));
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
