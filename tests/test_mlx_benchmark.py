@@ -251,7 +251,8 @@ def test_mlx_model_preserves_packed_document_boundaries_and_loops() -> None:
     ("shape", "expected_calls"),
     [
         ((2, 4, 64), {"qkv": 2, "path": 0}),
-        ((1, 1, 64), {"qkv": 1, "path": 1}),
+        # Decode with packed weights fuses the prep into the GEMV kernel.
+        ((1, 1, 64), {"qkv": 0, "path": 0}),
     ],
 )
 def test_mlx_qkv_and_path_share_input_preparation(

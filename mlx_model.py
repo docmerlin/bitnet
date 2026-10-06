@@ -14,9 +14,11 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.utils import checkpoint as activation_checkpoint
 
+from mlx_decode_kernels import PATH_DECODE_MAX_WIDTH, depth_attn_mix_m1, path_decode_step_m1
 from mlx_path_kernel import path_triangular_solve, reference_triangular_solve
 from mlx_rfmoe_kernel import compacted_grouped_linear, masked_grouped_linear
 from mlx_ternary_kernel import (
+    M1_PREP_MAX_DIM,
     pack_ternary_weight,
     ternary_fused_linear_m1,
     ternary_quantized_linear,
@@ -341,9 +343,17 @@ class MLXDepthAttnMix(nn.Module):
             )
         self.proj.weight = mx.zeros_like(self.proj.weight)
 
-    def __call__(self, completed: list[mx.array], partial: mx.array) -> mx.array:
+    def __call__(
+        self,
+        completed: list[mx.array],
+        partial: mx.array,
+        stacked: mx.array | None = None,
+    ) -> mx.array:
         if not completed:
             return partial
+        if stacked is not None and isinstance(self.norm, nn.RMSNorm):
+            # Decode (one token): one kernel instead of stack/norm/softmax/sum.
+            return depth_attn_mix_m1(stacked, partial, self.norm.weight, self.proj.weight, self.norm.eps)
         v = mx.stack([*completed, partial], axis=0)  # [N+1, B, T, D]
         k = self.norm(v)
         w = mx.reshape(self.proj.weight, (-1,))  # [D]
@@ -363,6 +373,10 @@ class MLXAttnResStream:
     last_hidden: mx.array
     attn_mix: MLXDepthAttnMix
     mlp_mix: MLXDepthAttnMix
+    # Single-token decode: completed blocks as one (N, D) array, rebuilt only when a
+    # block closes instead of re-stacked by every mix.
+    stacked: mx.array | None = None
+    stacked_len: int = 0
 
     @classmethod
     def start(
@@ -385,15 +399,23 @@ class MLXAttnResStream:
             mlp_mix=mlp_mix,
         )
 
+    def _stacked_completed(self, partial: mx.array) -> mx.array | None:
+        if partial.size != partial.shape[-1]:
+            return None
+        if self.stacked_len != len(self.completed):
+            self.stacked = mx.concatenate([c.reshape(1, -1) for c in self.completed], axis=0)
+            self.stacked_len = len(self.completed)
+        return self.stacked
+
     def mix_attn(self) -> mx.array:
         partial = self.partial if self.partial is not None else self.completed[-1]
-        h = self.attn_mix(self.completed, partial)
+        h = self.attn_mix(self.completed, partial, self._stacked_completed(partial))
         self.last_hidden = h
         return h
 
     def mix_mlp(self) -> mx.array:
         partial = self.partial if self.partial is not None else self.completed[-1]
-        h = self.mlp_mix(self.completed, partial)
+        h = self.mlp_mix(self.completed, partial, self._stacked_completed(partial))
         self.last_hidden = h
         return h
 
@@ -412,7 +434,7 @@ class MLXAttnResStream:
 
     def hidden(self) -> mx.array:
         if self.partial is not None:
-            return self.mlp_mix(self.completed, self.partial)
+            return self.mlp_mix(self.completed, self.partial, self._stacked_completed(self.partial))
         return self.completed[-1]
 
 
@@ -429,8 +451,12 @@ class MLXHBitLinear(nn.Module):
         self._pinned_dense: mx.array | None = None
         self._pinned_packed: tuple | None = None
 
+    @property
+    def uses_hadamard(self) -> bool:
+        return self.config.use_hadamard and self.input_dims & (self.input_dims - 1) == 0
+
     def prepare_input(self, x: mx.array) -> mx.array:
-        if self.config.use_hadamard and self.input_dims & (self.input_dims - 1) == 0:
+        if self.uses_hadamard:
             x = mx.hadamard_transform(x)
         # Native fp8 e4m3. from_fp8 has no VJP, so STE keeps an identity gradient.
         quantized = mx.from_fp8(mx.to_fp8(x), x.dtype)
@@ -505,43 +531,61 @@ class MLXHBitLinear(nn.Module):
                 cache[key] = packed_weight
         return packed_weight
 
-    def __call__(self, x: mx.array) -> mx.array:
-        in_dim = int(self.weight.shape[1])
-        out_dim = int(self.weight.shape[0])
-        tokens = int(x.size // max(in_dim, 1))
-        use_fused_m1 = (
-            tokens == 1
-            and in_dim <= 512
-            and out_dim <= 1024
-            and in_dim % 32 == 0
+    def can_fuse_decode(self, x: mx.array) -> bool:
+        """Whether a single-token activation shaped like ``x`` (any width) can run fused."""
+        return x.size == x.shape[-1] and self.input_dims <= M1_PREP_MAX_DIM and self._packed_weight(x) is not None
+
+    def fused_decode(
+        self,
+        x: mx.array,
+        *,
+        norm: nn.RMSNorm | None = None,
+        epilogue: str | None = None,
+    ) -> mx.array | None:
+        """Single-token projection as one kernel: [RMSNorm] + Hadamard + fp8 + GEMV
+        [+ silu / swiglu]. None when it does not apply (see can_fuse_decode).
+
+        The kernel has no VJP, so the STE in prepare_input has nothing to do here.
+        """
+        if not self.can_fuse_decode(x):
+            return None
+        packed, scales, group_size = self._packed_weight(x)
+        return ternary_fused_linear_m1(
+            x,
+            packed,
+            scales,
+            in_dim=self.input_dims,
+            out_dim=int(self.weight.shape[0]),
+            group_size=int(group_size),
+            prepare=True,
+            hadamard=self.uses_hadamard,
+            norm_weight=None if norm is None else norm.weight,
+            norm_eps=0.0 if norm is None else norm.eps,
+            epilogue=epilogue,
         )
-        if use_fused_m1:
-            packed_weight = self._packed_weight(x)
-            if packed_weight is not None:
-                packed, scales, group_size = packed_weight
-                x = self.prepare_input(x)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        y = self.fused_decode(x)
+        return y if y is not None else self.forward_prepared(self.prepare_input(x))
+
+    def forward_prepared(self, x: mx.array) -> mx.array:
+        """Project input already Hadamard-transformed by an equivalent layer."""
+        if self._pinned_dense is not None:
+            return x @ self._pinned_dense.T
+        packed_weight = self._packed_weight(x)  # pinned packed first, then the cache
+        if packed_weight is not None:
+            packed, scales, group_size = packed_weight
+            if x.size == self.input_dims:
+                # M=1 GEMV; also keeps custom-VJP ternary_quantized_linear, which
+                # mx.compile rejects, out of compiled decode.
                 return ternary_fused_linear_m1(
                     x,
                     packed,
                     scales,
-                    in_dim=in_dim,
-                    out_dim=out_dim,
+                    in_dim=self.input_dims,
+                    out_dim=int(self.weight.shape[0]),
                     group_size=int(group_size),
-                    dtype=x.dtype,
                 )
-
-        return self.forward_prepared(self.prepare_input(x))
-
-    def forward_prepared(self, x: mx.array) -> mx.array:
-        """Project input already Hadamard-transformed by an equivalent layer."""
-        if self._pinned_packed is not None:
-            packed, scales, _ = self._pinned_packed
-            return ternary_quantized_linear(x, self.weight, packed, scales)
-        if self._pinned_dense is not None:
-            return x @ self._pinned_dense.T
-        packed_weight = self._packed_weight(x)
-        if packed_weight is not None:
-            packed, scales, _ = packed_weight
             return ternary_quantized_linear(x, self.weight, packed, scales)
         return x @ self.effective_weight(x.dtype).T
 
@@ -1258,6 +1302,58 @@ class MLXPaTHAttention(nn.Module):
         cache.path_projected = combined[:, -2:]
         return q, k, v, w, beta, log_forget
 
+    # Class switch so tests can run the op-by-op reference path side by side.
+    fused_decode = True
+
+    def pin_merged_projection(self) -> None:
+        """Stack pinned packed qkv and path_down rows: both read x, so a decode token
+        projects with one kernel (one prep, one dispatch). Built here, outside any
+        mx.compile trace, so compiled steps never re-run the concatenation."""
+        self._merged_projection = None
+        a, b = self.qkv._pinned_packed, self.path_down._pinned_packed
+        if a is None or b is None or a[2] != b[2]:
+            return
+        merged = (mx.concatenate([a[0], b[0]]), mx.concatenate([a[1], b[1]]), a[2])
+        mx.eval(merged[0], merged[1])
+        # Keep the source pins to detect a later re-pin of either layer.
+        self._merged_projection = (a, b, merged)
+
+    def _qkv_and_path_down(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        merged = getattr(self, "_merged_projection", None)
+        if (
+            merged is not None
+            and merged[0] is self.qkv._pinned_packed
+            and merged[1] is self.path_down._pinned_packed
+            and self.qkv.can_fuse_decode(x)
+        ):
+            packed, scales, group_size = merged[2]
+            n_qkv = int(self.qkv.weight.shape[0])
+            y = ternary_fused_linear_m1(
+                x,
+                packed,
+                scales,
+                in_dim=self.qkv.input_dims,
+                out_dim=int(packed.shape[0]),
+                group_size=int(group_size),
+                prepare=True,
+                hadamard=self.qkv.uses_hadamard,
+            )
+            return y[..., :n_qkv], y[..., n_qkv:]
+        return self.qkv(x), self.path_down(x)
+
+    def _can_fuse_decode(self, cache: "MLXPaTHInferenceCache", chunk_width: int) -> bool:
+        """Whether path_decode_step_m1 covers this step; otherwise the op-by-op path runs."""
+        return (
+            self.fused_decode
+            and _path_decode_mode.get() != "recompute"
+            and not self.cache_path_products
+            and self.memory_dim == self.head_dim
+            and self.head_dim % 32 == 0
+            and chunk_width <= PATH_DECODE_MAX_WIDTH
+            # Continuing a chunk needs its running T (absent only after a mode switch).
+            and (cache.q is None or cache.open_len == 0 or cache.t_inverse is not None)
+        )
+
     def incremental(
         self,
         x: mx.array,
@@ -1265,12 +1361,13 @@ class MLXPaTHAttention(nn.Module):
         update_memory: bool,
     ) -> mx.array:
         batch, _, hidden = x.shape
-        qkv = self.qkv(x).reshape(batch, 1, 3, self.config.num_attention_heads, self.head_dim)
+        qkv, path_low = self._qkv_and_path_down(x)
+        qkv = qkv.reshape(batch, 1, 3, self.config.num_attention_heads, self.head_dim)
         q = self.q_norm(qkv[:, :, 0].transpose(0, 2, 1, 3))
         k = self.k_norm(qkv[:, :, 1].transpose(0, 2, 1, 3))
         v = qkv[:, :, 2].transpose(0, 2, 1, 3)
 
-        projected = self.path_up(self.path_down(x))
+        projected = self.path_up(path_low)
         convolved = projected * self.path_conv_weight[:, 2]
         if cache.path_projected is not None and cache.path_projected.shape[1] > 0:
             history = cache.path_projected
@@ -1292,51 +1389,76 @@ class MLXPaTHAttention(nn.Module):
         forget_logits = self.path_forget(x).astype(mx.float32)
         log_forget = -mx.logaddexp(mx.zeros_like(forget_logits), -forget_logits)
 
-        if cache.q is None or cache.open_len == 0:
-            cache.q, cache.k, cache.v = q, k, v
-            cache.w, cache.beta, cache.log_forget = w, beta, log_forget
-            cache.open_len = 1
-            cache.t_inverse = None
-            cache.wk = None
-        else:
-            cache.q = mx.concatenate((cache.q, q), axis=2)
-            cache.k = mx.concatenate((cache.k, k), axis=2)
-            cache.v = mx.concatenate((cache.v, v), axis=2)
-            cache.w = mx.concatenate((cache.w, w), axis=1)
-            cache.beta = mx.concatenate((cache.beta, beta), axis=1)
-            cache.log_forget = mx.concatenate((cache.log_forget, log_forget), axis=1)
-            cache.open_len = cache.open_len + 1
-
-        if _path_decode_mode.get() == "recompute":
-            full, t_inverse, wk = self.path_chunk_with_state(
-                cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, None
-            )
-            last = cache.open_len - 1
-            local = full[:, :, last : last + 1]
-            # Keep running T / WK in sync for mixed-mode / branch clones.
-            cache.t_inverse = t_inverse
-            cache.wk = wk if self.cache_path_products else None
-        else:
-            cache.t_inverse = self.path_border_update_t(cache.t_inverse, cache.w, cache.beta)
-            cache.wk = self.path_wk_extend(cache.wk, cache.w, cache.k) if self.cache_path_products else None
-            local = self.path_chunk_last_with_t(
+        chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
+        starting = cache.q is None or cache.open_len == 0
+        if self._can_fuse_decode(cache, chunk_width):
+            # One kernel appends the token to the open chunk and attends with it.
+            (
+                local,
+                cache.t_inverse,
                 cache.q,
                 cache.k,
                 cache.v,
                 cache.w,
                 cache.beta,
                 cache.log_forget,
-                cache.t_inverse,
-                None,
-                wk=cache.wk,
+            ) = path_decode_step_m1(
+                (q, k, v, w, beta, log_forget),
+                None if starting else (cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget),
+                None if starting else cache.t_inverse,
+                cache.memory_m,
+                cache.memory_z,
+                cache.memory_initialized,
+                self.memory_gate,
+                chunk_width=chunk_width,
+                favor=self.config.infini_feature_map == "favor",
             )
-        memory_context = self._retrieve_memory(q, cache.memory_m, cache.memory_z).astype(v.dtype)
-        gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
-        mixed = (1.0 - gate) * local + gate * memory_context
-        local = mx.where(cache.memory_initialized[:, None, None, None], mixed, local)
+            cache.open_len = 1 if starting else cache.open_len + 1
+            cache.wk = None
+        else:
+            if starting:
+                cache.q, cache.k, cache.v = q, k, v
+                cache.w, cache.beta, cache.log_forget = w, beta, log_forget
+                cache.open_len = 1
+                cache.t_inverse = None
+                cache.wk = None
+            else:
+                cache.q = mx.concatenate((cache.q, q), axis=2)
+                cache.k = mx.concatenate((cache.k, k), axis=2)
+                cache.v = mx.concatenate((cache.v, v), axis=2)
+                cache.w = mx.concatenate((cache.w, w), axis=1)
+                cache.beta = mx.concatenate((cache.beta, beta), axis=1)
+                cache.log_forget = mx.concatenate((cache.log_forget, log_forget), axis=1)
+                cache.open_len = cache.open_len + 1
+            if _path_decode_mode.get() == "recompute":
+                full, t_inverse, wk = self.path_chunk_with_state(
+                    cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget, None
+                )
+                last = cache.open_len - 1
+                local = full[:, :, last : last + 1]
+                # Keep running T / WK in sync for mixed-mode / branch clones.
+                cache.t_inverse = t_inverse
+                cache.wk = wk if self.cache_path_products else None
+            else:
+                cache.t_inverse = self.path_border_update_t(cache.t_inverse, cache.w, cache.beta)
+                cache.wk = self.path_wk_extend(cache.wk, cache.w, cache.k) if self.cache_path_products else None
+                local = self.path_chunk_last_with_t(
+                    cache.q,
+                    cache.k,
+                    cache.v,
+                    cache.w,
+                    cache.beta,
+                    cache.log_forget,
+                    cache.t_inverse,
+                    None,
+                    wk=cache.wk,
+                )
+            memory_context = self._retrieve_memory(q, cache.memory_m, cache.memory_z).astype(v.dtype)
+            gate = mx.sigmoid(self.memory_gate)[None, :, None, None]
+            mixed = (1.0 - gate) * local + gate * memory_context
+            local = mx.where(cache.memory_initialized[:, None, None, None], mixed, local)
         context = local.transpose(0, 2, 1, 3).reshape(batch, 1, hidden)
 
-        chunk_width = min(self.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
         if cache.open_len == chunk_width:
             if update_memory:
                 cache.memory_m, cache.memory_z, cache.memory_initialized = self._next_memory(
@@ -1991,6 +2113,21 @@ class MLXHybridBlock(nn.Module):
         hidden_act = nn.silu(self.mid(nn.silu(gate) * value))
         return self.down(hidden_act)
 
+    def _norm_mlp(self, x: mx.array, cond: mx.array | None = None, checkpoint_activations: bool = False) -> mx.array:
+        """mlp(mlp_norm(x)). A decode token runs three kernels: RMSNorm + up + swiglu,
+        mid + silu, down."""
+        if (
+            cond is None
+            and self.moe is None
+            and self.ada_mlp is None
+            and isinstance(self.mlp_norm, nn.RMSNorm)
+            and all(layer.can_fuse_decode(x) for layer in (self.up, self.mid, self.down))
+        ):
+            hidden_act = self.up.fused_decode(x, norm=self.mlp_norm, epilogue="swiglu")
+            hidden_act = self.mid.fused_decode(hidden_act, epilogue="silu")
+            return self.down.fused_decode(hidden_act)
+        return self._mlp(self._mlp_norm(x, cond), checkpoint_activations)
+
     def _mlp(self, x: mx.array, checkpoint_activations: bool = False) -> mx.array:
         if self.skip_mlp:
             raise RuntimeError("MLP skipped on this block (skip_first_prelude_mlp)")
@@ -2059,7 +2196,7 @@ class MLXHybridBlock(nn.Module):
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        output = self._mlp(self._mlp_norm(x, cond), checkpoint_activations)
+        output = self._norm_mlp(x, cond, checkpoint_activations)
         return self.mlp_post(x + self.mlp_scale * output)
 
     def forward_kimi(
@@ -2109,7 +2246,7 @@ class MLXHybridBlock(nn.Module):
 
         if not self.skip_mlp:
             h = stream.mix_mlp()
-            stream.add_sublayer(self._mlp(self._mlp_norm(h, cond), checkpoint_activations))
+            stream.add_sublayer(self._norm_mlp(h, cond, checkpoint_activations))
         stream.close_layer()
         return stream
 
@@ -2167,7 +2304,7 @@ class MLXHybridBlock(nn.Module):
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
+        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x))
 
     def extend(
         self,
@@ -2186,7 +2323,7 @@ class MLXHybridBlock(nn.Module):
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
+        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x))
 
     def prefill(
         self,
@@ -2204,7 +2341,7 @@ class MLXHybridBlock(nn.Module):
             x = self.attn_post(x + self.attn_scale * mx.sigmoid(self.attn_gate) * attention)
         if self.skip_mlp:
             return x
-        return self.mlp_post(x + self.mlp_scale * self._mlp(self.mlp_norm(x)))
+        return self.mlp_post(x + self.mlp_scale * self._norm_mlp(x))
 
     def __call__(
         self,
@@ -2371,6 +2508,9 @@ class MLXBitNet(nn.Module):
             ]
             if pinned or packed:
                 mx.eval(*(pinned + packed))
+            for _, module in self.named_modules():
+                if isinstance(module, MLXPaTHAttention):
+                    module.pin_merged_projection()
         finally:
             _recurrent_quantized_matmul.reset(token)
 
@@ -2555,10 +2695,9 @@ class MLXBitNet(nn.Module):
         self._compiled_inference_step = None
         self._compiled_by_open_len = None
         try:
-            # Dense pins avoid custom quantized transforms that break mx.compile.
-            for _, module in self.named_modules():
-                if isinstance(module, MLXHBitLinear):
-                    module.pin_inference_weight(self.embedding.weight.dtype, prefer_packed=False)
+            # Packed pins: every M=1 packed linear runs the custom GEMV kernel, which
+            # compiles (ternary_quantized_linear's custom VJP would not).
+            self.pin_inference_weights(self.embedding.weight.dtype)
             loops = getattr(self, "inference_num_loops", self.config.num_loops)
             path_attn = next((b.attn for b in self.blocks), None)
             default_w = self.config.path_window_size
