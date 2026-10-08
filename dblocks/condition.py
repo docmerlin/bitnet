@@ -11,23 +11,30 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-# Transformer / DiT geometric grid. Raw 2**k hits 2^31 at default fourier_dim=64
-# and float32 sin/cos stop tracking log σ (~[-6, 4]) past ~2^15.
+# DiT timestep grid, as the official DiffusionBlocks code: frequencies fall from 1
+# to 1/max_period. Applied to EDM's c_noise = ln(σ)/4 (|c_noise| <= 1.6 on
+# [0.002, 80]) no feature wraps, so σ beyond a block's trained range (the sampler
+# starts at σ_max, which training almost never draws) still reads as "very noisy".
+# The old grid ran 1..max_period on ln σ: even its slowest feature wrapped every 2π,
+# so σ=80 encoded like σ≈0.15 and block 0 trusted pure noise.
 _FOURIER_MAX_PERIOD = 10_000.0
 
 
 def fourier_frequencies(half: int, max_period: float = _FOURIER_MAX_PERIOD) -> mx.array:
-    """Geometric frequencies in ``[1, max_period]``. ``half`` is fourier_dim/2."""
+    """DiT frequencies ``exp(-ln(max_period) · i / half)``, in ``(1/max_period, 1]``."""
     if half < 1:
         raise ValueError("half must be positive")
-    if half == 1:
-        return mx.array([1.0], dtype=mx.float32)
-    scale = mx.arange(half).astype(mx.float32) / float(half - 1)
-    return mx.exp(math.log(max_period) * scale)
+    scale = mx.arange(half).astype(mx.float32) / float(half)
+    return mx.exp(-math.log(max_period) * scale)
+
+
+def sigma_noise_input(sigma: mx.array) -> mx.array:
+    """EDM ``c_noise = ln(σ) / 4``."""
+    return 0.25 * mx.log(mx.maximum(sigma.astype(mx.float32), 1e-8))
 
 
 class MLXSigmaEmbed(nn.Module):
-    """``log σ`` Fourier features → MLP → cond vector."""
+    """``c_noise = ln(σ)/4`` Fourier features (DiT grid) → MLP → cond vector."""
 
     def __init__(self, fourier_dim: int, cond_dim: int):
         super().__init__()
@@ -41,8 +48,7 @@ class MLXSigmaEmbed(nn.Module):
         self.out_proj = nn.Linear(self.cond_dim, self.cond_dim, bias=True)
 
     def __call__(self, sigma: mx.array) -> mx.array:
-        log_sigma = mx.log(mx.maximum(sigma.astype(mx.float32), 1e-8))
-        flat = mx.reshape(log_sigma, (-1, 1))
+        flat = mx.reshape(sigma_noise_input(sigma), (-1, 1))
         freqs = fourier_frequencies(self.fourier_dim // 2)
         angle = flat * freqs.reshape((1, -1))
         features = mx.concatenate([mx.sin(angle), mx.cos(angle)], axis=-1)

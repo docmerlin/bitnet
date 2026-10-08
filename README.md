@@ -15,7 +15,8 @@ migrated): activation-quant mix/bit fields (`activation_bits`, `activation_dtype
 `use_4bit_activations`, `quantize_activations`, mix arrays) and Mamba/QK-Clip
 fields. Most recent structural breaks: DiffusionBlocks is the MLX default and adds
 `sigma_embed` / AdaRMS / `dblock_noise_in` (dblock checkpoints from before the
-clean-context rewrite do not load); the output head is untied by default
+clean-context rewrite do not load, and ones from before the DiT σ grid load but
+decode wrong: `sigma_embed` now reads `ln(σ)/4` on frequencies ≤ 1); the output head is untied by default
 (`--no-tie-word-embeddings`), which adds `lm_head.weight` and splits the optimizer
 into three groups.
 

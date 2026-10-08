@@ -5,7 +5,7 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from dblocks.condition import MLXAdaRMS, MLXSigmaEmbed, apply_ada, fourier_frequencies
+from dblocks.condition import MLXAdaRMS, MLXSigmaEmbed, apply_ada, fourier_frequencies, sigma_noise_input
 
 
 def test_adarms_is_identity_at_construction() -> None:
@@ -38,15 +38,16 @@ def test_sigma_embed_is_finite_for_scalar_and_batch() -> None:
     assert bool(mx.all(mx.isfinite(batched)).item())
 
 
-def test_fourier_frequencies_stay_in_float32_range() -> None:
+def test_sigma_features_never_wrap_on_the_sigma_range() -> None:
+    """DiT grid on c_noise: every feature stays within one half-period over
+    [σ_min, σ_max], so σ_max (sampler start, rarely trained) cannot alias a small σ."""
     freqs = fourier_frequencies(32)
     mx.eval(freqs)
     values = [float(v) for v in freqs]
     assert values[0] == pytest.approx(1.0)
-    assert max(values) == pytest.approx(10_000.0, rel=1e-5)
-    assert min(values) >= 1.0 - 1e-5
-    # Default half=32 would have been 2**31 with the old 2**k grid.
-    assert max(values) < 2**15
+    assert min(values) > 1e-4 and max(values) <= 1.0
+    extent = max(abs(float(sigma_noise_input(mx.array(s)).item())) for s in (0.002, 80.0))
+    assert max(values) * extent < 3.14159 / 2
 
 
 def test_adarms_broadcasts_batched_cond_on_the_feature_axis() -> None:
