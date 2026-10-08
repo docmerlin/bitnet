@@ -166,6 +166,15 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
         uint lane = thread_index_in_simdgroup;
         uint sg = simdgroup_index_in_threadgroup;
         uint tid = sg * 32 + lane;
+        // Weight group (grid y, 1 unless grouped): x, packed, scales, the norm
+        // weights and y are stacked per group, so G layers' GEMVs share one dispatch.
+        uint gi = threadgroup_position_in_grid.y;
+        auto xg = x + gi * IN_DIM;
+        auto pk = packed + gi * (OUT_DIM * WORDS);
+        auto sc = scales + gi * (OUT_DIM * GROUPS);
+        auto nw = norm_weight + gi * IN_DIM;
+        auto nb = norm_bias + gi * IN_DIM;
+        auto yg = y + gi * P;
         // No early exit for rows past the end: every thread must reach the prep
         // barriers. Those rows clamp their loads and skip their writes instead.
         uint unit0 = (threadgroup_position_in_grid.x * SIMDGROUPS + sg) * UNITS;
@@ -192,7 +201,7 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
             float v[EPT];
             for (uint k = 0; k < EPT; ++k) {
                 uint i = tid * EPT + k;
-                v[k] = i < IN_DIM ? float(x[i]) : 0.0f;
+                v[k] = i < IN_DIM ? float(xg[i]) : 0.0f;
             }
             if (NORM) {
                 // RMSNorm prologue, as mx.fast.rms_norm: fp32 math, output rounded to XT
@@ -213,9 +222,9 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
                 float inv = rsqrt(total / float(IN_DIM) + norm_eps[0]);
                 for (uint k = 0; k < EPT; ++k) {
                     uint i = tid * EPT + k;
-                    float y = i < IN_DIM ? v[k] * inv * float(norm_weight[i]) : 0.0f;
+                    float y = i < IN_DIM ? v[k] * inv * float(nw[i]) : 0.0f;
                     if (NORM_BIAS && i < IN_DIM) {
-                        y += float(norm_bias[i]);  // folded AdaRMS shift
+                        y += float(nb[i]);  // folded AdaRMS shift
                     }
                     v[k] = float(XT(y));
                 }
@@ -281,12 +290,12 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
         for (uint w = lane; w < WORDS; w += 32) {
             float xv[16];
             for (uint i = 0; i < 16; ++i) {
-                float v = PREP ? xs[w * 16 + i] : float(x[w * 16 + i]);
+                float v = PREP ? xs[w * 16 + i] : float(xg[w * 16 + i]);
                 xsum += v;
                 xv[i] = v * (1.0f / float(1u << (2 * i)));
             }
             for (uint r = 0; r < ROWS; ++r) {
-                uint word = packed[rows[r] * WORDS + w];
+                uint word = pk[rows[r] * WORDS + w];
                 float s = 0.0f;
                 for (uint i = 0; i < 16; ++i) {
                     s = fma(xv[i], float(word & (3u << (2 * i))), s);
@@ -297,7 +306,7 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
         xsum = simd_sum(xsum);
         float val[ROWS];
         for (uint r = 0; r < ROWS; ++r) {
-            val[r] = (simd_sum(acc[r]) - xsum) * float(scales[rows[r] * GROUPS]);
+            val[r] = (simd_sum(acc[r]) - xsum) * float(sc[rows[r] * GROUPS]);
         }
         if (lane == 0) {
             for (uint r = 0; r < UNITS; ++r) {
@@ -309,7 +318,7 @@ _TERNARY_FUSED_M1 = mx.fast.metal_kernel(
                     } else if (EPILOGUE == 2) {
                         v = v / (1.0f + exp(-v)) * val[r + UNITS];
                     }
-                    y[o] = T(v);
+                    yg[o] = T(v);
                 }
             }
         }
@@ -338,6 +347,7 @@ def _compiled_m1(
     norm: bool,
     norm_bias: bool,
     epilogue: int,
+    groups: int = 1,
 ):
     outputs = out_dim // 2 if epilogue == 2 else out_dim
     units_per_tg = (_M1_ROWS // 2 if epilogue == 2 else _M1_ROWS) * _M1_SIMDGROUPS
@@ -360,9 +370,9 @@ def _compiled_m1(
                 ("NORM_BIAS", norm_bias),
                 ("EPILOGUE", epilogue),
             ],
-            grid=(threadgroups * 32 * _M1_SIMDGROUPS, 1, 1),
+            grid=(threadgroups * 32 * _M1_SIMDGROUPS, groups, 1),
             threadgroup=(32 * _M1_SIMDGROUPS, 1, 1),
-            output_shapes=[(outputs,)],
+            output_shapes=[(groups * outputs,)],
             output_dtypes=[dtype],
         )[0]
 
@@ -397,13 +407,18 @@ def ternary_fused_linear_m1(
     ``norm_bias`` is added to its output before rounding (folded AdaRMS shift).
     ``epilogue``: ``"silu"`` applies silu to the output; ``"swiglu"`` returns
     ``silu(y[:P]) * y[P:]`` with ``P = out_dim // 2``.
+
+    Grouped: ``packed`` ``(G, out, in/16)`` and ``scales`` stacked over G layers
+    (norm weights ``(G, in)``) with ``x`` holding one row per group runs the G
+    GEMVs in one dispatch.
     """
     if dtype is None:
         dtype = x.dtype
     orig_shape = x.shape
+    groups = int(packed.shape[0]) if packed.ndim == 3 else 1
     flat = x.reshape(-1, in_dim)
-    if int(flat.shape[0]) != 1:
-        raise ValueError("ternary_fused_linear_m1 requires batch*seq == 1")
+    if int(flat.shape[0]) != groups:
+        raise ValueError("ternary_fused_linear_m1 requires one row (per weight group)")
     if in_dim % 32:
         raise ValueError("in_dim must be divisible by 32")
     if prepare and in_dim > M1_PREP_MAX_DIM:
@@ -419,7 +434,7 @@ def ternary_fused_linear_m1(
     norm = norm_weight is not None
     bias = norm_bias is not None
     kernel = _compiled_m1(
-        in_dim, out_dim, group_size, x.dtype, dtype, prepare, hadamard, norm, bias, _EPILOGUES[epilogue]
+        in_dim, out_dim, group_size, x.dtype, dtype, prepare, hadamard, norm, bias, _EPILOGUES[epilogue], groups
     )
     # Unused inputs still need an array in their slot.
     y = kernel(

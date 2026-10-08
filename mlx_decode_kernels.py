@@ -30,6 +30,13 @@ _DEPTH_MIX = mx.fast.metal_kernel(
         uint t = thread_position_in_threadgroup.x;
         uint lane = thread_index_in_simdgroup;
         uint sg = simdgroup_index_in_threadgroup;
+        // Weight group (grid y, 1 unless grouped): G layers' mixes in one dispatch.
+        uint gi = threadgroup_position_in_grid.y;
+        auto cg = completed + gi * N * D;
+        auto pg = partial + gi * D;
+        auto nw = norm_weight + gi * D;
+        auto pw = proj_weight + gi * D;
+        auto yg = y + gi * D;
         threadgroup float red[SIMDGROUPS][2 * (N + 1)];
         threadgroup float logits[N + 1];
 
@@ -43,9 +50,9 @@ _DEPTH_MIX = mx.fast.metal_kernel(
         for (uint e = 0; e < EPT; ++e) {
             uint d = t + e * THREADS;
             bool in = d < D;
-            float gw = in ? float(norm_weight[d]) * float(proj_weight[d]) : 0.0f;
+            float gw = in ? float(nw[d]) * float(pw[d]) : 0.0f;
             for (uint j = 0; j <= N; ++j) {
-                float x = !in ? 0.0f : (j < N ? float(completed[j * D + d]) : float(partial[d]));
+                float x = !in ? 0.0f : (j < N ? float(cg[j * D + d]) : float(pg[d]));
                 v[j][e] = x;
                 ss[j] += x * x;
                 dot[j] += x * gw;
@@ -88,7 +95,7 @@ _DEPTH_MIX = mx.fast.metal_kernel(
                 for (uint j = 0; j <= N; ++j) {
                     acc += p[j] * v[j][e];
                 }
-                y[d] = T(acc / z);
+                yg[d] = T(acc / z);
             }
         }
     """,
@@ -96,15 +103,15 @@ _DEPTH_MIX = mx.fast.metal_kernel(
 
 
 @lru_cache(maxsize=None)
-def _compiled_depth_mix(n: int, d: int, dtype):
+def _compiled_depth_mix(n: int, d: int, dtype, groups: int = 1):
     threads = min(1024, (d + 31) // 32 * 32)
     def dispatch(completed, partial, norm_weight, proj_weight, eps):
         return _DEPTH_MIX(
             inputs=[completed, partial, norm_weight, proj_weight, eps],
             template=[("T", dtype), ("N", n), ("D", d), ("THREADS", threads)],
-            grid=(threads, 1, 1),
+            grid=(threads, groups, 1),
             threadgroup=(threads, 1, 1),
-            output_shapes=[(d,)],
+            output_shapes=[(groups * d,)],
             output_dtypes=[dtype],
         )[0]
 
@@ -124,12 +131,18 @@ def depth_attn_mix_m1(
     proj_weight: mx.array,
     eps: float,
 ) -> mx.array:
-    """Depth mix of ``completed`` ``(N, D)`` and ``partial`` (``D`` elements, any shape)."""
-    n, d = completed.shape
-    if partial.size != d:
-        raise ValueError("depth_attn_mix_m1 requires a single-token partial")
-    kernel = _compiled_depth_mix(n, d, partial.dtype)
-    return kernel(completed, partial.reshape(d), norm_weight, proj_weight.reshape(d), _scalar(eps)).reshape(partial.shape)
+    """Depth mix of ``completed`` ``(N, D)`` and ``partial`` (``D`` elements, any shape).
+
+    Grouped: ``completed`` ``(G, N, D)``, ``partial`` ``G·D`` elements and weights
+    ``(G, D)`` run G layers' mixes in one dispatch.
+    """
+    groups = completed.shape[0] if completed.ndim == 3 else 1
+    n, d = completed.shape[-2:]
+    if partial.size != groups * d:
+        raise ValueError("depth_attn_mix_m1 requires a single-token partial (per group)")
+    kernel = _compiled_depth_mix(n, d, partial.dtype, groups)
+    y = kernel(completed, partial.reshape(-1), norm_weight, proj_weight.reshape(-1), _scalar(eps))
+    return y.reshape(partial.shape)
 
 
 # One PaTH decode step (last query of the open chunk) fused with the Infini memory
@@ -169,6 +182,10 @@ _PATH_DECODE = mx.fast.metal_kernel(
         uint bh = threadgroup_position_in_grid.x;
         uint b = bh / H;
         uint h = bh % H;
+        // GROUPED: batch row b runs layer b's weights (G layers' steps in one dispatch).
+        auto cw = conv_w + (GROUPED ? b * H * D * 3 : 0);
+        auto hw = head_w + (GROUPED ? b * 2 * H * H * D : 0);
+        auto hs = head_small + (GROUPED ? b * (3 * H + 2 * D) : 0);
         uint L = uint(params[0]);
         uint Lp = L - 1;
         uint n_hist = uint(params[1]);
@@ -266,9 +283,9 @@ _PATH_DECODE = mx.fast.metal_kernel(
             float qm = -INFINITY;
             for (uint t = 0; t < DPL; ++t) {
                 uint d = lane + 32 * t;
-                T qv = T(qr[t] * qi * head_small[3 * H + d]);
+                T qv = T(qr[t] * qi * hs[3 * H + d]);
                 q_cat[newrow + d] = qv;
-                k_cat[newrow + d] = T(kr[t] * ki * head_small[3 * H + D + d]);
+                k_cat[newrow + d] = T(kr[t] * ki * hs[3 * H + D + d]);
                 v_cat[newrow + d] = qkv[qkv_base + 2 * HD + d];
                 qr[t] = float(qv);
                 qn += qr[t] * qr[t];
@@ -294,12 +311,12 @@ _PATH_DECODE = mx.fast.metal_kernel(
             float wss = 0.0f;
             for (uint t = 0; t < DPL; ++t) {
                 uint idx = h * D + lane + 32 * t;
-                float c = float(projected[b * HD + idx]) * float(conv_w[idx * 3 + 2]);
+                float c = float(projected[b * HD + idx]) * float(cw[idx * 3 + 2]);
                 if (n_hist >= 1) {
-                    c += float(history[(b * n_hist + n_hist - 1) * HD + idx]) * float(conv_w[idx * 3 + 1]);
+                    c += float(history[(b * n_hist + n_hist - 1) * HD + idx]) * float(cw[idx * 3 + 1]);
                 }
                 if (n_hist >= 2) {
-                    c += float(history[(b * n_hist + n_hist - 2) * HD + idx]) * float(conv_w[idx * 3]);
+                    c += float(history[(b * n_hist + n_hist - 2) * HD + idx]) * float(cw[idx * 3]);
                 }
                 cs[t] = c / (1.0f + exp(-c));
                 wss += cs[t] * cs[t];
@@ -327,8 +344,8 @@ _PATH_DECODE = mx.fast.metal_kernel(
             float fd = 0.0f;
             for (uint i = tid; i < HD; i += THREADS) {
                 float xv = float(x_norm[b * HD + i]);
-                bd += xv * float(head_w[h * HD + i]);
-                fd += xv * float(head_w[(H + h) * HD + i]);
+                bd += xv * float(hw[h * HD + i]);
+                fd += xv * float(hw[(H + h) * HD + i]);
             }
             bd = simd_sum(bd);
             fd = simd_sum(fd);
@@ -338,8 +355,8 @@ _PATH_DECODE = mx.fast.metal_kernel(
             }
         }
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-        float bd = head_small[h];
-        float fd = head_small[H + h];
+        float bd = hs[h];
+        float fd = hs[H + h];
         for (uint i = 0; i < SG; ++i) {
             bd += red[i];
             fd += red[SG + i];
@@ -498,7 +515,7 @@ _PATH_DECODE = mx.fast.metal_kernel(
         if (q4 == 0) {
             float out = local;
             if (memory_initialized[b]) {
-                float g = 1.0f / (1.0f + exp(-head_small[2 * H + h]));
+                float g = 1.0f / (1.0f + exp(-hs[2 * H + h]));
                 out = (1.0f - g) * local + g * (num / den_shared[0]);
             }
             y[bh * D + d] = T(out);
@@ -517,14 +534,23 @@ def _step_params(length: int, n_hist: int, eps: float) -> mx.array:
 
 @lru_cache(maxsize=None)
 def _compiled_path_step(
-    batch: int, heads: int, length: int, dim: int, n_hist: int, lmax: int, dtype, hist_dtype, favor: bool
+    batch: int,
+    heads: int,
+    length: int,
+    dim: int,
+    n_hist: int,
+    lmax: int,
+    dtype,
+    hist_dtype,
+    favor: bool,
+    grouped: bool = False,
 ):
     cache_shape = (batch, heads, length, dim)
 
     def dispatch(*inputs):
         return _PATH_DECODE(
             inputs=list(inputs),
-            template=[("T", dtype), ("D", dim), ("H", heads), ("LMAX", lmax), ("FAVOR", favor)],
+            template=[("T", dtype), ("D", dim), ("H", heads), ("LMAX", lmax), ("FAVOR", favor), ("GROUPED", grouped)],
             grid=(256 * batch * heads, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[
@@ -579,7 +605,8 @@ def path_decode_step_m1(
     ``history`` the last <= 2 path projections (B,n,H*D) or None. ``prev`` is the
     open chunk (q, k, v (B,H,L-1,D); w (B,L-1,H,D); beta, log_forget (B,L-1,H)) or None
     to start one, ``t_prev`` its running T. ``memory`` is (M, z, initialized);
-    ``weights`` is (conv (H*D,3), head_w, head_small) from pack_path_head_weights.
+    ``weights`` is (conv (H*D,3), head_w, head_small) from pack_path_head_weights;
+    stacked over B layers (leading axis) it is grouped: batch row b runs layer b.
 
     Returns (context with the gated Infini memory read, T, q, k, v, w, beta,
     log_forget, history): the grown caches and the new path history.
@@ -597,7 +624,12 @@ def path_decode_step_m1(
         raise ValueError("t_prev must be given exactly when continuing a chunk")
     if n_hist > 2:
         raise ValueError("path history holds at most two projections")
-    kernel = _compiled_path_step(batch, heads, length, dim, n_hist, chunk_width, qkv.dtype, projected.dtype, favor)
+    grouped = weights[0].ndim == 3
+    if grouped and weights[0].shape[0] != batch:
+        raise ValueError("grouped weights need one layer per batch row")
+    kernel = _compiled_path_step(
+        batch, heads, length, dim, n_hist, chunk_width, qkv.dtype, projected.dtype, favor, grouped
+    )
     # Unread slots (no open chunk, no history) still need an array.
     prev = (qkv,) * 6 if prev is None else prev
     return tuple(kernel(

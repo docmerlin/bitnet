@@ -244,7 +244,11 @@ the clean prefix. B>1 keeps one PaTH cache per block: a past position's noise is
 once, when its token is committed, so each token runs B one-position queries plus B
 one-position commits. Per-σ AdaRMS is folded into the RMSNorm weights (plus a shift the
 fused MLP kernel adds), and each block's graph goes to the GPU while the next is built.
-1B, window 64: ~29 ms/token flat vs 162/353 ms at a 64/256 prompt re-running the prefix.
+The B commits run as one chain: layer j of every block shares each kernel dispatch
+(stacked weights, a second copy of the packed weights: ~236 MB at 1B), and the queries
+read batch-row views of the stacked caches. The network runs in the model dtype (bf16),
+as in training; only the Euler state stays fp32.
+1B, window 64: ~19 ms/token flat vs 162/353 ms at a 64/256 prompt re-running the prefix.
 `--dblock-compile` (off) compiles each token step; no warm gain since decode is GPU-bound. B=1 still re-runs the prefix per eval. `--dblock-infer loops`
 is a B=1 debug unroll of Huginn R.
 

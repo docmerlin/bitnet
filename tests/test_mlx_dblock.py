@@ -414,3 +414,77 @@ def test_dblock_compiled_generate_matches_eager(monkeypatch) -> None:
     assert len(ran) == 10  # every token compiled (prompt > 2: all have a commit)
     for eager, fused in zip(logits[False], logits[True]):
         assert mx.allclose(eager, fused, atol=1e-4).item()
+
+
+def _grouped_model(**overrides):
+    mx.random.seed(9)
+    config = _dblock_config(
+        dblock_blocks=2, hidden_size=64, num_attention_heads=2, intermediate_size=128, **overrides
+    )
+    model = MLXBitNet(config)
+    for block in model.blocks:  # non-zero AdaRMS and gates
+        for ada in (block.ada_attn, block.ada_mlp):
+            ada.proj.weight = mx.random.normal(ada.proj.weight.shape) * 0.1
+            ada.proj.bias = mx.random.normal(ada.proj.bias.shape) * 0.1
+        block.attn_gate = mx.random.normal((1,))
+        for mix in (block.attn_res_mix, block.mlp_res_mix):
+            mix.proj.weight = mx.random.normal(mix.proj.weight.shape) * 0.2
+    mx.eval(model.parameters())
+    model.set_inference_block_width(4)
+    model.recurrent_quantized_matmul = True
+    model.pin_inference_weights(mx.float32, prefer_packed=True)
+    return model
+
+
+def test_dblock_grouped_commit_matches_per_block() -> None:
+    """One grouped commit chain == B per-block commits (caches and later queries)."""
+    model = _grouped_model()
+    hidden = model.config.hidden_size
+    values = (3.0, 0.05)
+    sigmas = [mx.array([v]) for v in values]
+    conds = [model.dblock_decode_cond(s, k) for k, s in enumerate(sigmas)]
+    group = model.dblock_commit_group([0, 1], conds)
+    assert group is not None
+    caches = [model.new_dblock_cache(k) for k in range(2)]
+    stacked = model.dblock_stack_caches([model.new_dblock_cache(k) for k in range(2)])
+    tokens = mx.random.randint(0, 32, (1, 10))
+    for i in range(9):  # crosses the width-4 chunk edges twice (memory folds)
+        clean = model.dblock_clean_embeddings(tokens[:, i + 1 : i + 2])
+        noise = mx.random.normal((2, 1, hidden))
+        for k in range(2):
+            model.dblock_decode(clean + values[k] * noise[k], sigmas[k], tokens[:, i : i + 1], caches[k],
+                                block_id=k, cond=conds[k])
+        model.dblock_grouped_commit(clean + mx.array(values).reshape(2, 1, 1) * noise,
+                                    mx.array(values), tokens[:, i : i + 1], group, stacked)
+        z = mx.random.normal((1, 1, hidden))
+        for k in range(2):
+            want = model.dblock_decode(z, sigmas[k], tokens[:, i + 1 : i + 2], caches[k].clone(), block_id=k, cond=conds[k])
+            got = model.dblock_decode(z, sigmas[k], tokens[:, i + 1 : i + 2],
+                                      model.dblock_row_cache(stacked, k, i + 1), block_id=k, cond=conds[k])
+            assert mx.allclose(got, want, atol=1e-4).item(), (i, k, mx.abs(got - want).max().item())
+
+
+@pytest.mark.parametrize("prompt", [[3], [3, 5], [3, 5, 7, 9, 11]])
+def test_dblock_grouped_generate_matches_per_block(monkeypatch, prompt) -> None:
+    import mlx_generate
+    from mlx_generate import dblock_greedy_generate
+
+    model = _grouped_model()
+    logits = {False: [], True: []}
+    mode = [False]
+    argmax = mlx_generate._generation_argmax
+    monkeypatch.setattr(mlx_generate, "_generation_argmax", lambda x, v: logits[mode[0]].append(x) or argmax(x, v))
+    grouped_calls = []
+    real_commit = model.dblock_grouped_commit
+    monkeypatch.setattr(model, "dblock_grouped_commit", lambda *a: grouped_calls.append(1) or real_commit(*a))
+    real_group = model.dblock_commit_group
+    out = {}
+    for grouped in (False, True):
+        mode[0] = grouped
+        monkeypatch.setattr(model, "dblock_commit_group", real_group if grouped else lambda *a: None)
+        mx.random.seed(1)
+        out[grouped] = dblock_greedy_generate(model, prompt, 9)
+    assert out[True] == out[False]
+    assert len(grouped_calls) == 9 - (len(prompt) == 1)  # every token after the first has a commit
+    for want, got in zip(logits[False], logits[True]):
+        assert mx.allclose(want, got, atol=1e-4).item()

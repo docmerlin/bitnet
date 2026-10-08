@@ -2034,6 +2034,28 @@ class MLXPaTHInferenceCache:
         self.wk = None
         self.open_len = 0
 
+    _BATCHED = (
+        "memory_m", "memory_z", "memory_initialized", "path_projected",
+        "q", "k", "v", "w", "beta", "log_forget", "t_inverse", "wk",
+    )
+
+    @classmethod
+    def stack(cls, caches: list["MLXPaTHInferenceCache"]) -> "MLXPaTHInferenceCache":
+        """Batch-stack caches that have seen the same positions."""
+        fields = {}
+        for name in cls._BATCHED:
+            values = [getattr(cache, name) for cache in caches]
+            fields[name] = None if values[0] is None else mx.concatenate(values)
+        return cls(**fields, open_len=caches[0].open_len)
+
+    def row(self, index: int) -> "MLXPaTHInferenceCache":
+        """Batch row ``index`` as its own cache. Steps rebind fields, so it never writes back."""
+        fields = {}
+        for name in self._BATCHED:
+            value = getattr(self, name)
+            fields[name] = None if value is None else value[index : index + 1]
+        return MLXPaTHInferenceCache(**fields, open_len=self.open_len)
+
     def clone(self) -> "MLXPaTHInferenceCache":
         return MLXPaTHInferenceCache(
             self.memory_m,
@@ -3260,13 +3282,19 @@ class MLXBitNet(nn.Module):
     def dblock_clean_embeddings(self, tokens: mx.array) -> mx.array:
         return _safe_normalize(self.embedding(tokens), axis=-1)
 
-    def _dblock_inputs(self, z: mx.array, sigma: mx.array, tokens: mx.array) -> tuple[mx.array, mx.array]:
+    def _dblock_x(self, z: mx.array, sigma: mx.array, tokens: mx.array) -> mx.array:
+        """Stack input: clean ``tokens`` plus ``noise_in(c_in · z)``, in the model dtype
+        (training's z is the embedding dtype; a sampler may keep fp32 Euler state)."""
         if self.config.train_mode != "dblock" or self.sigma_embed is None:
             raise RuntimeError("dblock decode requires train_mode='dblock'")
+        z = z.astype(self.embedding.weight.dtype)
         scale = self._broadcast_sigma(self.dblock_c_in(sigma), z)
         noisy = self.dblock_noise_in(scale.astype(z.dtype) * z)
-        inputs = self.subln(self.embedding(tokens)) + noisy.astype(z.dtype)
-        return inputs, self.sigma_embed(sigma).astype(z.dtype)
+        return self.subln(self.embedding(tokens)) + noisy.astype(z.dtype)
+
+    def _dblock_inputs(self, z: mx.array, sigma: mx.array, tokens: mx.array) -> tuple[mx.array, mx.array]:
+        inputs = self._dblock_x(z, sigma, tokens)
+        return inputs, self.sigma_embed(sigma).astype(inputs.dtype)
 
     def new_dblock_cache(self, block_id: int, batch_size: int = 1) -> MLXInferenceCache:
         """Decode cache for one B>1 block slice (B=1 runs Hyperloop, not a flat slice)."""
@@ -3320,6 +3348,193 @@ class MLXBitNet(nn.Module):
             )
         cache.position += length
         return self.norm(x)
+
+    def dblock_commit_group(self, block_ids: list[int], conds: list[list]) -> list[dict] | None:
+        """Stacked weights to commit one position to G block slices together: layer j
+        of every slice shares one dispatch per kernel (``dblock_grouped_commit``).
+
+        None unless every layer runs the fused single-token kernels: Kimi AttnRes,
+        pinned packed weights, folded AdaRMS (``conds`` from ``dblock_decode_cond``).
+        ponytail: stacks a second copy of the packed weights (~236 MB at 1B); slice
+        the stack for the per-block queries too if memory matters.
+        """
+        ranges = [self.config.dblock_layer_ranges()[block_id] for block_id in block_ids]
+        widths = {end - start for start, end in ranges}
+        if not self._kimi_mode or len(set(block_ids)) != len(block_ids) or len(widths) != 1:
+            return None
+        chunk_width = min(self.blocks[0].attn.fixed_block_width or self.config.path_window_size,
+                          self.config.path_window_size)
+
+        def packed(layers: list[MLXHBitLinear]):
+            pins = [layer._pinned_packed for layer in layers]
+            if any(pin is None for pin in pins) or layers[0].input_dims > M1_PREP_MAX_DIM:
+                return None
+            return mx.stack([pin[0] for pin in pins]), mx.stack([pin[1] for pin in pins]), int(pins[0][2])
+
+        group = []
+        for j in range(widths.pop()):
+            blocks = [self.blocks[start + j] for start, _ in ranges]
+            folded = [cond[j] for cond in conds]
+            attns = [block.attn for block in blocks]
+            if not all(
+                isinstance(f, FoldedAda)
+                and b.engram is None
+                and b.moe is None
+                and not b.skip_attn
+                and not b.skip_mlp
+                and isinstance(b.attn_res_mix.norm, nn.RMSNorm)
+                and isinstance(b.mlp_res_mix.norm, nn.RMSNorm)
+                and getattr(b.attn, "_merged_projection", None) is not None
+                and b.attn._can_fuse_decode(MLXPaTHInferenceCache(None, None, None), chunk_width)
+                for b, f in zip(blocks, folded)
+            ):
+                return None
+            linears = {
+                "qkv_down": [a._merged_projection[2] for a in attns],
+                **{name: packed([getattr(a, name) for a in attns]) for name in ("path_up", "out")},
+                **{name: packed([getattr(b, name) for b in blocks]) for name in ("up", "mid", "down")},
+            }
+            linears["qkv_down"] = (
+                mx.stack([m[0] for m in linears["qkv_down"]]),
+                mx.stack([m[1] for m in linears["qkv_down"]]),
+                int(linears["qkv_down"][0][2]),
+            )
+            if any(value is None for value in linears.values()):
+                return None
+            heads = [a._decode_head_weights() for a in attns]
+            group.append(
+                {
+                    "attn": attns[0],  # config/helpers only; weights come from the stacks
+                    "block": blocks[0],
+                    "attn_mix": (
+                        mx.stack([b.attn_res_mix.norm.weight for b in blocks]),
+                        mx.stack([b.attn_res_mix.proj.weight.reshape(-1) for b in blocks]),
+                    ),
+                    "mlp_mix": (
+                        mx.stack([b.mlp_res_mix.norm.weight for b in blocks]),
+                        mx.stack([b.mlp_res_mix.proj.weight.reshape(-1) for b in blocks]),
+                    ),
+                    "attn_norm": (mx.stack([f.attn_weight for f in folded]), mx.stack([f.attn_shift for f in folded])),
+                    "mlp_norm": (mx.stack([f.mlp_weight for f in folded]), mx.stack([f.mlp_shift for f in folded])),
+                    "gate": mx.sigmoid(mx.stack([b.attn_gate for b in blocks])).reshape(-1, 1, 1),
+                    "path": (
+                        mx.stack([a.path_conv_weight for a in attns]),
+                        mx.stack([h[0] for h in heads]),
+                        mx.stack([h[1] for h in heads]),
+                    ),
+                    **linears,
+                }
+            )
+        mx.eval(group)
+        return group
+
+    @staticmethod
+    def dblock_stack_caches(caches: list[MLXInferenceCache]) -> list[MLXPaTHInferenceCache]:
+        """Per-block dblock caches (same positions) → per-layer batch-stacked caches."""
+        return [
+            MLXPaTHInferenceCache.stack([cache.layers[j].attention for cache in caches])
+            for j in range(len(caches[0].layers))
+        ]
+
+    @staticmethod
+    def dblock_row_cache(caches: list[MLXPaTHInferenceCache], index: int, position: int) -> MLXInferenceCache:
+        """Block ``index``'s decode cache as views of stacked caches (for queries)."""
+        return MLXInferenceCache(
+            layers=[MLXBlockInferenceCache(cache.row(index), None) for cache in caches],
+            token_history=mx.zeros((1, 0), dtype=mx.int32),
+            num_loops=1,
+            weight_cache={},
+            position=position,
+        )
+
+    def dblock_grouped_commit(
+        self,
+        z: mx.array,
+        sigma: mx.array,
+        tokens: mx.array,
+        group: list[dict],
+        caches: list[MLXPaTHInferenceCache],
+    ) -> None:
+        """Commit one position to G block slices at once, advancing ``caches``.
+
+        ``z`` ``(G, 1, D)`` and ``sigma`` ``(G,)``: row g is block g's noisy target;
+        ``tokens`` ``(1, 1)`` the shared clean context token; ``caches[j]`` holds layer
+        j of every slice stacked on the batch axis (``MLXPaTHInferenceCache.stack``).
+        Matches G ``dblock_decode`` calls; only the caches are produced.
+        """
+        groups, _, hidden = z.shape
+        x = self._dblock_x(z, sigma, tokens)
+        group_size = int(self.config.attn_res_group_size)
+        completed, partial, in_block, stacked = [x], x, 0, None
+
+        def mix(weights: tuple[mx.array, mx.array], eps: float) -> mx.array:
+            nonlocal stacked
+            if stacked is None or stacked.shape[1] != len(completed):
+                stacked = mx.concatenate([c.reshape(groups, 1, hidden) for c in completed], axis=1)
+            current = partial if partial is not None else completed[-1]
+            return depth_attn_mix_m1(stacked, current, weights[0], weights[1], eps)
+
+        def norm(h: mx.array, weights: tuple[mx.array, mx.array], eps: float) -> mx.array:
+            # Folded AdaRMS per group: rms_norm(h) * g(1+s) + t, fp32 then rounded once.
+            y = mx.fast.rms_norm(h.astype(mx.float32), None, eps) * weights[0][:, None, :] + weights[1][:, None, :]
+            return y.astype(h.dtype)
+
+        def linear(h: mx.array, weights: tuple, layer: MLXHBitLinear, out_dim: int, **kwargs) -> mx.array:
+            packed, scales, group_size_ = weights
+            return ternary_fused_linear_m1(
+                h, packed, scales, in_dim=layer.input_dims, out_dim=out_dim, group_size=group_size_,
+                prepare=True, hadamard=layer.uses_hadamard, **kwargs,
+            )
+
+        for layer, cache in zip(group, caches):
+            attn, block = layer["attn"], layer["block"]
+            chunk_width = min(attn.fixed_block_width or self.config.path_window_size, self.config.path_window_size)
+            h = mix(layer["attn_mix"], block.attn_res_mix.norm.eps)
+            h = norm(h, layer["attn_norm"], block.attn_norm.eps)
+            n_qkv = int(attn.qkv.weight.shape[0])
+            y = linear(h, layer["qkv_down"], attn.qkv, int(layer["qkv_down"][0].shape[1]))
+            qkv, path_low = y[..., :n_qkv], y[..., n_qkv:]
+            projected = linear(path_low, layer["path_up"], attn.path_up, hidden)
+            starting = cache.q is None or cache.open_len == 0
+            history = cache.path_projected
+            (
+                local, cache.t_inverse, cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget,
+                cache.path_projected,
+            ) = path_decode_step_m1(
+                qkv,
+                projected,
+                None if history is None or history.shape[1] == 0 else history,
+                h,
+                None if starting else (cache.q, cache.k, cache.v, cache.w, cache.beta, cache.log_forget),
+                None if starting else cache.t_inverse,
+                (cache.memory_m, cache.memory_z, cache.memory_initialized),
+                layer["path"],
+                heads=self.config.num_attention_heads,
+                norm_eps=attn.q_norm.eps,
+                chunk_width=chunk_width,
+                favor=self.config.infini_feature_map == "favor",
+            )
+            cache.open_len = 1 if starting else cache.open_len + 1
+            if cache.open_len == chunk_width:
+                cache.memory_m, cache.memory_z, cache.memory_initialized = attn._next_memory(
+                    cache.k, cache.v, mx.ones((groups,), dtype=mx.bool_),
+                    cache.memory_m, cache.memory_z, cache.memory_initialized,
+                )
+                cache.clear_open_chunk()
+            context = local.transpose(0, 2, 1, 3).reshape(groups, 1, hidden)
+            delta = layer["gate"].astype(x.dtype) * linear(context, layer["out"], attn.out, hidden)
+            partial = delta if partial is None else partial + delta
+            h = mix(layer["mlp_mix"], block.mlp_res_mix.norm.eps)
+            mlp_weight, mlp_shift = layer["mlp_norm"]
+            a = linear(h, layer["up"], block.up, int(layer["up"][0].shape[1]), norm_weight=mlp_weight,
+                       norm_eps=block.mlp_norm.eps, norm_bias=mlp_shift, epilogue="swiglu")
+            a = linear(a, layer["mid"], block.mid, int(layer["mid"][0].shape[1]), epilogue="silu")
+            delta = linear(a, layer["down"], block.down, hidden)
+            partial = partial + delta
+            in_block += 1
+            if in_block == group_size:
+                completed.append(partial)
+                partial, in_block = None, 0
 
     def dblock_forward_from_z(
         self,

@@ -166,3 +166,18 @@ def test_path_decode_step_m1_long_chunk(hidden: int, heads: int) -> None:
         if reference_cache.t_inverse is not None:
             t_rel = mx.abs(fused_cache.t_inverse - reference_cache.t_inverse).max() / mx.abs(reference_cache.t_inverse).max()
             assert t_rel.item() < 1e-5, (step, t_rel.item())
+
+
+def test_depth_attn_mix_m1_grouped_matches_per_layer() -> None:
+    from mlx_decode_kernels import depth_attn_mix_m1
+
+    mx.random.seed(2)
+    groups, n, dim = 3, 4, 1024
+    completed = mx.random.normal((groups, n, dim)).astype(mx.bfloat16)
+    partial = mx.random.normal((groups, 1, dim)).astype(mx.bfloat16)
+    norm_weight = mx.random.uniform(0.5, 1.5, (groups, dim)).astype(mx.bfloat16)
+    proj_weight = (mx.random.normal((groups, dim)) * 0.2).astype(mx.bfloat16)
+    grouped = depth_attn_mix_m1(completed, partial, norm_weight, proj_weight, 1e-5)
+    single = [depth_attn_mix_m1(completed[g], partial[g], norm_weight[g], proj_weight[g], 1e-5) for g in range(groups)]
+    assert grouped.shape == partial.shape
+    assert mx.array_equal(grouped, mx.stack(single)).item()

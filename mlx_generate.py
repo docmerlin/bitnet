@@ -244,6 +244,13 @@ def _dblock_cached_generate(
         targets = mx.array([out[1:-1]], dtype=mx.int32)
         noise = [mx.random.normal((1, len(out) - 2, hidden_size)) for _ in evals]
         commit(caches, context, targets, noise, pipeline=True)
+    # Eager single-position commits run all B block slices as one chain: layer j of
+    # every block shares each kernel dispatch. Queries read batch-row views.
+    group = None if compile_step else model.dblock_commit_group([block for *_, block in evals], conds)
+    if group is not None:
+        stacked = model.dblock_stack_caches(caches)
+        committed = caches[0].position
+        values = mx.array([value for value, *_ in evals], dtype=mx.float32)
     for _ in range(max_new_tokens):
         query = mx.array([out[-1:]], dtype=mx.int32)
         context = targets = noise = None
@@ -253,6 +260,17 @@ def _dblock_cached_generate(
             noise = mx.random.normal((len(evals), 1, 1, hidden_size))
         z = sigmas[0] * mx.random.normal((1, 1, hidden_size))
         logits = None
+        if group is not None:
+            if context is not None:
+                clean = model.dblock_clean_embeddings(targets).astype(mx.float32)
+                model.dblock_grouped_commit(
+                    clean + values.reshape(-1, 1, 1) * noise.reshape(len(evals), 1, hidden_size),
+                    values, context, group, stacked,
+                )
+                committed += 1
+                mx.async_eval([a for cache in stacked for a in cache.arrays()])
+            views = [model.dblock_row_cache(stacked, k, committed) for k in range(len(evals))]
+            logits = token_step(views, None, None, query, None, z, pipeline=True)
         if compile_step and context is not None and caches[0].position > 0:
             logits = compiled_step(context, targets, query, noise, z)
             if logits is None:

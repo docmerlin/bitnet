@@ -1249,3 +1249,30 @@ def test_packed_dense_mlp_preserves_fp8_preparation(use_hadamard: bool) -> None:
     mx.eval(output, expected, batched)
     assert mx.allclose(output, expected, rtol=1e-3, atol=1e-5).item()
     assert mx.allclose(output, batched[:, :1], rtol=1e-3, atol=1e-5).item()
+
+
+@pytest.mark.parametrize("epilogue", [None, "swiglu"])
+@pytest.mark.parametrize("norm", [False, "bias"])
+def test_ternary_fused_linear_m1_grouped_matches_per_layer(norm, epilogue) -> None:
+    """G stacked layers in one dispatch == G single-layer calls."""
+    from mlx_ternary_kernel import pack_ternary_weight, ternary_fused_linear_m1
+
+    mx.random.seed(4)
+    groups, in_dim, out_dim = 3, 1024, 512
+    packs = [pack_ternary_weight(mx.random.normal((out_dim, in_dim))) for _ in range(groups)]
+    x = mx.random.normal((groups, 1, in_dim)).astype(mx.bfloat16)
+    nw = mx.random.uniform(0.5, 1.5, (groups, in_dim)).astype(mx.bfloat16) if norm else None
+    nb = mx.random.normal((groups, in_dim)).astype(mx.bfloat16) if norm else None
+    kwargs = dict(in_dim=in_dim, out_dim=out_dim, group_size=packs[0][2], prepare=True, hadamard=True,
+                  norm_eps=1e-5, epilogue=epilogue)
+    single = [
+        ternary_fused_linear_m1(x[g], p, s, norm_weight=None if nw is None else nw[g],
+                                norm_bias=None if nb is None else nb[g], **kwargs)
+        for g, (p, s, _) in enumerate(packs)
+    ]
+    grouped = ternary_fused_linear_m1(
+        x, mx.stack([p for p, _, _ in packs]), mx.stack([s for _, s, _ in packs]),
+        norm_weight=nw, norm_bias=nb, **kwargs,
+    )
+    assert grouped.shape == (groups, 1, out_dim // 2 if epilogue == "swiglu" else out_dim)
+    assert mx.array_equal(grouped, mx.stack(single)).item()
