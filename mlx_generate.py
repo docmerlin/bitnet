@@ -87,6 +87,7 @@ def dblock_greedy_generate(
     *,
     euler_steps: int | None = None,
     valid_vocab_size: int | None = None,
+    compile_step: bool = False,
 ) -> list[int]:
     """AR DiffusionBlocks decode (paper App. E.4): greedy, one token at a time.
 
@@ -99,7 +100,11 @@ def dblock_greedy_generate(
 
     B>1 keeps one PaTH cache per eval: a past position's noise is drawn once,
     when its target is committed, rather than fresh per token (same marginal
-    as training), so each eval only runs the new positions.
+    as training), so each eval only runs the new positions. ``compile_step``
+    runs each token (commit + B queries) as one mx.compile per open-chunk
+    length, falling back to eager if compile fails. Off by default: pipelined
+    eager is already GPU-bound (1B: 28.5 vs 29.2 ms/token warm) and each new
+    open length costs ~75 ms of tracing, paid again per call.
     ponytail: B=1 still re-runs the full prefix per eval (K Hyperloop caches would
     cost K× AR cache memory); cache it if B=1 decode speed matters.
     ``valid_vocab_size`` restricts selection to defined IDs in a padded vocabulary.
@@ -123,7 +128,9 @@ def dblock_greedy_generate(
         sigmas = schedule.sample_sigmas(model.config.dblock_sample_steps(euler_steps))
     hidden_size = model.config.hidden_size
     if model.config.dblock_blocks > 1:
-        return _dblock_cached_generate(model, prompt, max_new_tokens, eos_token_id, sigmas, valid_vocab_size)
+        return _dblock_cached_generate(
+            model, prompt, max_new_tokens, eos_token_id, sigmas, valid_vocab_size, compile_step
+        )
     table = model.dblock_denoise_table()
     out = list(prompt)
     for _ in range(max_new_tokens):
@@ -161,42 +168,101 @@ def _dblock_cached_generate(
     eos_token_id: int | None,
     sigmas: tuple[float, ...],
     valid_vocab_size: int | None,
+    compile_step: bool = False,
 ) -> list[int]:
     schedule = model.config.noise_schedule()
     evals = [(sigma, mx.array([sigma], dtype=mx.float32), schedule.block_for_sigma(sigma)) for sigma in sigmas]
     caches = [model.new_dblock_cache(block) for _, _, block in evals]
     conds = [model.dblock_decode_cond(sigma, block) for _, sigma, block in evals]
     table = model.dblock_denoise_table()
-
-    def commit(context: list[int], targets: list[int]) -> None:
-        # Positions with known next tokens: clean token i + noisy target i + 1.
-        tokens = mx.array([context], dtype=mx.int32)
-        clean = model.dblock_clean_embeddings(mx.array([targets], dtype=mx.int32)).astype(mx.float32)
-        for (value, sigma, block), cache, cond in zip(evals, caches, conds):
-            noisy = clean + value * mx.random.normal(clean.shape)
-            model.dblock_decode(noisy, sigma, tokens, cache, block_id=block, cond=cond)
-            # Start the GPU on each block while Python builds the next (~12 ms of graph per token).
-            mx.async_eval(cache.arrays())
-
-    out = list(prompt)
-    if len(out) > 1:
-        commit(out[:-1], out[1:])
     hidden_size = model.config.hidden_size
-    for _ in range(max_new_tokens):
-        last = mx.array([out[-1:]], dtype=mx.int32)
-        z = sigmas[0] * mx.random.normal((1, 1, hidden_size))
+    mx.eval(table, conds)
+
+    def commit(caches, context, targets, noise, pipeline: bool) -> None:
+        # Positions with known next tokens: clean token i + noisy target i + 1.
+        clean = model.dblock_clean_embeddings(targets).astype(mx.float32)
+        for (value, sigma, block), cache, cond, eps in zip(evals, caches, conds, noise):
+            model.dblock_decode(clean + value * eps, sigma, context, cache, block_id=block, cond=cond)
+            if pipeline:  # GPU runs this block while Python builds the next (~11 ms of graph per token)
+                mx.async_eval(cache.arrays())
+
+    def token_step(caches, context, targets, query, noise, z, pipeline: bool = False) -> mx.array:
+        """Commit the previous position (if any) to every cache, then denoise ``query``'s next token."""
+        if context is not None:
+            commit(caches, context, targets, noise, pipeline)
         for index, ((value, sigma, block), cache, cond) in enumerate(zip(evals, caches, conds)):
             # Query on a clone: the query position is committed only once its token is known.
-            hidden = model.dblock_decode(z, sigma, last, cache.clone(), block_id=block, cond=cond)
-            logits = model.logits_from(hidden)
+            logits = model.logits_from(model.dblock_decode(z, sigma, query, cache.clone(), block_id=block, cond=cond))
             if index + 1 < len(evals):
                 z = z + (sigmas[index + 1] - value) / value * (z - model.dblock_denoised(logits, table))
-                mx.async_eval(z)
+                if pipeline:
+                    mx.async_eval(z)
+        return logits
+
+    # One mx.compile per open-chunk length (as enable_compiled_inference); every
+    # cache has seen the same positions, so the first layer's length is the key.
+    layouts = [model._cache_layout(cache) for cache in caches]
+    compiled: dict[int, object] = {}
+
+    def make_pure_step():
+        def pure(context, targets, query, noise, z, *flat):
+            views, offset = [], 0
+            for cache, layout in zip(caches, layouts):
+                count = len(model._flatten_inference_cache(cache))
+                view = model._unflatten_inference_cache(
+                    list(flat[offset : offset + count]), layout, 1, cache.weight_cache, position=1
+                )
+                views.append(view)
+                offset += count
+            logits = token_step(views, context, targets, query, noise, z)
+            return (logits, *(a for view in views for a in model._flatten_inference_cache(view)))
+
+        return pure
+
+    def compiled_step(context, targets, query, noise, z) -> mx.array | None:
+        attention = caches[0].layers[0].attention
+        key = 0 if attention.q is None else int(attention.q.shape[2])
+        flats = [model._flatten_inference_cache(cache) for cache in caches]
+        try:
+            fn = compiled.get(key)
+            if fn is None:
+                fn = compiled[key] = mx.compile(make_pure_step())
+            result = fn(context, targets, query, noise, z, *(a for flat in flats for a in flat))
+            mx.eval(result)
+        except Exception:
+            return None
+        offset = 1
+        for cache, flat in zip(caches, flats):
+            model._apply_flat_to_inference_cache(cache, list(result[offset : offset + len(flat)]))
+            cache.position += 1
+            offset += len(flat)
+        return result[0]
+
+    out = list(prompt)
+    if len(out) > 2:  # positions 0..P-3; P-2 is committed by the first token step
+        context = mx.array([out[:-2]], dtype=mx.int32)
+        targets = mx.array([out[1:-1]], dtype=mx.int32)
+        noise = [mx.random.normal((1, len(out) - 2, hidden_size)) for _ in evals]
+        commit(caches, context, targets, noise, pipeline=True)
+    for _ in range(max_new_tokens):
+        query = mx.array([out[-1:]], dtype=mx.int32)
+        context = targets = noise = None
+        if len(out) > 1:
+            context = mx.array([out[-2:-1]], dtype=mx.int32)
+            targets = query
+            noise = mx.random.normal((len(evals), 1, 1, hidden_size))
+        z = sigmas[0] * mx.random.normal((1, 1, hidden_size))
+        logits = None
+        if compile_step and context is not None and caches[0].position > 0:
+            logits = compiled_step(context, targets, query, noise, z)
+            if logits is None:
+                compile_step = False  # unsupported here: eager from now on
+        if logits is None:
+            logits = token_step(caches, context, targets, query, noise, z, pipeline=True)
         token = int(_generation_argmax(logits, valid_vocab_size)[0, -1].item())
         out.append(token)
         if eos_token_id is not None and token == eos_token_id:
             break
-        commit(out[-2:-1], [token])
     return out
 
 
@@ -471,6 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Try mx.compile on inference_step (default: on; falls back if unsupported).",
     )
     parser.add_argument(
+        "--dblock-compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="mx.compile the dblock token step (default: off; no warm gain, ~75 ms trace per open length).",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Print prefill/decode/eval phase timings alongside tokens/second.",
@@ -507,6 +579,7 @@ def main() -> None:
             tokenizer.eos_id,
             euler_steps=args.dblock_euler_steps,
             valid_vocab_size=len(tokenizer),
+            compile_step=args.dblock_compile,
         )
     else:
         speculative = args.speculative and model.config.mtp_depth > 0

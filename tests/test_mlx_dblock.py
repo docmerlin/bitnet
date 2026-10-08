@@ -274,12 +274,12 @@ def test_dblock_generate_is_autoregressive_one_block_per_eval(monkeypatch) -> No
         return real(z, sigma, tokens, *args, **kwargs)
 
     monkeypatch.setattr(model, "dblock_decode", spy)
-    dblock_greedy_generate(model, [1, 2], max_new_tokens=2)
-    # Commit prompt position 0 per block, then per token: B cached queries
-    # (one new position each), then commit that token's position per block.
+    dblock_greedy_generate(model, [1, 2], max_new_tokens=2, compile_step=False)
+    # Per token: commit the previous position per block, then B cached queries
+    # (one new position each). Nothing commits after the last token.
     queries = [c for c in calls if c[0] == 1 and c[1] == 1]
     assert [c[2] for c in calls[:4]] == [0, 1, 2, 3]
-    assert [c[2] for c in calls] == [0, 1, 2, 3] * 5
+    assert [c[2] for c in calls] == [0, 1, 2, 3] * 4
     assert all(c[0] == c[1] == 1 for c in calls)
     assert len(queries) == len(calls)
     assert calls[4][3] == pytest.approx(80.0) and calls[7][3] == pytest.approx(0.002)
@@ -371,3 +371,46 @@ def test_dblock_generate_honors_inference_num_loops_and_loops_mode() -> None:
     object.__setattr__(model.config, "dblock_blocks", 4)
     with pytest.raises(ValueError, match="dblock_infer='loops' requires dblock_blocks=1"):
         dblock_greedy_generate(model, prompt, max_new_tokens=2)
+
+
+def test_dblock_compiled_generate_matches_eager(monkeypatch) -> None:
+    """Compiled token step (commit + B queries) == eager, across chunk edges."""
+    import mlx_generate
+    from mlx_generate import dblock_greedy_generate
+
+    mx.random.seed(8)
+    model = MLXBitNet(_dblock_config(dblock_blocks=2, hidden_size=64, num_attention_heads=2, intermediate_size=128))
+    mx.eval(model.parameters())
+    model.set_inference_block_width(4)
+    model.recurrent_quantized_matmul = True
+    model.pin_inference_weights(mx.float32, prefer_packed=True)
+
+    logits = {False: [], True: []}
+    mode = [False]
+    argmax = mlx_generate._generation_argmax
+    monkeypatch.setattr(
+        mlx_generate, "_generation_argmax", lambda x, v: logits[mode[0]].append(x) or argmax(x, v)
+    )
+    ran = []
+    compile_ = mx.compile
+
+    def counting_compile(fn):
+        compiled = compile_(fn)
+
+        def call(*args):
+            result = compiled(*args)
+            ran.append(1)  # only after a successful compiled call
+            return result
+
+        return call
+
+    monkeypatch.setattr(mx, "compile", counting_compile)
+    out = {}
+    for compiled in (False, True):
+        mode[0] = compiled
+        mx.random.seed(1)
+        out[compiled] = dblock_greedy_generate(model, [3, 5, 7], 10, compile_step=compiled)
+    assert out[True] == out[False]
+    assert len(ran) == 10  # every token compiled (prompt > 2: all have a commit)
+    for eager, fused in zip(logits[False], logits[True]):
+        assert mx.allclose(eager, fused, atol=1e-4).item()
